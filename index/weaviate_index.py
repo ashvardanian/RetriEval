@@ -10,17 +10,17 @@ def search_single_query(q, k, class_name):
     index = Client(embedded_options=EmbeddedOptions())
     results = (
         index.query.get(class_name)
-        .with_additional("id")
+        .with_additional('id')
         .with_near_vector(
             {
-                "vector": q,
+                'vector': q,
             }
         )
         .with_limit(k)
         .do()
     )
     return array(
-        [UUID(r["_additional"]["id"]).int for r in results["data"]["Get"]["Vector"]]
+        [UUID(r['_additional']['id']).int for r in results['data']['Get']['Vector']]
     )
 
 
@@ -35,42 +35,42 @@ class WeaviateIndex(BaseIndex):
         construction_batch_size: int = 100,
     ):
         index = Client(embedded_options=EmbeddedOptions())
-        metric = {"angular": "cosine", "l2": "l2-squared"}[metric]
+        metric = {'angular': 'cosine', 'l2': 'l2-squared'}[metric]
 
         self.construction_batch_size = construction_batch_size
-        self.class_name = "Vector"
+        self.class_name = 'Vector'
         self.index_offset = 0
         index.schema.delete_class(self.class_name)
 
         index.schema.create(
             {
-                "classes": [
+                'classes': [
                     {
-                        "class": self.class_name,
-                        "properties": [
+                        'class': self.class_name,
+                        'properties': [
                             {
-                                "name": "index",
-                                "dataType": ["int"],
+                                'name': 'index',
+                                'dataType': ['int'],
                             }
                         ],
-                        "vectorIndexConfig": {
-                            "distance": metric,
-                            "maxConnections": m,
-                            "efConstruction": ef_construction,
-                            "ef": ef_search,
+                        'vectorIndexConfig': {
+                            'distance': metric,
+                            'maxConnections': m,
+                            'efConstruction': ef_construction,
+                            'ef': ef_search,
                         },
                     }
                 ]
             }
         )
-        super().__init__(index, dim, metric, "Weaviate", m, ef_construction, ef_search)
+        super().__init__(index, dim, metric, 'Weaviate', m, ef_construction, ef_search)
 
     def add(self, x: ndarray):
         self.index.batch.configure(batch_size=self.construction_batch_size)
         with self.index.batch as batch:
             for i, vector in enumerate(x, start=self.index_offset):
                 batch.add_data_object(
-                    data_object={"index": i},
+                    data_object={'index': i},
                     class_name=self.class_name,
                     vector=vector,
                     uuid=UUID(int=i),

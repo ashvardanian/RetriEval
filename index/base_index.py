@@ -32,6 +32,6 @@ class BaseIndex(ABC):
 
     def __str__(self):
         if self.m != -1 and self.ef_construction != -1 and self.ef_search != -1:
-            return f"{self.name}, m={self.m}, ef_construction={self.ef_construction}, ef_search={self.ef_search}"
+            return f'{self.name}, m={self.m}, ef_construction={self.ef_construction}, ef_search={self.ef_search}'
 
         return self.name

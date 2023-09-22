@@ -1,32 +1,31 @@
 {
-    "save_every_nth": 5,
+    "save_every_nth": 2000,
     "step_size": 100000,
-    "dataset_size": 5000000,
+    "dataset_size": 1000000000,
     "index_vectors_path": "/mnt/disk0/datasets/deep/base.1B.fbin",
     "query_vectors_path": "/mnt/disk0/datasets/deep/query.10K.fbin",
     "groundtruth_path": "/mnt/disk0/datasets/deep/groundtruth.10K.ibin",
     "indexes": [
         {
-            "name": "Qdrant",
+            "name":"USearch",
             "params": {
                 "dim": 96,
                 "metric": "angular",
                 "m": 16,
                 "ef_construction": 128,
                 "ef_search": 64,
-                "construction_batch_size": 256,
-                "is_local": false
+                "dtype": "i8"
             }
         },
         {
-            "name": "Weaviate",
+            "name":"USearch",
             "params": {
                 "dim": 96,
                 "metric": "angular",
                 "m": 16,
                 "ef_construction": 128,
                 "ef_search": 64,
-                "construction_batch_size": 256
+                "dtype": "f16"
             }
         }
     ]

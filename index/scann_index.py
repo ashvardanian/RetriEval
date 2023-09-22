@@ -21,14 +21,14 @@ class ScannIndex(BaseIndex):
         self.dimensions_per_block = dimensions_per_block
         self.reordering_num_neighbors = reordering_num_neighbors
 
-        metric = {"angular": "dot_product", "l2": "squared_l2"}[metric]
+        metric = {'angular': 'dot_product', 'l2': 'squared_l2'}[metric]
 
-        super().__init__(None, dim, metric, "SCANN")
+        super().__init__(None, dim, metric, 'SCANN')
 
     def add(self, x: np.ndarray):
         spherical = False
 
-        if self.metric == "dot_product":
+        if self.metric == 'dot_product':
             x = self.normalize(x)
             spherical = True
 
@@ -50,8 +50,8 @@ class ScannIndex(BaseIndex):
         )
 
     def search(self, x: np.ndarray, k: int):
-        """if self.metric == 'dot_product':
-        x = self.normalize(x)"""
+        '''if self.metric == 'dot_product':
+        x = self.normalize(x)'''
         return self.index.search_batched_parallel(
             x, k, self.reordering_num_neighbors, self.num_leaves_to_search
         )[0]

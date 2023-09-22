@@ -14,28 +14,28 @@ class FaissIndex(BaseIndex):
         exact: bool = False,
     ):
         if exact:
-            if metric == "angular":
+            if metric == 'angular':
                 index = faiss.IndexFlatIP(dim)
             else:
                 index = faiss.IndexFlatL2(dim)
 
-            super().__init__(index, dim, metric, "FAISS-Exact", -1, -1, -1)
+            super().__init__(index, dim, metric, 'FAISS-Exact', -1, -1, -1)
         else:
             index = faiss.IndexHNSWFlat(dim, m)
             index.hnsw.efConstruction = ef_construction
             index.hnsw.efSearch = ef_search
             super().__init__(
-                index, dim, metric, "FAISS-HNSW", m, ef_construction, ef_search
+                index, dim, metric, 'FAISS-HNSW', m, ef_construction, ef_search
             )
 
     def add(self, x: ndarray):
-        if self.metric == "angular":
+        if self.metric == 'angular':
             x = self.normalize(x)
 
         self.index.add(x)
 
     def search(self, x: ndarray, k: int):
-        if self.metric == "angular":
+        if self.metric == 'angular':
             x = self.normalize(x)
 
         return self.index.search(x, k)[1]

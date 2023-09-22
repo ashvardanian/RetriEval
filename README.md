@@ -6,6 +6,7 @@ First of all, create conda environment:
 
 ```sh
 conda create -n usearch-benchmarks python=3.10
+conda activate usearch-benchmarks
 ```
 
 Then install dependencies:
@@ -35,9 +36,9 @@ sh main.sh
 
 You will afterwards find the charts in the `plots/` subdirectory.
 
-If you want to test USearch on the whole dataset, you need to run these commands (it will rewrite the previous USearch results):
+If you want to test USearch and FAISS on the whole dataset, you need to run these commands:
 
 ```sh
-python run.py configs/usearch_1B.json
+OMP_NUM_THREADS=224 python run.py configs/usearch_faiss_1B.json 1B
 python utils/draw_plots.py
 ```

@@ -8,11 +8,11 @@ from .weaviate_index import WeaviateIndex
 
 
 INDEXES = {
-    "FAISS": FaissIndex,
-    "LanceDB": LanceDBIndex,
-    "Qdrant": QdrantIndex,
-    "SCANN": ScannIndex,
-    "USearchExact": USearchExactIndex,
-    "USearch": USearchIndex,
-    "Weaviate": WeaviateIndex,
+    'FAISS': FaissIndex,
+    'LanceDB': LanceDBIndex,
+    'Qdrant': QdrantIndex,
+    'SCANN': ScannIndex,
+    'USearchExact': USearchExactIndex,
+    'USearch': USearchIndex,
+    'Weaviate': WeaviateIndex,
 }
