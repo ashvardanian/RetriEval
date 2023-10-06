@@ -17,7 +17,7 @@ sh prepare_env.sh
 You need to launch server inside docker container for Qdrant benchmarking:
 
 ```sh
-docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
+docker run -d -p 6333:6333 -p 6334:6334 qdrant/qdrant
 ```
 
 Finally, download [DEEP1B](https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search) vectors (warning: the size of file is __384GB__):
