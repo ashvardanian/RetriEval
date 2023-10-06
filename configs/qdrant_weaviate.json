@@ -2,9 +2,9 @@
     "save_every_nth": 5,
     "step_size": 100000,
     "dataset_size": 5000000,
-    "index_vectors_path": "/mnt/disk0/datasets/deep/base.1B.fbin",
-    "query_vectors_path": "/mnt/disk0/datasets/deep/query.10K.fbin",
-    "groundtruth_path": "/mnt/disk0/datasets/deep/groundtruth.10K.ibin",
+    "index_vectors_path": "data/base.1B.fbin",
+    "query_vectors_path": "data/query.10K.fbin",
+    "groundtruth_path": "data/groundtruth.10K.ibin",
     "indexes": [
         {
             "name": "Qdrant",
