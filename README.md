@@ -39,6 +39,7 @@ You will afterwards find the charts in the `plots/` subdirectory.
 If you want to test USearch and FAISS on the whole dataset, you need to run these commands:
 
 ```sh
-python run.py configs/usearch_faiss_1B.json 1B
+python run.py configs/usearch_1B.json 1B
+python run.py configs/faiss_1B.json 1B
 python utils/draw_plots.py
 ```
