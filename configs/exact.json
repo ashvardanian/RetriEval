@@ -10,8 +10,7 @@
             "name": "FAISS",
             "params": {
                 "dim": 96,
-                "metric": "angular",
-                "exact": true
+                "metric": "angular"
             }
         },
         {

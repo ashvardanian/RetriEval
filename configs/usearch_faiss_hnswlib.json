@@ -7,16 +7,6 @@
     "groundtruth_path": "data/groundtruth.10K.ibin",
     "indexes": [
         {
-            "name": "FAISS",
-            "params": {
-                "dim": 96,
-                "metric": "angular",
-                "m": 16,
-                "ef_construction": 128,
-                "ef_search": 64
-            }
-        },
-        {
             "name":"USearch",
             "params": {
                 "dim": 96,
@@ -48,6 +38,50 @@
                 "ef_search": 64,
                 "dtype": "i8"
             }
-        }
+        },
+        {
+            "name": "FAISS",
+            "params": {
+                "dim": 96,
+                "metric": "angular",
+                "m": 16,
+                "ef_construction": 96,
+                "ef_search": 80,
+                "dtype": "f32"
+            }
+        },
+        {
+            "name": "FAISS",
+            "params": {
+                "dim": 96,
+                "metric": "angular",
+                "m": 16,
+                "ef_construction": 96,
+                "ef_search": 80,
+                "dtype": "f16"
+            }
+        },
+        {
+            "name": "FAISS",
+            "params": {
+                "dim": 96,
+                "metric": "angular",
+                "m": 16,
+                "ef_construction": 96,
+                "ef_search": 80,
+                "dtype": "i8"
+            }
+        },
+        {
+            "name":"HNSWLib",
+            "params": {
+                "dim": 96,
+                "metric": "angular",
+                "index_size": 50000000,
+                "m": 16,
+                "ef_construction": 128,
+                "ef_search": 64
+            }
+        },
     ]
 }

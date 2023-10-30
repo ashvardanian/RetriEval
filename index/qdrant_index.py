@@ -4,7 +4,7 @@ from qdrant_client.http.models import (
     VectorParams,
     OptimizersConfigDiff,
     HnswConfigDiff,
-    Batch
+    Batch,
 )
 from qdrant_client import grpc
 from multiprocessing import cpu_count
@@ -27,15 +27,15 @@ class QdrantIndex(BaseIndex):
         port: int = 6334,
         construction_batch_size: int = 128,
     ):
-        metric = {'angular': Distance.COSINE, 'l2': Distance.EUCLID}[metric]
+        metric = {"angular": Distance.COSINE, "l2": Distance.EUCLID}[metric]
 
         self.construction_batch_size = construction_batch_size
 
-        self.collection_name = 'Vectors'
+        self.collection_name = "Vectors"
         if is_local:
-            index = QdrantClient(':memory:')
+            index = QdrantClient(":memory:")
         else:
-            index = QdrantClient(f'localhost:{port}', prefer_grpc=True)
+            index = QdrantClient(f"localhost:{port}", prefer_grpc=True)
 
         index.recreate_collection(
             collection_name=self.collection_name,
@@ -45,7 +45,7 @@ class QdrantIndex(BaseIndex):
                 memmap_threshold=100000000,
                 # indexing_threshold=0,
                 default_segment_number=2,
-                max_optimization_threads=cpu_count()
+                max_optimization_threads=cpu_count(),
             ),
             hnsw_config=HnswConfigDiff(
                 m=m, ef_construct=ef_construction, max_indexing_threads=cpu_count()
@@ -55,10 +55,10 @@ class QdrantIndex(BaseIndex):
 
         self.index_offset = 0
 
-        super().__init__(index, dim, metric, 'Qdrant', m, ef_construction, ef_search)
+        super().__init__(index, dim, metric, "Qdrant", m, ef_construction, ef_search)
 
     def add(self, x: np.ndarray):
-        '''self.index.upload_collection(
+        """self.index.upload_collection(
             collection_name=self.collection_name,
             vectors=x,
             ids=list(range(self.index_offset, self.index_offset + x.shape[0])),
@@ -78,13 +78,13 @@ class QdrantIndex(BaseIndex):
                 max_indexing_threads=cpu_count(),
             ),
             timeout=TIMEOUT,
-        )'''
+        )"""
         self.index.upsert(
             collection_name=self.collection_name,
             points=Batch.construct(
                 ids=(np.arange(x.shape[0]) + self.index_offset).tolist(),
-                vectors=[v.tolist() for v in x]
-            )
+                vectors=[v.tolist() for v in x],
+            ),
         )
 
         self.index_offset += x.shape[0]

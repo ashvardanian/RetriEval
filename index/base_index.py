@@ -30,8 +30,12 @@ class BaseIndex(ABC):
     def search(self, x: ndarray, k: int):
         pass
 
+    @property
+    def is_training_needed(self):
+        return False
+
     def __str__(self):
         if self.m != -1 and self.ef_construction != -1 and self.ef_search != -1:
-            return f'{self.name}, m={self.m}, ef_construction={self.ef_construction}, ef_search={self.ef_search}'
+            return f"{self.name}, m={self.m}, ef_construction={self.ef_construction}, ef_search={self.ef_search}"
 
         return self.name

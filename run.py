@@ -11,16 +11,23 @@ from usearch.io import load_matrix
 from utils.metrics import recall
 
 
-STATS_DIR = 'stats'
+STATS_DIR = "stats"
 SAVE_DIRS = {
-    'USearch-HNSW-f32': '/mnt/disk1',
-    'USearch-HNSW-i8': '/mnt/disk2',
-    'USearch-HNSW-f16': '/mnt/disk14'
+    "USearch-HNSW-f32": "/mnt/disk1",
+    "USearch-HNSW-i8": "/mnt/disk2",
+    "USearch-HNSW-f16": "/mnt/disk14",
 }
 
 
 def get_memory_usage():
     return psutil.Process().memory_info().rss / 1024
+
+
+def get_train_dataset(dataset_path, dataset_size, frac=0.01):
+    size = int(dataset_size * frac)
+    start_idx = np.random.randint(0, dataset_size - size)
+
+    return load_matrix(dataset_path, start_idx, size, view=True)
 
 
 def measure(
@@ -31,7 +38,7 @@ def measure(
     dataset_size,
     step_size,
     save_every_nth,
-    suffix
+    suffix,
 ):
     queries = load_matrix(query_path)
     groundtruth = load_matrix(groundtruth_path)[:, :1]
@@ -44,7 +51,7 @@ def measure(
 
     memory_usage_before = get_memory_usage()
     for start_idx in tqdm(range(0, dataset_size, step_size), desc=index.name):
-        if index.name != 'SCANN':
+        if index.name != "SCANN":
             chunk = load_matrix(dataset_path, start_idx, step_size, view=True)
         else:
             chunk = load_matrix(dataset_path, 0, chunk_idx * step_size, view=True)
@@ -69,7 +76,7 @@ def measure(
 
         if chunk_idx % save_every_nth == 0:
             np.savez(
-                f'{STATS_DIR}/{index.name}.chunk_{chunk_idx}{suffix}.npz',
+                f"{STATS_DIR}/{index.name}.chunk_{chunk_idx}{suffix}.npz",
                 construction_time=construction_time,
                 memory_consumption=memory_consumption,
                 search_time=search_time,
@@ -78,37 +85,44 @@ def measure(
 
         chunk_idx += 1
 
-    '''if suffix == '-1B' and index.name in SAVE_DIRS:
-        index.index.save(f'{SAVE_DIRS[index.name]}/{index.name}.usearch')'''
+    """if suffix == '-1B' and index.name in SAVE_DIRS:
+        index.index.save(f'{SAVE_DIRS[index.name]}/{index.name}.usearch')"""
 
     return construction_time, memory_consumption, search_time, recalls
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     config_path = argv[1]
-    suffix = '' if len(argv) < 3 else f'-{argv[2]}'
+    suffix = "" if len(argv) < 3 else f"-{argv[2]}"
 
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config = load(f)
 
-    for index_config in config['indexes']:
-        index = INDEXES[index_config['name']](**index_config['params'])
+    for index_config in config["indexes"]:
+        index = INDEXES[index_config["name"]](**index_config["params"])
+
+        if index.is_training_needed:
+            train_dataset = get_train_dataset(
+                config["index_vectors_path"], config["dataset_size"]
+            )
+            print(f"Training: {index}")
+            index.train(train_dataset)
 
         construction_time, memory_consumption, search_time, recalls = measure(
             index,
-            config['index_vectors_path'],
-            config['query_vectors_path'],
-            config['groundtruth_path'],
-            config['dataset_size'],
-            config['step_size'],
-            config['save_every_nth'],
-            suffix
+            config["index_vectors_path"],
+            config["query_vectors_path"],
+            config["groundtruth_path"],
+            config["dataset_size"],
+            config["step_size"],
+            config["save_every_nth"],
+            suffix,
         )
 
         np.savez(
-            f'{STATS_DIR}/{index.name}{suffix}.npz',
+            f"{STATS_DIR}/{index.name}{suffix}.npz",
             construction_time=construction_time,
             memory_consumption=memory_consumption,
             search_time=search_time,
-            recalls=recalls
+            recalls=recalls,
         )

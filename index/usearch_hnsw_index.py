@@ -11,9 +11,9 @@ class USearchIndex(BaseIndex):
         m: int = 16,
         ef_construction: int = 128,
         ef_search: int = 64,
-        dtype: str = 'f32',
+        dtype: str = "f32",
     ):
-        metric = {'angular': MetricKind.IP, 'l2': MetricKind.L2sq}[metric]
+        metric = {"angular": MetricKind.IP, "l2": MetricKind.L2sq}[metric]
 
         index = Index(
             ndim=dim,
@@ -25,7 +25,7 @@ class USearchIndex(BaseIndex):
         )
         self.index_offset = 0
         super().__init__(
-            index, dim, metric, f'USearch-HNSW-{dtype}', m, ef_construction, ef_search
+            index, dim, metric, f"USearch-HNSW-{dtype}", m, ef_construction, ef_search
         )
 
     def add(self, x: np.ndarray):
