@@ -12,8 +12,8 @@
                 "dim": 96,
                 "metric": "angular",
                 "m": 16,
-                "ef_construction": 128,
-                "ef_search": 64
+                "ef_construction": 96,
+                "ef_search": 80
             }
         }
     ]
