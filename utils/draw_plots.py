@@ -31,7 +31,25 @@ BILLION_INDEX_NAMES = (
     "USearch-HNSW-f32-1B",
     "USearch-HNSW-f16-1B",
     "USearch-HNSW-i8-1B",
-    "FAISS-HNSW-1B",
+    # "FAISS-HNSW-1B",
+)
+
+ONEHUNDREDM_INDEX_NAMES = (
+    "USearch-HNSW-f32-100M",
+    "USearch-HNSW-f16-100M",
+    "USearch-HNSW-i8-100M",
+    "FAISS-HNSW-f32-100M",
+    "FAISS-HNSW-f16-100M",
+    "FAISS-HNSW-i8-100M",
+)
+
+ADA_INDEX_NAMES = (
+    "USearch-HNSW-f32-1536d",
+    "USearch-HNSW-f16-1536d",
+    "USearch-HNSW-i8-1536d",
+    "FAISS-HNSW-f32-1536d",
+    # "FAISS-HNSW-f16-1536d",
+    # "FAISS-HNSW-i8-1536d",
 )
 
 SLOW_INDEX_NAMES = ("Qdrant", "Weaviate")
@@ -43,15 +61,25 @@ NAME_MAPPING = {
     "USearch-Exact-f32": "USearch(Exact,f32)",
     "USearch-Exact-f16": "USearch(Exact,f16)",
     "USearch-Exact-i8": "USearch(Exact,i8)",
-    "USearch-HNSW-f32-1B": "USearch(HNSW,f32)",
-    "USearch-HNSW-f16-1B": "USearch(HNSW,f16)",
-    "USearch-HNSW-i8-1B": "USearch(HNSW,i8)",
-    "FAISS-HNSW-f32": "FAISS(HNSW,f32)",
-    "FAISS-HNSW-f16": "FAISS(HNSW,f16)",
-    "FAISS-HNSW-i8": "FAISS(HNSW,i8)",
+    "USearch-HNSW-f32-1B": "USearch, 32-bit float",
+    "USearch-HNSW-f16-1B": "USearch, 16-bit float",
+    "USearch-HNSW-i8-1B": "USearch, 8-bit int",
+    "FAISS-HNSW-f32": "USearch, 32-bit float",
+    "FAISS-HNSW-f16": "USearch, 16-bit float",
+    "FAISS-HNSW-i8": "USearch, 8-bit int",
     "FAISS-HNSW-f32-1B": "FAISS(HNSW,f32)",
     "FAISS-HNSW-f16-1B": "FAISS(HNSW,f16)",
     "FAISS-HNSW-i8-1B": "FAISS(HNSW,i8)",
+    "USearch-HNSW-f32-100M": "USearch, 32-bit float",
+    "USearch-HNSW-f16-100M": "USearch, 16-bit float",
+    "USearch-HNSW-i8-100M": "USearch, 8-bit int",
+    "FAISS-HNSW-f32-100M": "FAISS, 32-bit float",
+    "FAISS-HNSW-f16-100M": "FAISS, 16-bit float",
+    "FAISS-HNSW-i8-100M": "FAISS, 8-bit int",
+    "USearch-HNSW-f32-1536d": "USearch, 32-bit float",
+    "USearch-HNSW-f16-1536d": "USearch, 16-bit float",
+    "USearch-HNSW-i8-1536d": "USearch, 8-bit int",
+    "FAISS-HNSW-f32-1536d": "FAISS, 32-bit int",
     "HNSWLIB": "HNSWLIB",
     "FAISS-Exact": "FAISS(Exact)",
     "SCANN": "SCANN",
@@ -124,7 +152,7 @@ def draw_plot(
     return fig
 
 
-def draw_plots(index_names, prefix="", draw_log_plots=True):
+def draw_plots(index_names, prefix="", draw_log_plots=True, ndims=96):
     xs = []
     constuction_speed = []
     constuction_memory = []
@@ -154,10 +182,10 @@ def draw_plots(index_names, prefix="", draw_log_plots=True):
             fig = draw_plot(
                 xs,
                 search_speed,
-                "index size",
-                "vecs/s",
+                "index size, number of vectors",
+                "speed, vectors per second",
                 method,
-                "DEEP1B: Search Speed (log scale)",
+                f"Search Speed, {ndims}d Vectors (log scale)",
                 log_scale=True,
                 smoothing=True,
             )
@@ -166,10 +194,10 @@ def draw_plots(index_names, prefix="", draw_log_plots=True):
         fig = draw_plot(
             xs,
             search_speed,
-            "index size",
-            "vecs/s",
+            "index size, number of vectors",
+            "speed, vectors per second",
             method,
-            "DEEP1B: Search Speed",
+            f"Search Speed, {ndims}d Vectors",
             log_scale=False,
             smoothing=True,
             display_slow_index=False,
@@ -177,7 +205,12 @@ def draw_plots(index_names, prefix="", draw_log_plots=True):
         fig.write_image(f"{PLOTS_DIR}/{prefix}search_speed_linear.png", scale=2)
 
         fig = draw_plot(
-            xs, search_recall, "index size", "recall", method, "DEEP1B: Search Recall@1"
+            xs,
+            search_recall,
+            "index size, number of vectors",
+            "accuracy, fraction",
+            method,
+            f"Top-1 Search Accuracy, {ndims}d Vectors",
         )
         fig.write_image(f"{PLOTS_DIR}/{prefix}search_recall.png", scale=2)
 
@@ -185,10 +218,10 @@ def draw_plots(index_names, prefix="", draw_log_plots=True):
             fig = draw_plot(
                 xs,
                 constuction_speed,
-                "index size",
-                "vecs/s",
+                "index size, number of vectors",
+                "speed, vectors per second",
                 method,
-                "DEEP1B: Construction Speed (log scale)",
+                f"Construction Speed, {ndims}d Vectors (log scale)",
                 log_scale=True,
                 smoothing=True,
             )
@@ -197,10 +230,10 @@ def draw_plots(index_names, prefix="", draw_log_plots=True):
         fig = draw_plot(
             xs,
             constuction_speed,
-            "index size",
-            "vecs/s",
+            "index size, number of vectors",
+            "speed, vectors per second",
             method,
-            "DEEP1B: Construction Speed",
+            f"Construction Speed, {ndims}d Vectors",
             smoothing=True,
             display_slow_index=False,
         )
@@ -209,17 +242,17 @@ def draw_plots(index_names, prefix="", draw_log_plots=True):
         fig = draw_plot(
             xs,
             constuction_memory,
-            "index size",
-            "memory (gb)",
+            "index size, number of vectors",
+            "memory consumption, gigabytes",
             method,
-            "DEEP1B: Construction Memory Consumption",
+            f"Memory Consumption, {ndims}d Vectors",
             display_slow_index=False,
         )
         fig.write_image(f"{PLOTS_DIR}/{prefix}construction_memory.png", scale=2)
 
 
 if __name__ == "__main__":
-    exact_xs = []
+    """exact_xs = []
     exact_search_speed = []
     exact_method = []
 
@@ -248,7 +281,9 @@ if __name__ == "__main__":
             "DEEP1B: Search Speed (log scale)",
             log_scale=True,
         )
-        fig.write_image(f"{PLOTS_DIR}/exact_search_speed.png", scale=2)
+        fig.write_image(f"{PLOTS_DIR}/exact_search_speed.png", scale=2)"""
 
-    draw_plots(INDEX_NAMES)
-    draw_plots(BILLION_INDEX_NAMES, prefix="oneb_", draw_log_plots=False)
+    # draw_plots(INDEX_NAMES)
+    draw_plots(BILLION_INDEX_NAMES, prefix="1B_", draw_log_plots=False)
+    draw_plots(ONEHUNDREDM_INDEX_NAMES, prefix="100M_", draw_log_plots=False)
+    draw_plots(ADA_INDEX_NAMES, prefix="1536D_", draw_log_plots=False, ndims=1536)

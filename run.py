@@ -13,9 +13,10 @@ from utils.metrics import recall
 
 STATS_DIR = "stats"
 SAVE_DIRS = {
-    "USearch-HNSW-f32": "/mnt/disk1",
+    "USearch-HNSW-f32": "/mnt/nvme5n1",
     "USearch-HNSW-i8": "/mnt/disk2",
     "USearch-HNSW-f16": "/mnt/disk14",
+    "FAISS-HNSW": "/mnt/disk15",
 }
 
 
@@ -41,6 +42,9 @@ def measure(
     suffix,
 ):
     queries = load_matrix(query_path)
+    if index.dim != queries.shape[1]:
+        queries = np.tile(queries, (1, index.dim // queries.shape[1]))
+
     groundtruth = load_matrix(groundtruth_path)[:, :1]
 
     construction_time = []
@@ -55,6 +59,9 @@ def measure(
             chunk = load_matrix(dataset_path, start_idx, step_size, view=True)
         else:
             chunk = load_matrix(dataset_path, 0, chunk_idx * step_size, view=True)
+
+        if index.dim != chunk.shape[1]:
+            chunk = np.tile(chunk, (1, index.dim // chunk.shape[1]))
 
         start_time = perf_counter()
 
@@ -85,8 +92,8 @@ def measure(
 
         chunk_idx += 1
 
-    """if suffix == '-1B' and index.name in SAVE_DIRS:
-        index.index.save(f'{SAVE_DIRS[index.name]}/{index.name}.usearch')"""
+    """if suffix == "-1B" and index.name in SAVE_DIRS:
+        index.index.save(f"{SAVE_DIRS[index.name]}/{index.name}.usearch")"""
 
     return construction_time, memory_consumption, search_time, recalls
 
@@ -105,6 +112,10 @@ if __name__ == "__main__":
             train_dataset = get_train_dataset(
                 config["index_vectors_path"], config["dataset_size"]
             )
+            if index.dim != train_dataset.shape[1]:
+                train_dataset = np.tile(
+                    train_dataset, (1, index.dim // train_dataset.shape[1])
+                )
             print(f"Training: {index}")
             index.train(train_dataset)
 
