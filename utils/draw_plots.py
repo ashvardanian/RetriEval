@@ -48,8 +48,8 @@ ADA_INDEX_NAMES = (
     "USearch-HNSW-f16-1536d",
     "USearch-HNSW-i8-1536d",
     "FAISS-HNSW-f32-1536d",
-    # "FAISS-HNSW-f16-1536d",
-    # "FAISS-HNSW-i8-1536d",
+    "FAISS-HNSW-f16-1536d",
+    "FAISS-HNSW-i8-1536d",
 )
 
 SLOW_INDEX_NAMES = ("Qdrant", "Weaviate")
@@ -79,7 +79,9 @@ NAME_MAPPING = {
     "USearch-HNSW-f32-1536d": "USearch, 32-bit float",
     "USearch-HNSW-f16-1536d": "USearch, 16-bit float",
     "USearch-HNSW-i8-1536d": "USearch, 8-bit int",
-    "FAISS-HNSW-f32-1536d": "FAISS, 32-bit int",
+    "FAISS-HNSW-f32-1536d": "FAISS, 32-bit float",
+    "FAISS-HNSW-f16-1536d": "FAISS, 16-bit float",
+    "FAISS-HNSW-i8-1536d": "FAISS, 8-bit int",
     "HNSWLIB": "HNSWLIB",
     "FAISS-Exact": "FAISS(Exact)",
     "SCANN": "SCANN",
