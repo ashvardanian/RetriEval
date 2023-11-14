@@ -18,6 +18,28 @@
             }
         },
         {
+            "name":"USearch",
+            "params": {
+                "dim": 96,
+                "metric": "angular",
+                "m": 16,
+                "ef_construction": 128,
+                "ef_search": 64,
+                "dtype": "f16"
+            }
+        },
+        {
+            "name":"USearch",
+            "params": {
+                "dim": 96,
+                "metric": "angular",
+                "m": 16,
+                "ef_construction": 128,
+                "ef_search": 64,
+                "dtype": "i8"
+            }
+        },
+        {
             "name": "FAISS",
             "params": {
                 "dim": 96,
@@ -48,28 +70,6 @@
                 "ef_construction": 96,
                 "ef_search": 80,
                 "dtype": "f32"
-            }
-        },
-        {
-            "name":"USearch",
-            "params": {
-                "dim": 96,
-                "metric": "angular",
-                "m": 16,
-                "ef_construction": 128,
-                "ef_search": 64,
-                "dtype": "f16"
-            }
-        },
-        {
-            "name":"USearch",
-            "params": {
-                "dim": 96,
-                "metric": "angular",
-                "m": 16,
-                "ef_construction": 128,
-                "ef_search": 64,
-                "dtype": "i8"
             }
         }
     ]

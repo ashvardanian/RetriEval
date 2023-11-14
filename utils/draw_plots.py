@@ -32,7 +32,9 @@ INDEX_NAMES_1B96D = (
     "USearch-HNSW-f32-1B",
     "USearch-HNSW-f16-1B",
     "USearch-HNSW-i8-1B",
-    "FAISS-HNSW-1B",
+    "FAISS-HNSW-f32-1B",
+    "FAISS-HNSW-f16-1B",
+    "FAISS-HNSW-i8-1B",
 )
 
 INDEX_NAMES_100M96D = (
@@ -56,18 +58,18 @@ INDEX_NAMES_100M1536D = (
 SLOW_INDEX_NAMES = ("Qdrant", "Weaviate")
 
 NAME_MAPPING = {
-    "USearch-HNSW-f32": "USearch(HNSW,f32)",
-    "USearch-HNSW-f16": "USearch(HNSW,f16)",
-    "USearch-HNSW-i8": "USearch(HNSW,i8)",
+    "USearch-HNSW-f32": "USearch, 32-bit float",
+    "USearch-HNSW-f16": "USearch, 16-bit float",
+    "USearch-HNSW-i8": "USearch, 8-bit int",
     "USearch-HNSW-f32-1B": "USearch, 32-bit float",
     "USearch-HNSW-f16-1B": "USearch, 16-bit float",
     "USearch-HNSW-i8-1B": "USearch, 8-bit int",
-    "FAISS-HNSW-f32": "USearch, 32-bit float",
-    "FAISS-HNSW-f16": "USearch, 16-bit float",
-    "FAISS-HNSW-i8": "USearch, 8-bit int",
-    "FAISS-HNSW-f32-1B": "FAISS(HNSW,f32)",
-    "FAISS-HNSW-f16-1B": "FAISS(HNSW,f16)",
-    "FAISS-HNSW-i8-1B": "FAISS(HNSW,i8)",
+    "FAISS-HNSW-f32": "FAISS, 32-bit float",
+    "FAISS-HNSW-f16": "FAISS, 16-bit float",
+    "FAISS-HNSW-i8": "FAISS, 8-bit int",
+    "FAISS-HNSW-f32-1B": "FAISS, 32-bit float",
+    "FAISS-HNSW-f16-1B": "FAISS, 16-bit float",
+    "FAISS-HNSW-i8-1B": "FAISS, 8-bit int",
     "USearch-HNSW-f32-100M": "USearch, 32-bit float",
     "USearch-HNSW-f16-100M": "USearch, 16-bit float",
     "USearch-HNSW-i8-100M": "USearch, 8-bit int",

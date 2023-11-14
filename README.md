@@ -44,6 +44,6 @@ wget https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.1B.f
 To run the ANN benchmarks pass a configuration file:
 
 ```sh
-python run.py configs/usearch_1B.json # Outputs stats/*.npz file
+python run.py configs/usearch_1B.json 1B # Outputs stats/*.npz file
 python utils/draw_plots.py # Exports tp plots/*.png
 ```
