@@ -6,17 +6,18 @@ import psutil
 import numpy as np
 from tqdm import tqdm
 
-from index import INDEXES
 from usearch.io import load_matrix
+
 from utils.metrics import recall
+from index import INDEXES
 
 
 STATS_DIR = "stats"
 SAVE_DIRS = {
-    "USearch-HNSW-f32": "/mnt/nvme5n1",
-    "USearch-HNSW-i8": "/mnt/disk2",
-    "USearch-HNSW-f16": "/mnt/disk14",
-    "FAISS-HNSW": "/mnt/disk15",
+    "USearch-HNSW-f32": "./tmp",
+    "USearch-HNSW-i8": "./tmp",
+    "USearch-HNSW-f16": "./tmp",
+    "FAISS-HNSW": "./tmp",
 }
 
 
@@ -91,9 +92,6 @@ def measure(
             )
 
         chunk_idx += 1
-
-    """if suffix == "-1B" and index.name in SAVE_DIRS:
-        index.index.save(f"{SAVE_DIRS[index.name]}/{index.name}.usearch")"""
 
     return construction_time, memory_consumption, search_time, recalls
 

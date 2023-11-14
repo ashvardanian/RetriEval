@@ -14,9 +14,13 @@ INDEX_PATHS = (
     "../tmp/USearch-HNSW-f16",
 )
 
-INDEX_NAMES = ("USearch(HNSW,f32)", "USearch(HNSW,f16)", "USearch(HNSW,i8)")
+INDEX_NAMES = (
+    "USearch(HNSW,f32)",
+    "USearch(HNSW,f16)",
+    "USearch(HNSW,i8)",
+)
 
-DATA_PATH = "../tmp/deep/base.1B.fbin"
+DATA_PATH = "../data/base.1B.fbin"
 
 QUERY_SIZES = (10_000, 50_000, 100_000, 500_000, 1000_000, 5000_000, 10_000_000)
 

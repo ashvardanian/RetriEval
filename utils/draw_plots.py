@@ -1,6 +1,7 @@
+from os.path import exists
+
 import plotly.graph_objects as go
 import numpy as np
-from os.path import exists
 
 
 STEP_SIZE = 100_000
@@ -27,14 +28,14 @@ EXACT_INDEX_NAMES = (
     "FAISS-Exact",
 )
 
-BILLION_INDEX_NAMES = (
+INDEX_NAMES_1B96D = (
     "USearch-HNSW-f32-1B",
     "USearch-HNSW-f16-1B",
     "USearch-HNSW-i8-1B",
     "FAISS-HNSW-1B",
 )
 
-ONEHUNDREDM_INDEX_NAMES = (
+INDEX_NAMES_100M96D = (
     "USearch-HNSW-f32-100M",
     "USearch-HNSW-f16-100M",
     "USearch-HNSW-i8-100M",
@@ -43,7 +44,7 @@ ONEHUNDREDM_INDEX_NAMES = (
     "FAISS-HNSW-i8-100M",
 )
 
-ADA_INDEX_NAMES = (
+INDEX_NAMES_100M1536D = (
     "USearch-HNSW-f32-1536d",
     "USearch-HNSW-f16-1536d",
     "USearch-HNSW-i8-1536d",
@@ -250,7 +251,8 @@ def draw_plots(index_names, prefix="", draw_log_plots=True, ndims=96):
 
 
 if __name__ == "__main__":
-    # draw_plots(INDEX_NAMES)
-    draw_plots(BILLION_INDEX_NAMES, prefix="1B_", draw_log_plots=False)
-    draw_plots(ONEHUNDREDM_INDEX_NAMES, prefix="100M_", draw_log_plots=False)
-    draw_plots(ADA_INDEX_NAMES, prefix="1536D_", draw_log_plots=False, ndims=1536)
+    draw_plots(INDEX_NAMES_1B96D, prefix="1b-96d-", draw_log_plots=False)
+    draw_plots(INDEX_NAMES_100M96D, prefix="100m-96d-", draw_log_plots=False)
+    draw_plots(
+        INDEX_NAMES_100M1536D, prefix="100m-1536d-", draw_log_plots=False, ndims=1536
+    )
