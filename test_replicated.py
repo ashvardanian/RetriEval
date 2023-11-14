@@ -11,22 +11,22 @@ import numpy as np
 
 
 INDEX_PATHS = (
-    '/mnt/disk1/USearch-HNSW-f32.usearch',
-    '/mnt/disk3/USearch-HNSW-f32.usearch',
-    '/mnt/disk4/USearch-HNSW-f32.usearch',
-    '/mnt/disk5/USearch-HNSW-f32.usearch',
-    '/mnt/disk6/USearch-HNSW-f32.usearch',
-    '/mnt/disk7/USearch-HNSW-f32.usearch',
-    '/mnt/disk8/USearch-HNSW-f32.usearch',
-    '/mnt/disk9/USearch-HNSW-f32.usearch',
-    '/mnt/disk10/USearch-HNSW-f32.usearch',
-    '/mnt/disk11/USearch-HNSW-f32.usearch',
-    '/mnt/disk12/USearch-HNSW-f32.usearch',
-    '/mnt/disk13/USearch-HNSW-f32.usearch'
+    "/mnt/disk1/USearch-HNSW-f32.usearch",
+    "/mnt/disk2/USearch-HNSW-f32.usearch",
+    "/mnt/disk3/USearch-HNSW-f32.usearch",
+    "/mnt/disk4/USearch-HNSW-f32.usearch",
+    "/mnt/disk5/USearch-HNSW-f32.usearch",
+    "/mnt/disk6/USearch-HNSW-f32.usearch",
+    "/mnt/disk7/USearch-HNSW-f32.usearch",
+    "/mnt/disk8/USearch-HNSW-f32.usearch",
+    "/mnt/disk9/USearch-HNSW-f32.usearch",
+    "/mnt/disk10/USearch-HNSW-f32.usearch",
+    "/mnt/disk11/USearch-HNSW-f32.usearch",
+    "/mnt/disk12/USearch-HNSW-f32.usearch",
 )
 
-INDEX_NAME = 'USearch(HNSW,f32)'
-DATA_PATH = '/mnt/disk0/datasets/deep/base.1B.fbin'
+INDEX_NAME = "USearch(HNSW,f32)"
+DATA_PATH = "../tmp/deep/base.1B.fbin"
 DATA_SIZE = 1000_000_000
 
 
@@ -34,19 +34,14 @@ QUERY_SIZES = (10_000, 50_000, 100_000, 500_000, 1000_000, 5000_000, 10_000_000)
 
 
 def measure(seed=42, k=10):
-
-    '''indices = []
+    """indices = []
     for index_path in tqdm(INDEX_PATHS, desc='Index loading'):
-        indices.append(Index.restore(index_path, view=True))'''
-    
-    print('Index loading')
-    index = Indexes(
-        paths=INDEX_PATHS,
-        view=True,
-        threads=cpu_count()
-    )
-    print('Loaded!')
-    
+        indices.append(Index.restore(index_path, view=True))"""
+
+    print("Index loading")
+    index = Indexes(paths=INDEX_PATHS, view=True, threads=cpu_count())
+    print("Loaded!")
+
     # index.search(np.random.random((5000_000, 96)), 10)
 
     np.random.seed(seed)
@@ -70,28 +65,21 @@ def measure(seed=42, k=10):
     return search_speed, recalls
 
 
-def draw_plot(
-    x,
-    y,
-    method,
-    x_title,
-    y_title,
-    title
-):
+def draw_plot(x, y, method, x_title, y_title, title):
     graphs = [go.Scatter(x=x, y=y, name=method, line=dict(width=3))]
 
     fig = go.Figure(
         data=graphs,
         layout={
-            'xaxis': {'title': x_title},
-            'yaxis': {'title': y_title},
-            'title': {'text': title},
-            'width': 1200,
-            'legend': {
-                'xanchor': 'center',
-                'x': 0.5,
-                'y': 1.1,
-                'orientation': 'h',
+            "xaxis": {"title": x_title},
+            "yaxis": {"title": y_title},
+            "title": {"text": title},
+            "width": 1200,
+            "legend": {
+                "xanchor": "center",
+                "x": 0.5,
+                "y": 1.1,
+                "orientation": "h",
             },
         },
     )
@@ -100,26 +88,28 @@ def draw_plot(
     return fig
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     search_speed, recalls = measure()
-    np.savez(f'stats/{INDEX_NAME}_replicated.npz', search_speed=search_speed, recalls=recalls)
+    np.savez(
+        f"stats/{INDEX_NAME}_replicated.npz", search_speed=search_speed, recalls=recalls
+    )
 
     fig = draw_plot(
         QUERY_SIZES,
         search_speed,
         INDEX_NAME,
-        'num of queries',
-        'vecs/s',
-        'DEEP 1B x 12: Search Speed'
+        "num of queries",
+        "vecs/s",
+        "DEEP 1B x 12: Search Speed",
     )
-    fig.write_image('plots/search_speed_replicated.png', scale=2)
+    fig.write_image("plots/search_speed_replicated.png", scale=2)
 
     fig = draw_plot(
         QUERY_SIZES,
         recalls,
         INDEX_NAME,
-        'num of queries',
-        'recall',
-        'DEEP 1B x 12: Recall@10'
+        "num of queries",
+        "recall",
+        "DEEP 1B x 12: Recall@10",
     )
-    fig.write_image('plots/recall_replicated.png', scale=2)
+    fig.write_image("plots/recall_replicated.png", scale=2)

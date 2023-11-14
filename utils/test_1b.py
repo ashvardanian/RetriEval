@@ -1,27 +1,22 @@
+from time import perf_counter
+
 import numpy as np
 from usearch.index import Index
 from usearch.io import load_matrix
-from utils.metrics import recall
-from time import perf_counter
 from tqdm import tqdm
-
 import plotly.graph_objects as go
-import numpy as np
 
+from utils.metrics import recall
 
 INDEX_PATHS = (
-    '/mnt/disk1/USearch-HNSW-f32.usearch',
-    '/mnt/disk2/USearch-HNSW-i8.usearch',
-    # '/mnt/disk14/USearch-HNSW-f16'
+    "../tmp/USearch-HNSW-f32.usearch",
+    "../tmp/USearch-HNSW-i8.usearch",
+    "../tmp/USearch-HNSW-f16",
 )
 
-INDEX_NAMES = (
-    'USearch(HNSW,f32)',
-    'USearch(HNSW,f16)',
-    'USearch(HNSW,i8)'
-)
+INDEX_NAMES = ("USearch(HNSW,f32)", "USearch(HNSW,f16)", "USearch(HNSW,i8)")
 
-DATA_PATH = '/mnt/disk0/datasets/deep/base.1B.fbin'
+DATA_PATH = "../tmp/deep/base.1B.fbin"
 
 QUERY_SIZES = (10_000, 50_000, 100_000, 500_000, 1000_000, 5000_000, 10_000_000)
 
@@ -29,7 +24,7 @@ QUERY_SIZES = (10_000, 50_000, 100_000, 500_000, 1000_000, 5000_000, 10_000_000)
 def measure(index_path, seed=42, k=10):
     index = Index.restore(index_path, view=True)
     print(index)
-    
+
     index.search(np.random.random((5000_000, 96)), 10)
 
     np.random.seed(seed)
@@ -53,26 +48,18 @@ def measure(index_path, seed=42, k=10):
     return search_speed, recalls
 
 
-def draw_plot(
-    xs,
-    ys,
-    methods,
-    x_title,
-    y_title,
-    title
-):
+def draw_plot(xs, ys, methods, x_title, y_title, title):
     graphs = []
 
     for x, y, method in zip(xs, ys, methods):
-
-        if 'USearch' not in method:
+        if "USearch" not in method:
             graphs.append(
                 go.Scatter(
                     x=x,
                     y=y,
                     name=method,
-                    mode='lines',
-                    line=dict(dash='dash', width=3),
+                    mode="lines",
+                    line=dict(dash="dash", width=3),
                     marker=dict(size=5),
                 )
             )
@@ -82,15 +69,15 @@ def draw_plot(
     fig = go.Figure(
         data=graphs,
         layout={
-            'xaxis': {'title': x_title},
-            'yaxis': {'title': y_title},
-            'title': {'text': title},
-            'width': 1200,
-            'legend': {
-                'xanchor': 'center',
-                'x': 0.5,
-                'y': 1.1,
-                'orientation': 'h',
+            "xaxis": {"title": x_title},
+            "yaxis": {"title": y_title},
+            "title": {"text": title},
+            "width": 1200,
+            "legend": {
+                "xanchor": "center",
+                "x": 0.5,
+                "y": 1.1,
+                "orientation": "h",
             },
         },
     )
@@ -99,35 +86,32 @@ def draw_plot(
     return fig
 
 
-if __name__ == '__main__':
-    results = {
-        'search_speed': [],
-        'recall': []
-    }
+if __name__ == "__main__":
+    results = {"search_speed": [], "recall": []}
 
     for index_name, index_path in zip(INDEX_NAMES, INDEX_PATHS):
         search_speed, recalls = measure(index_path)
-        results['search_speed'].append(search_speed)
-        results['recall'].append(recalls)
+        results["search_speed"].append(search_speed)
+        results["recall"].append(recalls)
 
-    np.savez(f'stats/{index_name}_1B.npz', **results)
-
-    fig = draw_plot(
-        [QUERY_SIZES] * len(INDEX_PATHS),
-        results['search_speed'],
-        INDEX_NAMES,
-        'num of queries',
-        'vecs/s',
-        'DEEP 1B: Search Speed'
-    )
-    fig.write_image('../plots/search_speed_1B.png', scale=2)
+    np.savez(f"stats/{index_name}_1B.npz", **results)
 
     fig = draw_plot(
         [QUERY_SIZES] * len(INDEX_PATHS),
-        results['recall'],
+        results["search_speed"],
         INDEX_NAMES,
-        'num of queries',
-        'recall',
-        'DEEP 1B: Recall@10'
+        "num of queries",
+        "vecs/s",
+        "DEEP 1B: Search Speed",
     )
-    fig.write_image('../plots/recall_1B.png', scale=2)
+    fig.write_image("../plots/search_speed_1B.png", scale=2)
+
+    fig = draw_plot(
+        [QUERY_SIZES] * len(INDEX_PATHS),
+        results["recall"],
+        INDEX_NAMES,
+        "num of queries",
+        "recall",
+        "DEEP 1B: Recall@10",
+    )
+    fig.write_image("../plots/recall_1B.png", scale=2)

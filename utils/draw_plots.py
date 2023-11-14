@@ -31,7 +31,7 @@ BILLION_INDEX_NAMES = (
     "USearch-HNSW-f32-1B",
     "USearch-HNSW-f16-1B",
     "USearch-HNSW-i8-1B",
-    # "FAISS-HNSW-1B",
+    "FAISS-HNSW-1B",
 )
 
 ONEHUNDREDM_INDEX_NAMES = (
@@ -58,9 +58,6 @@ NAME_MAPPING = {
     "USearch-HNSW-f32": "USearch(HNSW,f32)",
     "USearch-HNSW-f16": "USearch(HNSW,f16)",
     "USearch-HNSW-i8": "USearch(HNSW,i8)",
-    "USearch-Exact-f32": "USearch(Exact,f32)",
-    "USearch-Exact-f16": "USearch(Exact,f16)",
-    "USearch-Exact-i8": "USearch(Exact,i8)",
     "USearch-HNSW-f32-1B": "USearch, 32-bit float",
     "USearch-HNSW-f16-1B": "USearch, 16-bit float",
     "USearch-HNSW-i8-1B": "USearch, 8-bit int",
@@ -83,7 +80,6 @@ NAME_MAPPING = {
     "FAISS-HNSW-f16-1536d": "FAISS, 16-bit float",
     "FAISS-HNSW-i8-1536d": "FAISS, 8-bit int",
     "HNSWLIB": "HNSWLIB",
-    "FAISS-Exact": "FAISS(Exact)",
     "SCANN": "SCANN",
     "Weaviate": "Weaviate",
     "LanceDB": "LanceDB",
@@ -254,37 +250,6 @@ def draw_plots(index_names, prefix="", draw_log_plots=True, ndims=96):
 
 
 if __name__ == "__main__":
-    """exact_xs = []
-    exact_search_speed = []
-    exact_method = []
-
-    for index_name in EXACT_INDEX_NAMES:
-        path = f"{STATS_DIR}/{index_name}.npz"
-        if not exists(path):
-            continue
-
-        data = np.load(f"{STATS_DIR}/{index_name}.npz")
-        exact_xs.append(
-            np.arange(
-                STEP_SIZE,
-                (data["search_time"].shape[0] + 1) * STEP_SIZE,
-                STEP_SIZE,
-            )
-        )
-        exact_search_speed.append(SEARCH_SIZE / data["search_time"])
-
-    if len(exact_xs) > 0:
-        fig = draw_plot(
-            exact_xs,
-            exact_search_speed,
-            "index size",
-            "vecs/s",
-            [NAME_MAPPING[name] for name in EXACT_INDEX_NAMES],
-            "DEEP1B: Search Speed (log scale)",
-            log_scale=True,
-        )
-        fig.write_image(f"{PLOTS_DIR}/exact_search_speed.png", scale=2)"""
-
     # draw_plots(INDEX_NAMES)
     draw_plots(BILLION_INDEX_NAMES, prefix="1B_", draw_log_plots=False)
     draw_plots(ONEHUNDREDM_INDEX_NAMES, prefix="100M_", draw_log_plots=False)
