@@ -39,6 +39,7 @@ Finally, download the [Deep1B](https://research.yandex.com/blog/benchmarks-for-b
 
 ```sh
 wget https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.1B.fbin -P data
+wget https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.10M.fbin -P data # For smaller subset
 ```
 
 To run the ANN benchmarks pass a configuration file:
