@@ -8,21 +8,26 @@
 //!     --dtype f32,f16,i8 \
 //!     --metric l2 \
 //!     --threads 16 \
-//!     --output turing-10M-faiss.jsonl
+//!     --output results/
 //! ```
+
+use std::collections::HashMap;
 
 use clap::Parser;
 use itertools::iproduct;
-use retrieval::{
-    dataset, div_ceil, fmt_thousands, run, Backend, BenchState, CommonArgs, Distance, Key,
-    VectorSlice, Vectors,
-};
+use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use serde_json::{json, Value};
 
 extern "C" {
     fn omp_set_num_threads(num_threads: i32);
+    fn faiss_ParameterSpace_new(space: *mut *mut std::ffi::c_void) -> i32;
+    fn faiss_ParameterSpace_set_index_parameters(
+        space: *const std::ffi::c_void,
+        index: *mut std::ffi::c_void,
+        params: *const std::ffi::c_char,
+    ) -> i32;
+    fn faiss_ParameterSpace_free(space: *mut std::ffi::c_void);
 }
-
-// #region CLI
 
 #[derive(Parser, Debug)]
 #[command(name = "retri-eval-faiss", about = "Benchmark FAISS HNSW")]
@@ -31,7 +36,7 @@ struct Cli {
     common: CommonArgs,
 
     /// Comma-separated quantization types: f32, f16, bf16, u8, i8, b1
-    #[arg(long, value_delimiter = ',', default_value = "f32")]
+    #[arg(long, value_delimiter = ',', default_value = "bf16")]
     dtype: Vec<String>,
 
     /// Comma-separated distance metrics: ip, l2, cos
@@ -39,25 +44,23 @@ struct Cli {
     metric: Vec<String>,
 
     /// HNSW connectivity parameter (M)
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 32)]
     connectivity: usize,
+
+    /// HNSW expansion factor during indexing
+    #[arg(long, default_value_t = 128)]
+    expansion_add: usize,
+
+    /// HNSW expansion factor during search
+    #[arg(long, default_value_t = 64)]
+    expansion_search: usize,
 
     /// Number of threads (sets OMP_NUM_THREADS)
     #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
     threads: usize,
 }
 
-// #region Local metric mapping
-
-fn parse_faiss_metric(s: &str) -> Result<faiss::MetricType, String> {
-    match s {
-        "ip" => Ok(faiss::MetricType::InnerProduct),
-        _ => Ok(faiss::MetricType::L2),
-    }
-}
-
-/// Return a short human-readable label for the metric string.
-fn metric_label(s: &str) -> &str {
+fn parse_metric(s: &str) -> &'static str {
     match s {
         "ip" => "ip",
         "cos" => "cos",
@@ -65,71 +68,102 @@ fn metric_label(s: &str) -> &str {
     }
 }
 
-// #region FaissDtype
-
-enum FaissDtype {
-    F32,
-    F16,
-    BF16,
-    U8,
-    I8,
-    B1,
-}
-
-impl FaissDtype {
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "f32" => Ok(Self::F32),
-            "f16" => Ok(Self::F16),
-            "bf16" => Ok(Self::BF16),
-            "u8" => Ok(Self::U8),
-            "i8" => Ok(Self::I8),
-            "b1" => Ok(Self::B1),
-            _ => Err(format!("unknown FAISS dtype: {s}")),
-        }
-    }
-
-    fn index_factory_string(&self, connectivity: usize) -> String {
-        match self {
-            Self::F32 => format!("HNSW{connectivity},Flat"),
-            Self::F16 => format!("HNSW{connectivity},SQfp16"),
-            Self::BF16 => format!("HNSW{connectivity},SQbf16"),
-            Self::U8 => format!("HNSW{connectivity},SQ8bit_direct"),
-            Self::I8 => format!("HNSW{connectivity},SQ8bit_direct_signed"),
-            Self::B1 => format!("BinaryHNSW{connectivity}"),
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::F32 => "f32",
-            Self::F16 => "f16",
-            Self::BF16 => "bf16",
-            Self::U8 => "u8",
-            Self::I8 => "i8",
-            Self::B1 => "b1",
-        }
-    }
-
-    fn is_binary(&self) -> bool {
-        matches!(self, Self::B1)
+fn parse_faiss_metric(s: &str) -> faiss::MetricType {
+    match s {
+        "ip" => faiss::MetricType::InnerProduct,
+        _ => faiss::MetricType::L2,
     }
 }
 
-// #region Backend
+fn index_factory_string(dtype: &str, connectivity: usize) -> Result<String, String> {
+    match dtype {
+        "f32" => Ok(format!("HNSW{connectivity},Flat")),
+        "f16" => Ok(format!("HNSW{connectivity},SQfp16")),
+        "bf16" => Ok(format!("HNSW{connectivity},SQbf16")),
+        "u8" => Ok(format!("HNSW{connectivity},SQ8bit_direct")),
+        "i8" => Ok(format!("HNSW{connectivity},SQ8bit_direct_signed")),
+        "b1" => Ok(format!("BinaryHNSW{connectivity}")),
+        _ => Err(format!("unknown FAISS dtype: {dtype}")),
+    }
+}
+
+fn is_binary(dtype: &str) -> bool {
+    dtype == "b1"
+}
 
 struct FaissBackend {
     index: faiss::Index,
     description: String,
-    metadata: std::collections::HashMap<String, serde_json::Value>,
+    metadata: HashMap<String, Value>,
+}
+
+impl FaissBackend {
+    fn new(
+        dimensions: usize,
+        dtype_name: &str,
+        metric_name: &str,
+        connectivity: usize,
+        expansion_add: usize,
+        expansion_search: usize,
+        threads: usize,
+    ) -> Result<Self, String> {
+        unsafe {
+            omp_set_num_threads(threads as i32);
+        }
+
+        let factory = index_factory_string(dtype_name, connectivity)?;
+        let dim = if is_binary(dtype_name) {
+            dimensions * 8
+        } else {
+            dimensions
+        } as u32;
+        let faiss_metric = parse_faiss_metric(metric_name);
+
+        let index = faiss::index::index_factory(dim, &factory, faiss_metric)
+            .map_err(|e| format!("failed to create FAISS index: {e}"))?;
+
+        // Set HNSW expansion factors via FAISS ParameterSpace API
+        let params_str = format!("efConstruction={expansion_add} efSearch={expansion_search}");
+        unsafe {
+            let mut space: *mut std::ffi::c_void = std::ptr::null_mut();
+            if faiss_ParameterSpace_new(&mut space) == 0 && !space.is_null() {
+                let c_params = std::ffi::CString::new(params_str.as_str()).unwrap();
+                faiss_ParameterSpace_set_index_parameters(
+                    space,
+                    index.inner_ptr(),
+                    c_params.as_ptr(),
+                );
+                faiss_ParameterSpace_free(space);
+            }
+        }
+
+        let metric_label = parse_metric(metric_name);
+        let description = format!(
+            "faiss · {dtype_name} · {metric_label} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads",
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert("backend".into(), json!("faiss"));
+        metadata.insert("dtype".into(), json!(dtype_name));
+        metadata.insert("metric".into(), json!(metric_label));
+        metadata.insert("connectivity".into(), json!(connectivity));
+        metadata.insert("expansion_add".into(), json!(expansion_add));
+        metadata.insert("expansion_search".into(), json!(expansion_search));
+        metadata.insert("threads".into(), json!(threads));
+
+        Ok(Self {
+            index,
+            description,
+            metadata,
+        })
+    }
 }
 
 impl Backend for FaissBackend {
     fn description(&self) -> String {
         self.description.clone()
     }
-
-    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+    fn metadata(&self) -> HashMap<String, Value> {
         self.metadata.clone()
     }
 
@@ -150,15 +184,15 @@ impl Backend for FaissBackend {
     ) -> Result<(), String> {
         let dimensions = queries.dimensions;
         let data = queries.data.to_f32();
-        let num_vectors = data.len() / dimensions;
+        let num_queries = data.len() / dimensions;
 
         let result = self
             .index
             .search(&data, count)
             .map_err(|e| format!("FAISS search failed: {e}"))?;
 
-        for q in 0..num_vectors {
-            let offset = q * count;
+        for query in 0..num_queries {
+            let offset = query * count;
             let mut found = 0;
             for j in 0..count {
                 let idx = result.labels[offset + j];
@@ -171,7 +205,7 @@ impl Backend for FaissBackend {
                     out_distances[offset + j] = Distance::INFINITY;
                 }
             }
-            out_counts[q] = found;
+            out_counts[query] = found;
         }
         Ok(())
     }
@@ -181,64 +215,31 @@ impl Backend for FaissBackend {
     }
 }
 
-// #region main
-
 fn main() {
     let cli = Cli::parse();
 
-    unsafe {
-        omp_set_num_threads(cli.threads as i32);
-    }
-
     let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {
-        eprintln!("Failed to load benchmark state: {e}");
+        eprintln!("{e}");
         std::process::exit(1);
     });
     let dimensions = state.dimensions();
 
-    for (dtype_str, metric_str) in iproduct!(&cli.dtype, &cli.metric) {
-        let faiss_metric = parse_faiss_metric(metric_str).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
-
-        let dtype = FaissDtype::from_str(dtype_str).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
-
-        let factory = dtype.index_factory_string(cli.connectivity);
-        let dim = if dtype.is_binary() {
-            dimensions * 8
-        } else {
-            dimensions
-        } as u32;
-
-        let index = faiss::index::index_factory(dim, &factory, faiss_metric).unwrap_or_else(|e| {
-            eprintln!("Failed to create FAISS index: {e}");
-            std::process::exit(1);
-        });
-
-        let description = format!(
-            "faiss · {} · {} · M={} · {} threads",
-            dtype.as_str(),
-            metric_label(metric_str),
+    for (dtype, metric) in iproduct!(&cli.dtype, &cli.metric) {
+        let mut index = FaissBackend::new(
+            dimensions,
+            dtype,
+            metric,
             cli.connectivity,
+            cli.expansion_add,
+            cli.expansion_search,
             cli.threads,
-        );
-        let metadata = {
-            use serde_json::json;
-            let mut m = std::collections::HashMap::new();
-            m.insert("backend".into(), json!("faiss"));
-            m.insert("dtype".into(), json!(dtype.as_str()));
-            m.insert("metric".into(), json!(metric_label(metric_str)));
-            m.insert("connectivity".into(), json!(cli.connectivity));
-            m.insert("threads".into(), json!(cli.threads));
-            m
-        };
-        let mut backend = FaissBackend { index, description, metadata };
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
 
-        run(&mut backend, &mut state).unwrap_or_else(|e| {
+        run(&mut index, &mut state).unwrap_or_else(|e| {
             eprintln!("Benchmark failed: {e}");
             std::process::exit(1);
         });

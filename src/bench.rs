@@ -170,6 +170,17 @@ impl BenchState {
 
         // Create output directory if specified
         if let Some(dir) = &args.output {
+            if dir
+                .extension()
+                .is_some_and(|ext| ext == "json" || ext == "jsonl")
+            {
+                return Err(format!(
+                    "--output should be a directory, not a file: {}. \
+                     Each config produces its own JSON file inside this directory.",
+                    dir.display()
+                )
+                .into());
+            }
             std::fs::create_dir_all(dir)?;
         }
 

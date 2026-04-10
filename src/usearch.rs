@@ -5,7 +5,8 @@
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --dtype f32,f16,i8 \
+//!     --dtype f32,bf16,e5m2 \
+//!     --shards 2 \
 //!     --metric l2 \
 //!     --output turing-10M.jsonl
 //! ```
@@ -24,23 +25,23 @@ struct Cli {
     common: CommonArgs,
 
     /// Quantization types (comma-separated)
-    #[arg(long, value_delimiter = ',', default_value = "f32")]
+    #[arg(long, value_delimiter = ',', default_value = "bf16")]
     dtype: Vec<String>,
 
     /// Distance metric: ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence
     #[arg(long, value_delimiter = ',', default_value = "l2")]
     metric: Vec<String>,
 
-    /// HNSW connectivity M (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "16")]
+    /// HNSW connectivity M (comma-separated for sweep, 0 = USearch default)
+    #[arg(long, value_delimiter = ',', default_value = "0")]
     connectivity: Vec<usize>,
 
-    /// HNSW construction expansion factor (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "128")]
+    /// HNSW construction expansion factor (comma-separated for sweep, 0 = USearch default)
+    #[arg(long, value_delimiter = ',', default_value = "0")]
     expansion_add: Vec<usize>,
 
-    /// HNSW search expansion factor (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "64")]
+    /// HNSW search expansion factor (comma-separated for sweep, 0 = USearch default)
+    #[arg(long, value_delimiter = ',', default_value = "0")]
     expansion_search: Vec<usize>,
 
     /// Number of index shards (comma-separated for sweep)
@@ -133,8 +134,18 @@ impl USearchBackend {
         let pool = ThreadPool::try_spawn(threads)
             .map_err(|e| format!("failed to create thread pool: {e}"))?;
 
+        let fmt_param = |v: usize| {
+            if v == 0 {
+                "auto".to_string()
+            } else {
+                v.to_string()
+            }
+        };
         let mut desc = format!(
-            "usearch · {dtype_name} · {metric_name} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads",
+            "usearch · {dtype_name} · {metric_name} · M={} · ef={}/{} · {threads} threads",
+            fmt_param(connectivity),
+            fmt_param(expansion_add),
+            fmt_param(expansion_search),
         );
         if shards > 1 {
             desc.push_str(&format!(" · {shards} shards"));
