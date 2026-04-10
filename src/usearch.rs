@@ -116,7 +116,9 @@ fn parse_metric(s: &str) -> Result<::usearch::MetricKind, String> {
         "pearson" => Ok(::usearch::MetricKind::Pearson),
         "haversine" => Ok(::usearch::MetricKind::Haversine),
         "divergence" | "jensenshannon" => Ok(::usearch::MetricKind::Divergence),
-        _ => Err(format!("unknown metric: {s}. supported: ip, l2sq, cos, hamming, jaccard, sorensen, pearson, haversine, divergence")),
+        _ => Err(format!(
+            "unknown metric: {s}. supported: ip, l2sq, cos, hamming, jaccard, sorensen, pearson, haversine, divergence"
+        )),
     }
 }
 
@@ -177,14 +179,10 @@ impl USearchBackend {
 
         let mut shard_vec = Vec::with_capacity(shards);
         for _ in 0..shards {
-            shard_vec.push(
-                ::usearch::Index::new(&opts)
-                    .map_err(|e| format!("failed to create USearch index: {e}"))?,
-            );
+            shard_vec.push(::usearch::Index::new(&opts).map_err(|e| format!("failed to create USearch index: {e}"))?);
         }
 
-        let pool = ThreadPool::try_spawn(threads)
-            .map_err(|e| format!("failed to create thread pool: {e}"))?;
+        let pool = ThreadPool::try_spawn(threads).map_err(|e| format!("failed to create thread pool: {e}"))?;
 
         let fmt_param = |v: usize| {
             if v == 0 {
@@ -222,10 +220,6 @@ impl USearchBackend {
         })
     }
 
-    fn pool_mut(&self) -> &mut ThreadPool {
-        unsafe { &mut *self.pool.get() }
-    }
-
     fn shard_count(&self) -> usize {
         self.shards.len()
     }
@@ -244,10 +238,11 @@ impl Backend for USearchBackend {
         let num_vectors = keys.len();
         let dimensions = vectors.dimensions;
         let shard_count = self.shard_count();
-        let pool = self.pool_mut();
+        // SAFETY: `run` calls `add` and `search` sequentially, never concurrently.
+        let pool = unsafe { &mut *self.pool.get() };
         let threads = pool.threads();
 
-        let per_shard = div_ceil(num_vectors, shard_count);
+        let per_shard = num_vectors.div_ceil(shard_count);
         for shard in &self.shards {
             shard
                 .reserve_capacity_and_threads(shard.size() + per_shard, threads)
@@ -275,7 +270,7 @@ impl Backend for USearchBackend {
                         .add(keys[i] as u64, &data[i * dimensions..(i + 1) * dimensions])
                         .is_ok(),
                     VectorSlice::B1x8(data) => {
-                        let stride = div_ceil(dimensions, 8);
+                        let stride = dimensions.div_ceil(8);
                         shard
                             .add(
                                 keys[i] as u64,
@@ -316,7 +311,8 @@ impl Backend for USearchBackend {
         let keys_ptr = SyncMutPtr::new(out_keys.as_mut_ptr());
         let dists_ptr = SyncMutPtr::new(out_distances.as_mut_ptr());
         let counts_ptr = SyncMutPtr::new(out_counts.as_mut_ptr());
-        let pool = self.pool_mut();
+        // SAFETY: `run` calls `add` and `search` sequentially, never concurrently.
+        let pool = unsafe { &mut *self.pool.get() };
         let threads = pool.threads();
         let failed = AtomicBool::new(false);
         let split = IndexedSplit::new(num_queries, threads);
@@ -340,21 +336,12 @@ impl Backend for USearchBackend {
 
                 for shard in shards {
                     let result = match queries.data {
-                        VectorSlice::F32(data) => {
-                            shard.search(&data[i * dimensions..(i + 1) * dimensions], count)
-                        }
-                        VectorSlice::I8(data) => {
-                            shard.search(&data[i * dimensions..(i + 1) * dimensions], count)
-                        }
-                        VectorSlice::U8(data) => {
-                            shard.search(&data[i * dimensions..(i + 1) * dimensions], count)
-                        }
+                        VectorSlice::F32(data) => shard.search(&data[i * dimensions..(i + 1) * dimensions], count),
+                        VectorSlice::I8(data) => shard.search(&data[i * dimensions..(i + 1) * dimensions], count),
+                        VectorSlice::U8(data) => shard.search(&data[i * dimensions..(i + 1) * dimensions], count),
                         VectorSlice::B1x8(data) => {
-                            let stride = div_ceil(dimensions, 8);
-                            shard.search(
-                                ::usearch::b1x8::from_u8s(&data[i * stride..(i + 1) * stride]),
-                                count,
-                            )
+                            let stride = dimensions.div_ceil(8);
+                            shard.search(::usearch::b1x8::from_u8s(&data[i * stride..(i + 1) * stride]), count)
                         }
                     };
 

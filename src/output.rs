@@ -78,8 +78,7 @@ pub fn collect_machine_info() -> MachineInfo {
 
 /// Write a ConfigReport as pretty JSON to a file.
 pub fn write_report(path: &Path, report: &ConfigReport) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
     std::fs::write(path, json)
 }
 

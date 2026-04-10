@@ -25,11 +25,6 @@ pub use output::{
 
 // #region Core types
 
-/// Integer division rounding up: `div_ceil(7, 3) == 3`.
-pub const fn div_ceil(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
-}
-
 /// Vector key type used throughout the benchmark.
 pub type Key = u32;
 
@@ -70,8 +65,12 @@ impl Vectors<'_> {
             VectorSlice::F32(data) => data.len() / dimensions,
             VectorSlice::I8(data) => data.len() / dimensions,
             VectorSlice::U8(data) => data.len() / dimensions,
-            VectorSlice::B1x8(data) => data.len() / div_ceil(dimensions, 8),
+            VectorSlice::B1x8(data) => data.len() / dimensions.div_ceil(8),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -100,7 +99,7 @@ pub fn format_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(c);
@@ -298,7 +297,7 @@ pub fn run(
     eprintln!("\n── {description} ──");
 
     let num_steps = state.epochs;
-    let step_size = div_ceil(total_vectors, num_steps);
+    let step_size = total_vectors.div_ceil(num_steps);
     let add_style = ProgressStyle::default_bar()
         .template("  add    [{elapsed_precise}] {bar:40.cyan/blue} {msg}")
         .unwrap()

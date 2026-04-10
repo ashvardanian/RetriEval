@@ -100,8 +100,7 @@ unsafe impl numkong::Allocator for CudaAllocator {
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: std::alloc::Layout) {
         if layout.size() > 0 {
-            let _ =
-                cuvs_sys::cuvsRMMFree(self.0, ptr.as_ptr() as *mut std::ffi::c_void, layout.size());
+            let _ = cuvs_sys::cuvsRMMFree(self.0, ptr.as_ptr() as *mut std::ffi::c_void, layout.size());
         }
     }
 }
@@ -171,9 +170,7 @@ impl CuvsDtype {
             "f16" => Ok(Self::F16),
             "i8" => Ok(Self::I8),
             "u8" => Ok(Self::U8),
-            _ => Err(format!(
-                "unknown CAGRA dtype: {s}. supported: f32, f16, i8, u8"
-            )),
+            _ => Err(format!("unknown CAGRA dtype: {s}. supported: f32, f16, i8, u8")),
         }
     }
 
@@ -212,9 +209,7 @@ impl CuvsDtype {
     fn convert_from_f32(self, source: &[f32], output: &mut Vec<u8>) {
         match self {
             Self::F32 => {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * 4)
-                };
+                let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * 4) };
                 output.extend_from_slice(bytes);
             }
             Self::F16 => {
@@ -266,26 +261,14 @@ enum GpuQueries {
 }
 
 impl GpuQueries {
-    fn allocate(
-        dtype: CuvsDtype,
-        shape: &[usize],
-        allocator: CudaAllocator,
-    ) -> Result<Self, String> {
+    fn allocate(dtype: CuvsDtype, shape: &[usize], allocator: CudaAllocator) -> Result<Self, String> {
         let error = |e| format!("GPU query alloc failed: {e}");
         unsafe {
             Ok(match dtype {
-                CuvsDtype::F32 => {
-                    Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
-                }
-                CuvsDtype::F16 => {
-                    Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
-                }
-                CuvsDtype::I8 => {
-                    Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
-                }
-                CuvsDtype::U8 => {
-                    Self::U8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
-                }
+                CuvsDtype::F32 => Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDtype::F16 => Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDtype::I8 => Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDtype::U8 => Self::U8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
             })
         }
     }
@@ -296,15 +279,6 @@ impl GpuQueries {
             Self::F16(tensor) => tensor.as_mut_ptr() as _,
             Self::I8(tensor) => tensor.as_mut_ptr() as _,
             Self::U8(tensor) => tensor.as_mut_ptr() as _,
-        }
-    }
-
-    fn byte_size(&self) -> usize {
-        match self {
-            Self::F32(tensor) => tensor.numel() * 4,
-            Self::F16(tensor) => tensor.numel() * 2,
-            Self::I8(tensor) => tensor.numel(),
-            Self::U8(tensor) => tensor.numel(),
         }
     }
 }
@@ -343,13 +317,10 @@ impl SearchBuffers {
         let error = |e| format!("GPU alloc failed: {e}");
         let queries = GpuQueries::allocate(dtype, &[num_queries, dimensions], allocator.clone())?;
         let neighbors = unsafe {
-            GpuTensor::<Key>::try_empty_in(&[num_queries, neighbor_count], allocator.clone())
-                .map_err(error)?
+            GpuTensor::<Key>::try_empty_in(&[num_queries, neighbor_count], allocator.clone()).map_err(error)?
         };
-        let distances = unsafe {
-            GpuTensor::<Distance>::try_empty_in(&[num_queries, neighbor_count], allocator)
-                .map_err(error)?
-        };
+        let distances =
+            unsafe { GpuTensor::<Distance>::try_empty_in(&[num_queries, neighbor_count], allocator).map_err(error)? };
         Ok(Self {
             queries,
             neighbors,
@@ -439,9 +410,7 @@ fn parse_build_algo(s: &str) -> Result<cuvs_sys::cuvsCagraGraphBuildAlgo, String
     match s {
         "auto" => Ok(cuvs_sys::cuvsCagraGraphBuildAlgo::AUTO_SELECT),
         "nn_descent" => Ok(cuvs_sys::cuvsCagraGraphBuildAlgo::NN_DESCENT),
-        _ => Err(format!(
-            "unknown build algo: {s}. supported: auto, nn_descent"
-        )),
+        _ => Err(format!("unknown build algo: {s}. supported: auto, nn_descent")),
     }
 }
 
@@ -495,8 +464,7 @@ impl CuvsBackend {
         let metric = parse_metric(metric_name)?;
         let dtype = CuvsDtype::from_str(dtype_name)?;
         let build_algo = parse_build_algo(build_algo_name)?;
-        let res =
-            cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
+        let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
         let cuda_alloc = CudaAllocator(res.0);
 
         let description = format!(
@@ -510,10 +478,7 @@ impl CuvsBackend {
         metadata.insert("dtype".into(), json!(dtype.as_str()));
         metadata.insert("metric".into(), json!(metric_label(metric_name)));
         metadata.insert("graph_degree".into(), json!(graph_degree));
-        metadata.insert(
-            "intermediate_graph_degree".into(),
-            json!(intermediate_graph_degree),
-        );
+        metadata.insert("intermediate_graph_degree".into(), json!(intermediate_graph_degree));
         metadata.insert("itopk_size".into(), json!(itopk_size));
         metadata.insert("search_width".into(), json!(search_width));
 
@@ -542,10 +507,7 @@ impl CuvsBackend {
     }
 
     /// Create search params once, reused across all search calls.
-    fn build_search_params(
-        &self,
-        neighbor_count: usize,
-    ) -> Result<cuvs::cagra::SearchParams, String> {
+    fn build_search_params(&self, neighbor_count: usize) -> Result<cuvs::cagra::SearchParams, String> {
         let effective_itopk = self.itopk_size.max(neighbor_count);
         let params = cuvs::cagra::SearchParams::new()
             .map_err(|e| format!("search params: {e}"))?
@@ -602,7 +564,7 @@ impl CuvsBackend {
 
     /// Copy device tensor to a pre-allocated host slice, synchronising the stream.
     unsafe fn device_to_host<T>(&self, device_ptr: *const T, host: &mut [T]) -> Result<(), String> {
-        let bytes = host.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(host);
         let stream = self.res.get_cuda_stream().map_err(|e| format!("{e}"))?;
         let err = cuvs_sys::cudaMemcpyAsync(
             host.as_mut_ptr() as *mut _,
@@ -618,11 +580,7 @@ impl CuvsBackend {
     }
 
     /// Copy host bytes to a pre-allocated device pointer.
-    unsafe fn host_to_device(
-        &self,
-        host: &[u8],
-        device_ptr: *mut std::ffi::c_void,
-    ) -> Result<(), String> {
+    unsafe fn host_to_device(&self, host: &[u8], device_ptr: *mut std::ffi::c_void) -> Result<(), String> {
         let stream = self.res.get_cuda_stream().map_err(|e| format!("{e}"))?;
         let err = cuvs_sys::cudaMemcpyAsync(
             device_ptr,
@@ -649,8 +607,7 @@ impl Backend for CuvsBackend {
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let f32_data = vectors.data.to_f32();
-        self.dtype
-            .convert_from_f32(&f32_data, &mut self.host_vectors);
+        self.dtype.convert_from_f32(&f32_data, &mut self.host_vectors);
         self.host_keys.extend_from_slice(keys);
         self.dirty.set(true);
         Ok(())
@@ -698,8 +655,7 @@ impl Backend for CuvsBackend {
             unsafe { self.host_to_device(bytes, buffers.queries.as_mut_ptr())? };
         } else {
             buffers.query_staging.clear();
-            self.dtype
-                .convert_from_f32(&query_f32, &mut buffers.query_staging);
+            self.dtype.convert_from_f32(&query_f32, &mut buffers.query_staging);
             unsafe { self.host_to_device(&buffers.query_staging, buffers.queries.as_mut_ptr())? };
         }
 
@@ -734,9 +690,7 @@ impl Backend for CuvsBackend {
             ))
         };
 
-        let index = unsafe { &*self.index.get() }
-            .as_ref()
-            .ok_or("index not built")?;
+        let index = unsafe { &*self.index.get() }.as_ref().ok_or("index not built")?;
 
         index
             .search(
@@ -760,7 +714,7 @@ impl Backend for CuvsBackend {
 
         // Map CAGRA 0-based indices back to original keys.
         let num_indexed = self.host_keys.len();
-        for query_idx in 0..num_queries {
+        for (query_idx, found_count) in out_counts[..num_queries].iter_mut().enumerate() {
             let offset = query_idx * count;
             let mut found = 0;
             for rank in 0..count {
@@ -774,7 +728,7 @@ impl Backend for CuvsBackend {
                     out_distances[offset + rank] = Distance::INFINITY;
                 }
             }
-            out_counts[query_idx] = found;
+            *found_count = found;
         }
 
         Ok(())

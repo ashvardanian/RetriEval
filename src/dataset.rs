@@ -60,7 +60,7 @@ impl Dataset {
             "fbin" => (dimensions * 4, ScalarFormat::F32),
             "u8bin" => (dimensions, ScalarFormat::U8),
             "i8bin" => (dimensions, ScalarFormat::I8),
-            "b1bin" => (crate::div_ceil(dimensions, 8), ScalarFormat::B1x8),
+            "b1bin" => (dimensions.div_ceil(8), ScalarFormat::B1x8),
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -250,8 +250,8 @@ impl Keys {
                 unsafe { std::slice::from_raw_parts(mmap[offset..].as_ptr() as *const Key, count) }
             }
             Keys::Sequential { .. } => {
-                for i in 0..count {
-                    scratch[i] = (start + i) as Key;
+                for (i, slot) in scratch[..count].iter_mut().enumerate() {
+                    *slot = (start + i) as Key;
                 }
                 &scratch[..count]
             }
@@ -278,9 +278,7 @@ impl GroundTruth {
         if mmap.len() < expected {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "ground truth too small: expected {expected} bytes for {queries}x{neighbors_per_query}"
-                ),
+                format!("ground truth too small: expected {expected} bytes for {queries}x{neighbors_per_query}"),
             ));
         }
 
@@ -302,11 +300,6 @@ impl GroundTruth {
     /// Get the ground-truth neighbor IDs for a specific query.
     pub fn neighbors(&self, query_idx: usize) -> &[Key] {
         let offset = 8 + query_idx * self.neighbors_per_query * std::mem::size_of::<Key>();
-        unsafe {
-            std::slice::from_raw_parts(
-                self.mmap[offset..].as_ptr() as *const Key,
-                self.neighbors_per_query,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.mmap[offset..].as_ptr() as *const Key, self.neighbors_per_query) }
     }
 }

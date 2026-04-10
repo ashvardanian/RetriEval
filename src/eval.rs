@@ -17,7 +17,7 @@ pub fn recall_at_k(
 
     let mut hits = 0usize;
 
-    for query_idx in 0..num_queries {
+    for (query_idx, &found_count) in out_counts[..num_queries].iter().enumerate() {
         let ground_truth_neighbors = ground_truth.neighbors(query_idx);
         if ground_truth_neighbors.is_empty() {
             continue;
@@ -25,7 +25,7 @@ pub fn recall_at_k(
         let true_nearest = ground_truth_neighbors[0];
 
         let offset = query_idx * max_count;
-        let found = out_counts[query_idx].min(k);
+        let found = found_count.min(k);
         if out_keys[offset..offset + found].contains(&true_nearest) {
             hits += 1;
         }
@@ -59,20 +59,17 @@ pub fn ndcg_at_k(
     let discount = discount_table(k);
     let mut total_ndcg = 0.0;
 
-    for query_idx in 0..num_queries {
+    for (query_idx, &found_count) in out_counts[..num_queries].iter().enumerate() {
         let ground_truth_neighbors = ground_truth.neighbors(query_idx);
         let ground_truth_count = ground_truth_neighbors.len().min(k);
         let offset = query_idx * max_count;
-        let found = out_counts[query_idx].min(k);
+        let found = found_count.min(k);
         let results = &out_keys[offset..offset + found];
 
         let mut dcg = 0.0;
         for (rank, &key) in results.iter().enumerate() {
-            for gt_rank in 0..ground_truth_count {
-                if key == ground_truth_neighbors[gt_rank] {
-                    dcg += discount[rank];
-                    break;
-                }
+            if ground_truth_neighbors[..ground_truth_count].contains(&key) {
+                dcg += discount[rank];
             }
         }
 

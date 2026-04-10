@@ -2,19 +2,31 @@
 //!
 //! ## Prerequisites
 //!
-//! Requires system `libfaiss` discoverable via `pkg-config`.
-//! Install with your package manager or build from source:
+//! Requires the FAISS C API library (`libfaiss_c`). Install via conda:
 //!
 //! ```sh
-//! # Ubuntu / Debian
-//! sudo apt install libfaiss-dev
-//! # or build from source: https://github.com/facebookresearch/faiss/blob/main/INSTALL.md
+//! conda install -c conda-forge libfaiss
+//! ```
+//!
+//! The conda package includes `libfaiss.so` but not the C API wrapper.
+//! Build `libfaiss_c.so` from the FAISS source `c_api/` directory against
+//! the installed `libfaiss`:
+//!
+//! ```sh
+//! git clone --depth 1 --branch v1.10.0 https://github.com/facebookresearch/faiss.git /tmp/faiss
+//! cd /tmp/faiss/c_api && mkdir build && cd build
+//! cmake .. -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
+//!     -DCMAKE_INSTALL_PREFIX="$CONDA_PREFIX" \
+//!     -DCMAKE_CXX_FLAGS="-I$CONDA_PREFIX/include" \
+//!     -DCMAKE_SHARED_LINKER_FLAGS="-L$CONDA_PREFIX/lib" \
+//!     -DBUILD_SHARED_LIBS=ON -DFAISS_ENABLE_GPU=OFF
+//! make -j$(nproc) && cp libfaiss_c.so "$CONDA_PREFIX/lib/"
 //! ```
 //!
 //! ## Build & Install
 //!
 //! ```sh
-//! cargo install --path . --features faiss-backend
+//! RUSTFLAGS="-L $CONDA_PREFIX/lib" cargo install --path . --features faiss-backend
 //! ```
 //!
 //! ## Examples
@@ -97,9 +109,7 @@ fn parse_metric(s: &str) -> Result<(&'static str, faiss::MetricType), String> {
     match s {
         "ip" => Ok(("ip", faiss::MetricType::InnerProduct)),
         "l2" | "l2sq" => Ok(("l2", faiss::MetricType::L2)),
-        _ => Err(format!(
-            "unknown FAISS metric: {s}. FAISS HNSW supports: ip, l2"
-        )),
+        _ => Err(format!("unknown FAISS metric: {s}. FAISS HNSW supports: ip, l2")),
     }
 }
 
@@ -117,6 +127,35 @@ fn index_factory_string(dtype: &str, connectivity: usize) -> Result<String, Stri
 
 fn is_binary(dtype: &str) -> bool {
     dtype == "b1"
+}
+
+/// Unpack FAISS search results into output buffers.
+/// Generic over the distance type — FAISS returns `f32` for float indices and `i32` for binary.
+fn unpack_search_results<D: Copy>(
+    labels: &[faiss::Idx],
+    distances: &[D],
+    count: usize,
+    to_distance: impl Fn(D) -> Distance,
+    out_keys: &mut [Key],
+    out_distances: &mut [Distance],
+    out_counts: &mut [usize],
+) {
+    for (query_idx, found_count) in out_counts.iter_mut().enumerate() {
+        let offset = query_idx * count;
+        let mut found = 0;
+        for rank in 0..count {
+            let neighbor_idx = labels[offset + rank];
+            if let Some(id) = neighbor_idx.get() {
+                out_keys[offset + rank] = id as Key;
+                out_distances[offset + rank] = to_distance(distances[offset + rank]);
+                found += 1;
+            } else {
+                out_keys[offset + rank] = Key::MAX;
+                out_distances[offset + rank] = Distance::INFINITY;
+            }
+        }
+        *found_count = found;
+    }
 }
 
 enum FaissIndex {
@@ -243,61 +282,42 @@ impl Backend for FaissBackend {
         // the only reader and FAISS is internally thread-safe via OpenMP.
         match &self.index {
             FaissIndex::Float(index) => {
-                let dimensions = queries.dimensions;
                 let data = queries.data.to_f32();
-                let num_queries = data.len() / dimensions;
 
                 let result = unsafe { &mut *index.get() }
                     .search(&data, count)
                     .map_err(|e| format!("FAISS search failed: {e}"))?;
 
-                for query_idx in 0..num_queries {
-                    let offset = query_idx * count;
-                    let mut found = 0;
-                    for rank in 0..count {
-                        let neighbor_idx = result.labels[offset + rank];
-                        if let Some(id) = neighbor_idx.get() {
-                            out_keys[offset + rank] = id as Key;
-                            out_distances[offset + rank] = result.distances[offset + rank];
-                            found += 1;
-                        } else {
-                            out_keys[offset + rank] = Key::MAX;
-                            out_distances[offset + rank] = Distance::INFINITY;
-                        }
-                    }
-                    out_counts[query_idx] = found;
-                }
+                unpack_search_results(
+                    &result.labels,
+                    &result.distances,
+                    count,
+                    |d| d,
+                    out_keys,
+                    out_distances,
+                    out_counts,
+                );
                 Ok(())
             }
             FaissIndex::Binary(index) => {
-                let bytes_per_vector = retrieval::div_ceil(queries.dimensions, 8);
                 let data = match &queries.data {
                     retrieval::VectorSlice::B1x8(bytes) => *bytes,
                     _ => return Err("FAISS binary index requires B1x8 data".into()),
                 };
-                let num_queries = data.len() / bytes_per_vector;
 
                 let result = unsafe { &mut *index.get() }
                     .search(data, count)
                     .map_err(|e| format!("FAISS binary search failed: {e}"))?;
 
-                for query_idx in 0..num_queries {
-                    let offset = query_idx * count;
-                    let mut found = 0;
-                    for rank in 0..count {
-                        let neighbor_idx = result.labels[offset + rank];
-                        if let Some(id) = neighbor_idx.get() {
-                            out_keys[offset + rank] = id as Key;
-                            out_distances[offset + rank] =
-                                result.distances[offset + rank] as Distance;
-                            found += 1;
-                        } else {
-                            out_keys[offset + rank] = Key::MAX;
-                            out_distances[offset + rank] = Distance::INFINITY;
-                        }
-                    }
-                    out_counts[query_idx] = found;
-                }
+                unpack_search_results(
+                    &result.labels,
+                    &result.distances,
+                    count,
+                    |d| d as Distance,
+                    out_keys,
+                    out_distances,
+                    out_counts,
+                );
                 Ok(())
             }
         }
