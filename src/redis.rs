@@ -1,7 +1,7 @@
 //! Redis/RediSearch benchmark binary.
 //!
 //! ```sh
-//! cargo run --release --bin bench-redis --features redis-backend -- \
+//! cargo run --release --bin retri-eval-redis --features redis-backend -- \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
@@ -13,12 +13,11 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use clap::Parser;
-use usearch_bench::docker::ContainerHandle;
-use usearch_bench::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::docker::ContainerHandle;
+use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
 
 const INDEX_NAME: &str = "bench_idx";
 const PREFIX: &str = "vec:";
-const BATCH_SIZE: usize = 1_000;
 
 // #region Local metric mapping
 
@@ -34,7 +33,7 @@ fn parse_redis_metric(s: &str) -> Result<&'static str, String> {
 // #region CLI
 
 #[derive(Parser, Debug)]
-#[command(name = "bench-redis", about = "Benchmark Redis/RediSearch")]
+#[command(name = "retri-eval-redis", about = "Benchmark Redis/RediSearch")]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
@@ -50,6 +49,14 @@ struct Cli {
 
     #[arg(long, default_value_t = 120)]
     docker_timeout: u64,
+
+    /// Redis port
+    #[arg(long, default_value_t = 6379)]
+    port: u16,
+
+    /// Batch size for pipeline operations
+    #[arg(long, default_value_t = 1_000)]
+    batch_size: usize,
 }
 
 // #region Backend
@@ -58,7 +65,9 @@ struct RedisBackend {
     connection: RefCell<redis::Connection>,
     container: Option<ContainerHandle>,
     runtime: tokio::runtime::Handle,
+    batch_size: usize,
     description: String,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 unsafe impl Send for RedisBackend {}
@@ -68,19 +77,27 @@ impl Backend for RedisBackend {
         self.description.clone()
     }
 
+    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.metadata.clone()
+    }
+
     fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let data = vectors.data.to_f32();
         let dimensions = vectors.dimensions;
         let num_vectors = data.len() / dimensions;
 
-        for batch_start in (0..num_vectors).step_by(BATCH_SIZE) {
-            let batch_end = (batch_start + BATCH_SIZE).min(num_vectors);
+        let mut vec_bytes = vec![0u8; dimensions * 4];
+
+        for batch_start in (0..num_vectors).step_by(self.batch_size) {
+            let batch_end = (batch_start + self.batch_size).min(num_vectors);
             let mut pipe = redis::pipe();
             for i in batch_start..batch_end {
-                let vec_bytes: Vec<u8> = data[i * dimensions..(i + 1) * dimensions]
+                for (j, f) in data[i * dimensions..(i + 1) * dimensions]
                     .iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
+                    .enumerate()
+                {
+                    vec_bytes[j * 4..(j + 1) * 4].copy_from_slice(&f.to_le_bytes());
+                }
                 let key = format!("{PREFIX}{i}");
                 pipe.cmd("HSET").arg(&key).arg("vector").arg(&vec_bytes[..]);
             }
@@ -103,12 +120,15 @@ impl Backend for RedisBackend {
         let dimensions = queries.dimensions;
         let num_vectors = data.len() / dimensions;
         let query_str = format!("*=>[KNN {count} @vector $BLOB]");
+        let mut query_bytes = vec![0u8; dimensions * 4];
 
         for q in 0..num_vectors {
-            let query_bytes: Vec<u8> = data[q * dimensions..(q + 1) * dimensions]
+            for (i, f) in data[q * dimensions..(q + 1) * dimensions]
                 .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
+                .enumerate()
+            {
+                query_bytes[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+            }
 
             let raw: redis::Value = redis::cmd("FT.SEARCH")
                 .arg(INDEX_NAME)
@@ -178,10 +198,13 @@ fn parse_ft_search(value: &redis::Value) -> Vec<(Key, Distance)> {
             if let redis::Value::Array(ref fields) = items[i + 1] {
                 let mut j = 0;
                 while j + 1 < fields.len() {
-                    if let redis::Value::BulkString(b) = &fields[j] {
-                        if String::from_utf8_lossy(b) == "__vector_score" {
-                            if let redis::Value::BulkString(b) = &fields[j + 1] {
-                                score = String::from_utf8_lossy(b).parse().unwrap_or(0.0);
+                    if let redis::Value::BulkString(name) = &fields[j] {
+                        if name == b"__vector_score" {
+                            if let redis::Value::BulkString(val) = &fields[j + 1] {
+                                score = std::str::from_utf8(val)
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0.0);
                             }
                         }
                     }
@@ -213,15 +236,15 @@ fn main() {
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start(
             "redis/redis-stack:latest",
-            "usearch-bench-redis",
-            &vec![(6379, 6379)],
+            "retrieval-redis",
+            &vec![(cli.port, 6379)],
             &[],
             timeout,
         )
         .await
         .expect("docker start");
         handle
-            .wait_for_tcp("localhost", 6379, timeout)
+            .wait_for_tcp("localhost", cli.port, timeout)
             .await
             .expect("redis not ready");
         handle
@@ -233,7 +256,8 @@ fn main() {
     });
     let dimensions = state.dimensions();
 
-    let client = redis::Client::open("redis://localhost:6379/").expect("redis client");
+    let redis_url = format!("redis://localhost:{}/", cli.port);
+    let client = redis::Client::open(redis_url.as_str()).expect("redis client");
     let mut conn = client.get_connection().expect("redis connection");
 
     let _: () = redis::cmd("FLUSHALL").query(&mut conn).expect("FLUSHALL");
@@ -266,10 +290,20 @@ fn main() {
         connection: RefCell::new(conn),
         container: Some(handle),
         runtime: runtime.handle().clone(),
+        batch_size: cli.batch_size,
         description: format!(
             "redis · {} · M={} · ef={} · {dimensions}d",
             cli.metric, cli.connectivity, cli.expansion_add,
         ),
+        metadata: {
+            use serde_json::json;
+            let mut m = std::collections::HashMap::new();
+            m.insert("backend".into(), json!("redis"));
+            m.insert("metric".into(), json!(&cli.metric));
+            m.insert("connectivity".into(), json!(cli.connectivity));
+            m.insert("expansion_add".into(), json!(cli.expansion_add));
+            m
+        },
     };
 
     run(&mut backend, &mut state).unwrap_or_else(|e| {

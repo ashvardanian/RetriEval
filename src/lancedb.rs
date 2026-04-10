@@ -1,7 +1,7 @@
 //! LanceDB benchmark binary (in-process, no Docker).
 //!
 //! ```sh
-//! cargo run --release --bin bench-lancedb --features lancedb-backend -- \
+//! cargo run --release --bin retri-eval-lancedb --features lancedb-backend -- \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
@@ -15,7 +15,7 @@ use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use clap::Parser;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use usearch_bench::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
 
 const TABLE_NAME: &str = "bench";
 
@@ -33,13 +33,17 @@ fn parse_lancedb_metric(s: &str) -> Result<lancedb::DistanceType, String> {
 // #region CLI
 
 #[derive(Parser, Debug)]
-#[command(name = "bench-lancedb", about = "Benchmark LanceDB")]
+#[command(name = "retri-eval-lancedb", about = "Benchmark LanceDB")]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
     #[arg(long, default_value = "l2")]
     metric: String,
+
+    /// Path for LanceDB storage
+    #[arg(long, default_value = "/tmp/retrieval-lancedb")]
+    db_path: String,
 }
 
 // #region Backend
@@ -51,6 +55,7 @@ struct LanceDbBackend {
     metric: String,
     runtime: tokio::runtime::Handle,
     description: String,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl LanceDbBackend {
@@ -87,6 +92,10 @@ impl LanceDbBackend {
 impl Backend for LanceDbBackend {
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.metadata.clone()
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
@@ -198,7 +207,7 @@ fn main() {
         .build()
         .expect("tokio");
     let db = runtime.block_on(async {
-        lancedb::connect("/tmp/usearch-bench-lancedb")
+        lancedb::connect(&cli.db_path)
             .execute()
             .await
             .expect("lancedb connect")
@@ -218,6 +227,13 @@ fn main() {
         metric: cli.metric.clone(),
         runtime: runtime.handle().clone(),
         description: format!("lancedb · {} · {dimensions}d", cli.metric),
+        metadata: {
+            use serde_json::json;
+            let mut m = std::collections::HashMap::new();
+            m.insert("backend".into(), json!("lancedb"));
+            m.insert("metric".into(), json!(&cli.metric));
+            m
+        },
     };
 
     run(&mut backend, &mut state).unwrap_or_else(|e| {

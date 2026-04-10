@@ -1,7 +1,7 @@
 //! FAISS HNSW benchmark binary.
 //!
 //! ```sh
-//! cargo run --release --bin bench-faiss --features faiss-backend -- \
+//! cargo run --release --bin retri-eval-faiss --features faiss-backend -- \
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
@@ -13,7 +13,7 @@
 
 use clap::Parser;
 use itertools::iproduct;
-use usearch_bench::{
+use retrieval::{
     dataset, div_ceil, fmt_thousands, run, Backend, BenchState, CommonArgs, Distance, Key,
     VectorSlice, Vectors,
 };
@@ -25,7 +25,7 @@ extern "C" {
 // #region CLI
 
 #[derive(Parser, Debug)]
-#[command(name = "bench-faiss", about = "Benchmark FAISS HNSW")]
+#[command(name = "retri-eval-faiss", about = "Benchmark FAISS HNSW")]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
@@ -121,11 +121,16 @@ impl FaissDtype {
 struct FaissBackend {
     index: faiss::Index,
     description: String,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Backend for FaissBackend {
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.metadata.clone()
     }
 
     fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
@@ -221,7 +226,17 @@ fn main() {
             cli.connectivity,
             cli.threads,
         );
-        let mut backend = FaissBackend { index, description };
+        let metadata = {
+            use serde_json::json;
+            let mut m = std::collections::HashMap::new();
+            m.insert("backend".into(), json!("faiss"));
+            m.insert("dtype".into(), json!(dtype.as_str()));
+            m.insert("metric".into(), json!(metric_label(metric_str)));
+            m.insert("connectivity".into(), json!(cli.connectivity));
+            m.insert("threads".into(), json!(cli.threads));
+            m
+        };
+        let mut backend = FaissBackend { index, description, metadata };
 
         run(&mut backend, &mut state).unwrap_or_else(|e| {
             eprintln!("Benchmark failed: {e}");

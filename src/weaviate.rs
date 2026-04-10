@@ -1,7 +1,7 @@
 //! Weaviate benchmark binary.
 //!
 //! ```sh
-//! cargo run --release --bin bench-weaviate --features weaviate-backend -- \
+//! cargo run --release --bin retri-eval-weaviate --features weaviate-backend -- \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
@@ -12,8 +12,8 @@
 use std::time::Duration;
 
 use clap::Parser;
-use usearch_bench::docker::ContainerHandle;
-use usearch_bench::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::docker::ContainerHandle;
+use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
 use weaviate_community::collections::objects::Object;
 use weaviate_community::collections::query::RawQuery;
 use weaviate_community::collections::schema::*;
@@ -36,7 +36,7 @@ fn parse_weaviate_distance(s: &str) -> Result<DistanceMetric, String> {
 // #region CLI
 
 #[derive(Parser, Debug)]
-#[command(name = "bench-weaviate", about = "Benchmark Weaviate")]
+#[command(name = "retri-eval-weaviate", about = "Benchmark Weaviate")]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
@@ -55,6 +55,10 @@ struct Cli {
 
     #[arg(long, default_value_t = 120)]
     docker_timeout: u64,
+
+    /// Weaviate HTTP port
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
 }
 
 // #region Backend
@@ -64,6 +68,7 @@ struct WeaviateBackend {
     container: Option<ContainerHandle>,
     runtime: tokio::runtime::Handle,
     description: String,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Backend for WeaviateBackend {
@@ -71,13 +76,17 @@ impl Backend for WeaviateBackend {
         self.description.clone()
     }
 
+    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.metadata.clone()
+    }
+
     fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let data = vectors.data.to_f32();
         let dimensions = vectors.dimensions;
         let num_vectors = data.len() / dimensions;
-
         self.runtime.block_on(async {
             for i in 0..num_vectors {
+                // Weaviate community crate requires Vec<f64> by ownership — allocation unavoidable
                 let vec: Vec<f64> = data[i * dimensions..(i + 1) * dimensions]
                     .iter()
                     .map(|&x| x as f64)
@@ -170,8 +179,8 @@ fn main() {
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start(
             "semitechnologies/weaviate:latest",
-            "usearch-bench-weaviate",
-            &vec![(8080, 8080), (50051, 50051)],
+            "retrieval-weaviate",
+            &vec![(cli.port, 8080), (50051, 50051)],
             &[
                 "QUERY_DEFAULTS_LIMIT=25".into(),
                 "AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true".into(),
@@ -184,13 +193,17 @@ fn main() {
         .await
         .expect("docker start");
         handle
-            .wait_for_http("http://localhost:8080/v1/.well-known/ready", timeout)
+            .wait_for_http(
+                &format!("http://localhost:{}/v1/.well-known/ready", cli.port),
+                timeout,
+            )
             .await
             .expect("weaviate not ready");
         handle
     });
 
-    let client = WeaviateClient::new("http://localhost:8080", None, None).expect("weaviate client");
+    let client = WeaviateClient::new(&format!("http://localhost:{}", cli.port), None, None)
+        .expect("weaviate client");
 
     runtime.block_on(async {
         let _ = client.schema.delete(CLASS_NAME).await;
@@ -231,6 +244,16 @@ fn main() {
             "weaviate · {} · M={} · ef={} · {dimensions}d",
             cli.metric, cli.connectivity, cli.expansion_add,
         ),
+        metadata: {
+            use serde_json::json;
+            let mut m = std::collections::HashMap::new();
+            m.insert("backend".into(), json!("weaviate"));
+            m.insert("metric".into(), json!(&cli.metric));
+            m.insert("connectivity".into(), json!(cli.connectivity));
+            m.insert("expansion_add".into(), json!(cli.expansion_add));
+            m.insert("expansion_search".into(), json!(cli.expansion_search));
+            m
+        },
     };
 
     run(&mut backend, &mut state).unwrap_or_else(|e| {

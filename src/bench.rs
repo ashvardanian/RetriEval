@@ -10,14 +10,18 @@ pub mod eval;
 pub mod output;
 
 use std::borrow::Cow;
-use std::io::Write;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use serde_json::Value;
 
 pub use dataset::{Dataset, GroundTruth, Keys};
-pub use output::{collect_machine_info, emit, StepRecord};
+pub use output::{
+    collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo,
+    StepEntry,
+};
 
 // #region Core types
 
@@ -27,7 +31,6 @@ pub const fn div_ceil(a: usize, b: usize) -> usize {
 }
 
 /// Vector key type used throughout the benchmark.
-/// Matches the 32-bit indices in BigANN `.ibin` ground-truth files.
 pub type Key = u32;
 
 /// Distance/similarity value returned by search operations.
@@ -50,7 +53,6 @@ pub enum VectorSlice<'a> {
 }
 
 impl VectorSlice<'_> {
-    /// Convert to f32, borrowing when already f32.
     pub fn to_f32(&self) -> Cow<'_, [Distance]> {
         match self {
             VectorSlice::F32(d) => Cow::Borrowed(d),
@@ -62,7 +64,6 @@ impl VectorSlice<'_> {
 }
 
 impl Vectors<'_> {
-    /// Number of vectors in the batch.
     pub fn len(&self) -> usize {
         let d = self.dimensions;
         match self.data {
@@ -78,15 +79,9 @@ impl Vectors<'_> {
 
 /// Common trait for all vector search backends.
 pub trait Backend: Send {
-    /// Human-readable description for progress output.
     fn description(&self) -> String;
-
-    /// Add vectors with the given keys to the index.
+    fn metadata(&self) -> HashMap<String, Value>;
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String>;
-
-    /// Search for the `count` nearest neighbors of each query vector.
-    /// Writes into pre-allocated output slices (length `num_queries * count`).
-    /// Unfilled slots are set to `Key::MAX` / `Distance::INFINITY`.
     fn search(
         &self,
         queries: Vectors,
@@ -95,8 +90,6 @@ pub trait Backend: Send {
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String>;
-
-    /// Resident memory used by the index.
     fn memory_bytes(&self) -> usize;
 }
 
@@ -132,7 +125,7 @@ pub struct CommonArgs {
     #[arg(long)]
     pub neighbors: PathBuf,
 
-    /// Optional path to a keys file (.i32bin). If omitted, sequential keys 0..N are used.
+    /// Optional path to a keys file (.i32bin)
     #[arg(long)]
     pub keys: Option<PathBuf>,
 
@@ -144,14 +137,14 @@ pub struct CommonArgs {
     #[arg(long, default_value_t = false)]
     pub no_shuffle: bool,
 
-    /// Output file path (defaults to stdout)
+    /// Output directory for JSON result files
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
 
-// #region Benchmark loop
+// #region BenchState
 
-/// Pre-loaded benchmark state. Call `BenchState::load()` once, then `bench()` per configuration.
+/// Pre-loaded benchmark state. Call `BenchState::load()` once, then `run()` per configuration.
 pub struct BenchState {
     pub dataset: Dataset,
     pub keys: Keys,
@@ -159,7 +152,9 @@ pub struct BenchState {
     pub ground_truth: GroundTruth,
     pub perm: dataset::Permutation,
     pub step_size: usize,
-    writer: Box<dyn Write>,
+    pub output_dir: Option<PathBuf>,
+    pub machine_info: MachineInfo,
+    pub dataset_info: DatasetInfo,
     out_keys: Vec<Key>,
     out_distances: Vec<Distance>,
     out_counts: Vec<usize>,
@@ -168,22 +163,26 @@ pub struct BenchState {
 }
 
 impl BenchState {
-    /// Load all datasets and allocate buffers. Call once before benchmarking.
     pub fn load(args: &CommonArgs) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut writer: Box<dyn Write> = match &args.output {
-            Some(path) => Box::new(std::fs::File::create(path)?),
-            None => Box::new(std::io::stdout().lock()),
-        };
+        if args.step_size == 0 {
+            return Err("--step-size must be greater than 0".into());
+        }
 
-        emit(&mut writer, &collect_machine_info())?;
+        // Create output directory if specified
+        if let Some(dir) = &args.output {
+            std::fs::create_dir_all(dir)?;
+        }
+
+        let machine_info = collect_machine_info();
 
         eprintln!("Loading dataset: {}", args.vectors.display());
         let dataset = Dataset::load(&args.vectors)?;
         let total_vectors = dataset.rows();
+        let dimensions = dataset.dimensions();
         eprintln!(
             "  {} vectors, {} dimensions",
             fmt_thousands(total_vectors as u64),
-            dataset.dimensions()
+            dimensions
         );
 
         let keys = match &args.keys {
@@ -223,10 +222,22 @@ impl BenchState {
         let search_count = ground_truth.neighbors_per_query();
         let batch_size = 10_000.min(args.step_size);
 
+        let dataset_info = DatasetInfo {
+            vectors_path: args.vectors.display().to_string(),
+            queries_path: args.queries.display().to_string(),
+            neighbors_path: args.neighbors.display().to_string(),
+            vectors_count: total_vectors,
+            queries_count: num_queries,
+            dimensions,
+            neighbors_per_query: search_count,
+        };
+
         Ok(Self {
             perm,
             step_size: args.step_size,
-            writer,
+            output_dir: args.output.clone(),
+            machine_info,
+            dataset_info,
             out_keys: vec![0 as Key; num_queries * search_count],
             out_distances: vec![0.0 as Distance; num_queries * search_count],
             out_counts: vec![0usize; num_queries],
@@ -244,7 +255,9 @@ impl BenchState {
     }
 }
 
-/// Run one benchmark: incremental add with sub-batched progress, search + eval after each step.
+// #region Benchmark loop
+
+/// Run one benchmark configuration. Accumulates steps, writes JSON report at the end.
 pub fn run(
     index: &mut dyn Backend,
     state: &mut BenchState,
@@ -255,6 +268,7 @@ pub fn run(
     let batch_size = state.key_scratch.len();
 
     let description = index.description();
+    let metadata = index.metadata();
     eprintln!("\n── {description} ──");
 
     let num_steps = div_ceil(total_vectors, state.step_size);
@@ -267,12 +281,14 @@ pub fn run(
         .unwrap();
 
     let mut vectors_indexed = 0usize;
+    let mut steps: Vec<StepEntry> = Vec::with_capacity(num_steps);
 
     for step in 0..num_steps {
         let step_start = step * state.step_size;
         let step_count = state.step_size.min(total_vectors - step_start);
+        let is_final_step = step == num_steps - 1;
 
-        // --- Add (sub-batched for progress updates) ---
+        // --- Add ---
         let pb_add = ProgressBar::new(total_vectors as u64);
         pb_add.set_style(add_style.clone());
         pb_add.set_position(vectors_indexed as u64);
@@ -321,23 +337,6 @@ pub fn run(
         ));
         pb_add.finish();
 
-        emit(
-            &mut state.writer,
-            &StepRecord {
-                description: description.clone(),
-                phase: "add".to_string(),
-                vectors_indexed,
-                vectors_total: total_vectors,
-                elapsed_seconds: Some(add_elapsed),
-                vectors_per_second: Some(add_throughput),
-                queries_per_second: None,
-                memory_bytes: Some(index.memory_bytes() as u64),
-                recall_at_1: None,
-                recall_at_10: None,
-                ndcg_at_10: None,
-            },
-        )?;
-
         // --- Search ---
         let pb_search = ProgressBar::new_spinner();
         pb_search.set_style(search_style.clone());
@@ -385,28 +384,60 @@ pub fn run(
             10,
         );
 
+        let recall1_norm = eval::normalize_metric(recall1, vectors_indexed, total_vectors);
+        let recall10_norm = eval::normalize_metric(recall10, vectors_indexed, total_vectors);
+        let ndcg10_norm = eval::normalize_metric(ndcg10, vectors_indexed, total_vectors);
+
+        let approx = if is_final_step { "" } else { "~" };
         pb_search.finish_with_message(format!(
-            "{} QPS, recall@1={recall1:.4}, recall@10={recall10:.4}, NDCG@10={ndcg10:.4} ({} vectors)",
+            "{} QPS, {approx}recall@1={recall1_norm:.4}, {approx}recall@10={recall10_norm:.4}, {approx}NDCG@10={ndcg10_norm:.4} ({} vectors)",
             fmt_thousands(search_throughput),
             fmt_thousands(vectors_indexed as u64),
         ));
 
-        emit(
-            &mut state.writer,
-            &StepRecord {
-                description: description.clone(),
-                phase: "search".to_string(),
-                vectors_indexed,
-                vectors_total: total_vectors,
-                elapsed_seconds: Some(search_elapsed),
-                vectors_per_second: None,
-                queries_per_second: Some(search_throughput),
-                memory_bytes: None,
-                recall_at_1: Some(recall1),
-                recall_at_10: Some(recall10),
-                ndcg_at_10: Some(ndcg10),
+        steps.push(StepEntry {
+            vectors_indexed,
+            add_elapsed,
+            add_throughput,
+            memory_bytes: index.memory_bytes() as u64,
+            search_elapsed,
+            search_throughput,
+            recall_at_1: recall1,
+            recall_at_10: recall10,
+            ndcg_at_10: ndcg10,
+            recall_at_1_normalized: recall1_norm,
+            recall_at_10_normalized: recall10_norm,
+            ndcg_at_10_normalized: ndcg10_norm,
+        });
+    }
+
+    // Write JSON report if output directory is set
+    if let Some(dir) = &state.output_dir {
+        let backend_name = metadata
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let hash = config_hash(&metadata);
+        let filename = format!("{backend_name}-{hash}.json");
+        let path = dir.join(&filename);
+
+        let report = ConfigReport {
+            machine: collect_machine_info(),
+            dataset: DatasetInfo {
+                vectors_path: state.dataset_info.vectors_path.clone(),
+                queries_path: state.dataset_info.queries_path.clone(),
+                neighbors_path: state.dataset_info.neighbors_path.clone(),
+                vectors_count: state.dataset_info.vectors_count,
+                queries_count: state.dataset_info.queries_count,
+                dimensions: state.dataset_info.dimensions,
+                neighbors_per_query: state.dataset_info.neighbors_per_query,
             },
-        )?;
+            config: metadata,
+            steps,
+        };
+
+        write_report(&path, &report)?;
+        eprintln!("  → {}", path.display());
     }
 
     eprintln!();

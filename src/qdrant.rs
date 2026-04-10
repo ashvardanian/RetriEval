@@ -1,7 +1,7 @@
 //! Qdrant benchmark binary.
 //!
 //! ```sh
-//! cargo run --release --bin bench-qdrant --features qdrant-backend -- \
+//! cargo run --release --bin retri-eval-qdrant --features qdrant-backend -- \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
@@ -18,11 +18,10 @@ use qdrant_client::qdrant::{
     PointStruct, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
-use usearch_bench::docker::ContainerHandle;
-use usearch_bench::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::docker::ContainerHandle;
+use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
 
 const COLLECTION: &str = "bench";
-const BATCH_SIZE: usize = 10_000;
 
 // #region Local metric mapping
 
@@ -39,7 +38,7 @@ fn parse_qdrant_distance(s: &str) -> Result<QdrantDistance, String> {
 // #region CLI
 
 #[derive(Parser, Debug)]
-#[command(name = "bench-qdrant", about = "Benchmark Qdrant")]
+#[command(name = "retri-eval-qdrant", about = "Benchmark Qdrant")]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
@@ -53,8 +52,21 @@ struct Cli {
     #[arg(long, default_value_t = 128)]
     expansion_add: usize,
 
+    /// Docker timeout in seconds
     #[arg(long, default_value_t = 120)]
     docker_timeout: u64,
+
+    /// gRPC port for Qdrant
+    #[arg(long, default_value_t = 6334)]
+    grpc_port: u16,
+
+    /// HTTP port for Qdrant
+    #[arg(long, default_value_t = 6333)]
+    http_port: u16,
+
+    /// Batch size for upsert operations
+    #[arg(long, default_value_t = 10_000)]
+    batch_size: usize,
 }
 
 // #region Backend
@@ -62,14 +74,19 @@ struct Cli {
 struct QdrantBackend {
     client: Qdrant,
     container: Option<ContainerHandle>,
-    dimensions: usize,
     runtime: tokio::runtime::Handle,
+    batch_size: usize,
     description: String,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Backend for QdrantBackend {
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.metadata.clone()
     }
 
     fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
@@ -78,8 +95,8 @@ impl Backend for QdrantBackend {
         let num_vectors = data.len() / dimensions;
 
         self.runtime.block_on(async {
-            for batch_start in (0..num_vectors).step_by(BATCH_SIZE) {
-                let batch_end = (batch_start + BATCH_SIZE).min(num_vectors);
+            for batch_start in (0..num_vectors).step_by(self.batch_size) {
+                let batch_end = (batch_start + self.batch_size).min(num_vectors);
                 let points: Vec<PointStruct> = (batch_start..batch_end)
                     .map(|i| {
                         let vec = data[i * dimensions..(i + 1) * dimensions].to_vec();
@@ -174,21 +191,24 @@ fn main() {
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start(
             "qdrant/qdrant:latest",
-            "usearch-bench-qdrant",
-            &vec![(6333, 6333), (6334, 6334)],
+            "retrieval-qdrant",
+            &vec![(cli.http_port, 6333), (cli.grpc_port, 6334)],
             &[],
             timeout,
         )
         .await
         .expect("docker start");
         handle
-            .wait_for_http("http://localhost:6333/healthz", timeout)
+            .wait_for_http(
+                &format!("http://localhost:{}/healthz", cli.http_port),
+                timeout,
+            )
             .await
             .expect("health");
         handle
     });
 
-    let client = Qdrant::from_url("http://localhost:6334")
+    let client = Qdrant::from_url(&format!("http://localhost:{}", cli.grpc_port))
         .build()
         .expect("qdrant client");
 
@@ -217,12 +237,21 @@ fn main() {
     let mut backend = QdrantBackend {
         client,
         container: Some(handle),
-        dimensions,
         runtime: runtime.handle().clone(),
+        batch_size: cli.batch_size,
         description: format!(
             "qdrant · {} · M={} · ef={} · {dimensions}d",
             cli.metric, cli.connectivity, cli.expansion_add,
         ),
+        metadata: {
+            use serde_json::json;
+            let mut m = std::collections::HashMap::new();
+            m.insert("backend".into(), json!("qdrant"));
+            m.insert("metric".into(), json!(&cli.metric));
+            m.insert("connectivity".into(), json!(cli.connectivity));
+            m.insert("expansion_add".into(), json!(cli.expansion_add));
+            m
+        },
     };
 
     run(&mut backend, &mut state).unwrap_or_else(|e| {

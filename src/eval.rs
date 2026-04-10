@@ -86,3 +86,15 @@ pub fn ndcg_at_k(
 
     total_ndcg / num_queries as f64
 }
+
+/// Re-normalize a recall/NDCG metric for partial indexing.
+/// When only `indexed` out of `total` vectors are in the index,
+/// the expected recall for a perfect search is `indexed/total`.
+/// Normalized = raw / (indexed/total), capped at 1.0.
+pub fn normalize_metric(raw: f64, indexed: usize, total: usize) -> f64 {
+    if indexed == 0 || total == 0 {
+        return 0.0;
+    }
+    let fraction = indexed as f64 / total as f64;
+    (raw / fraction).min(1.0)
+}

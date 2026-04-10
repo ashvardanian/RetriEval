@@ -1,7 +1,7 @@
 //! USearch HNSW benchmark binary.
 //!
 //! ```sh
-//! cargo run --release --bin bench-usearch -- \
+//! cargo run --release --bin retri-eval-usearch -- \
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
@@ -15,10 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use fork_union::{IndexedSplit, SyncMutPtr, ThreadPool};
-use usearch_bench::*;
+use retrieval::*;
 
 #[derive(Parser, Debug)]
-#[command(name = "bench-usearch", about = "Benchmark USearch HNSW")]
+#[command(name = "retri-eval-usearch", about = "Benchmark USearch HNSW")]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
@@ -90,6 +90,7 @@ pub struct USearchBackend {
     shards: Vec<::usearch::Index>,
     pool: UnsafeCell<ThreadPool>,
     description: String,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 unsafe impl Sync for USearchBackend {}
@@ -139,10 +140,22 @@ impl USearchBackend {
             desc.push_str(&format!(" · {shards} shards"));
         }
 
+        use serde_json::json;
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("backend".into(), json!("usearch"));
+        meta.insert("dtype".into(), json!(dtype_name));
+        meta.insert("metric".into(), json!(metric_name));
+        meta.insert("connectivity".into(), json!(connectivity));
+        meta.insert("expansion_add".into(), json!(expansion_add));
+        meta.insert("expansion_search".into(), json!(expansion_search));
+        meta.insert("threads".into(), json!(threads));
+        meta.insert("shards".into(), json!(shards));
+
         Ok(Self {
             shards: shard_vec,
             pool: UnsafeCell::new(pool),
             description: desc,
+            metadata: meta,
         })
     }
 
@@ -158,6 +171,10 @@ impl USearchBackend {
 impl Backend for USearchBackend {
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.metadata.clone()
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {

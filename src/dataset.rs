@@ -233,9 +233,16 @@ impl Keys {
 
     /// Get the key at a specific index.
     pub fn get(&self, index: usize) -> Key {
+        debug_assert!(
+            index < self.count(),
+            "key index {index} out of bounds (count={})",
+            self.count()
+        );
         match self {
             Keys::Mapped { mmap, .. } => {
                 let offset = 8 + index * std::mem::size_of::<Key>();
+                let end = offset + std::mem::size_of::<Key>();
+                assert!(end <= mmap.len(), "key index {index} out of mmap bounds");
                 unsafe { *(mmap[offset..].as_ptr() as *const Key) }
             }
             Keys::Sequential { .. } => index as Key,

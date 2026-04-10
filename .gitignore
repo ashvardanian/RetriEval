@@ -7,3 +7,9 @@
 
 /datasets
 /data
+/plots
+*.usearch
+__pycache__/
+*.pyc
+*.pyo
+/results/

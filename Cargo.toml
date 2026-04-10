@@ -1,39 +1,39 @@
 [package]
-name = "usearch-bench"
+name = "retrieval"
 version = "0.1.0"
 edition = "2021"
-description = "Benchmark suite for vector search engines"
+description = "RetriEval — benchmark suite for vector search engines"
 
 [lib]
-name = "usearch_bench"
+name = "retrieval"
 path = "src/bench.rs"
 
 [[bin]]
-name = "bench-usearch"
+name = "retri-eval-usearch"
 path = "src/usearch.rs"
 
 [[bin]]
-name = "bench-faiss"
+name = "retri-eval-faiss"
 path = "src/faiss.rs"
 required-features = ["faiss-backend"]
 
 [[bin]]
-name = "bench-qdrant"
+name = "retri-eval-qdrant"
 path = "src/qdrant.rs"
 required-features = ["qdrant-backend"]
 
 [[bin]]
-name = "bench-redis"
+name = "retri-eval-redis"
 path = "src/redis.rs"
 required-features = ["redis-backend"]
 
 [[bin]]
-name = "bench-lancedb"
+name = "retri-eval-lancedb"
 path = "src/lancedb.rs"
 required-features = ["lancedb-backend"]
 
 [[bin]]
-name = "bench-weaviate"
+name = "retri-eval-weaviate"
 path = "src/weaviate.rs"
 required-features = ["weaviate-backend"]
 
