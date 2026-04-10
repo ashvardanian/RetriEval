@@ -43,6 +43,11 @@ name = "retri-eval-cuvs"
 path = "src/cuvs.rs"
 required-features = ["cuvs-backend"]
 
+[[bin]]
+name = "retri-generate"
+path = "src/generate.rs"
+required-features = ["generate"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -95,3 +100,4 @@ redis-backend = ["tier2", "redis"]
 lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
 weaviate-backend = ["tier2", "weaviate-community"]
 cuvs-backend = ["cuvs", "cuvs-sys", "itertools", "numkong"]
+generate = ["numkong"]

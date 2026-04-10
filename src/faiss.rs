@@ -29,6 +29,18 @@
 //!     --threads 16 \
 //!     --output results/
 //! ```
+//!
+//! Binary hamming-distance search via BinaryHNSW (1024-bit vectors in `.b1bin`):
+//! ```sh
+//! retri-eval-faiss \
+//!     --vectors datasets/binary_1M/base.1M.b1bin \
+//!     --queries datasets/binary_1M/query.10K.b1bin \
+//!     --neighbors datasets/binary_1M/groundtruth.10K.ibin \
+//!     --dtype b1 \
+//!     --metric hamming \
+//!     --threads 16 \
+//!     --output results/binary_1M
+//! ```
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -107,8 +119,13 @@ fn is_binary(dtype: &str) -> bool {
     dtype == "b1"
 }
 
+enum FaissIndex {
+    Float(UnsafeCell<faiss::index::IndexImpl>),
+    Binary(UnsafeCell<faiss::index::BinaryIndexImpl>),
+}
+
 struct FaissBackend {
-    index: UnsafeCell<faiss::index::IndexImpl>,
+    index: FaissIndex,
     description: String,
     metadata: HashMap<String, Value>,
 }
@@ -132,27 +149,34 @@ impl FaissBackend {
         }
 
         let factory = index_factory_string(dtype_name, connectivity)?;
-        let dim = if is_binary(dtype_name) {
-            dimensions * 8
-        } else {
-            dimensions
-        } as u32;
-        let (metric_label, faiss_metric) = parse_metric(metric_name)?;
+        let binary = is_binary(dtype_name);
 
-        let index = faiss::index::index_factory(dim, &factory, faiss_metric)
-            .map_err(|e| format!("failed to create FAISS index: {e}"))?;
+        // For binary indices, dimensions is already in bits (from .b1bin header).
+        // For float indices, dimensions is the scalar count.
+        let dim = dimensions as u32;
+
+        let (metric_label, index) = if binary {
+            let index = faiss::index::index_binary_factory(dim, &factory)
+                .map_err(|e| format!("failed to create FAISS binary index: {e}"))?;
+            ("hamming", FaissIndex::Binary(UnsafeCell::new(index)))
+        } else {
+            let (label, faiss_metric) = parse_metric(metric_name)?;
+            let index = faiss::index::index_factory(dim, &factory, faiss_metric)
+                .map_err(|e| format!("failed to create FAISS index: {e}"))?;
+            (label, FaissIndex::Float(UnsafeCell::new(index)))
+        };
 
         // Set HNSW expansion factors via FAISS ParameterSpace API
+        let inner_ptr = match &index {
+            FaissIndex::Float(i) => unsafe { (*i.get()).inner_ptr() as *mut std::ffi::c_void },
+            FaissIndex::Binary(i) => unsafe { (*i.get()).inner_ptr() as *mut std::ffi::c_void },
+        };
         let params_str = format!("efConstruction={expansion_add} efSearch={expansion_search}");
         unsafe {
             let mut space: *mut std::ffi::c_void = std::ptr::null_mut();
             if faiss_ParameterSpace_new(&mut space) == 0 && !space.is_null() {
                 let c_params = std::ffi::CString::new(params_str.as_str()).unwrap();
-                faiss_ParameterSpace_set_index_parameters(
-                    space,
-                    index.inner_ptr() as *mut std::ffi::c_void,
-                    c_params.as_ptr(),
-                );
+                faiss_ParameterSpace_set_index_parameters(space, inner_ptr, c_params.as_ptr());
                 faiss_ParameterSpace_free(space);
             }
         }
@@ -171,7 +195,7 @@ impl FaissBackend {
         metadata.insert("threads".into(), json!(threads));
 
         Ok(Self {
-            index: UnsafeCell::new(index),
+            index,
             description,
             metadata,
         })
@@ -187,11 +211,24 @@ impl Backend for FaissBackend {
     }
 
     fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let data = vectors.data.to_f32();
         // SAFETY: `add` has exclusive `&mut self` access.
-        unsafe { &mut *self.index.get() }
-            .add(&data)
-            .map_err(|e| format!("FAISS add failed: {e}"))
+        match &self.index {
+            FaissIndex::Float(index) => {
+                let data = vectors.data.to_f32();
+                unsafe { &mut *index.get() }
+                    .add(&data)
+                    .map_err(|e| format!("FAISS add failed: {e}"))
+            }
+            FaissIndex::Binary(index) => {
+                let data = match &vectors.data {
+                    retrieval::VectorSlice::B1x8(bytes) => *bytes,
+                    _ => return Err("FAISS binary index requires B1x8 data".into()),
+                };
+                unsafe { &mut *index.get() }
+                    .add(data)
+                    .map_err(|e| format!("FAISS binary add failed: {e}"))
+            }
+        }
     }
 
     fn search(
@@ -202,33 +239,68 @@ impl Backend for FaissBackend {
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String> {
-        let dimensions = queries.dimensions;
-        let data = queries.data.to_f32();
-        let num_queries = data.len() / dimensions;
-
         // SAFETY: `run` never calls `search` and `add` concurrently; search is
         // the only reader and FAISS is internally thread-safe via OpenMP.
-        let result = unsafe { &mut *self.index.get() }
-            .search(&data, count)
-            .map_err(|e| format!("FAISS search failed: {e}"))?;
+        match &self.index {
+            FaissIndex::Float(index) => {
+                let dimensions = queries.dimensions;
+                let data = queries.data.to_f32();
+                let num_queries = data.len() / dimensions;
 
-        for query_idx in 0..num_queries {
-            let offset = query_idx * count;
-            let mut found = 0;
-            for rank in 0..count {
-                let neighbor_idx = result.labels[offset + rank];
-                if let Some(id) = neighbor_idx.get() {
-                    out_keys[offset + rank] = id as Key;
-                    out_distances[offset + rank] = result.distances[offset + rank];
-                    found += 1;
-                } else {
-                    out_keys[offset + rank] = Key::MAX;
-                    out_distances[offset + rank] = Distance::INFINITY;
+                let result = unsafe { &mut *index.get() }
+                    .search(&data, count)
+                    .map_err(|e| format!("FAISS search failed: {e}"))?;
+
+                for query_idx in 0..num_queries {
+                    let offset = query_idx * count;
+                    let mut found = 0;
+                    for rank in 0..count {
+                        let neighbor_idx = result.labels[offset + rank];
+                        if let Some(id) = neighbor_idx.get() {
+                            out_keys[offset + rank] = id as Key;
+                            out_distances[offset + rank] = result.distances[offset + rank];
+                            found += 1;
+                        } else {
+                            out_keys[offset + rank] = Key::MAX;
+                            out_distances[offset + rank] = Distance::INFINITY;
+                        }
+                    }
+                    out_counts[query_idx] = found;
                 }
+                Ok(())
             }
-            out_counts[query_idx] = found;
+            FaissIndex::Binary(index) => {
+                let bytes_per_vector = retrieval::div_ceil(queries.dimensions, 8);
+                let data = match &queries.data {
+                    retrieval::VectorSlice::B1x8(bytes) => *bytes,
+                    _ => return Err("FAISS binary index requires B1x8 data".into()),
+                };
+                let num_queries = data.len() / bytes_per_vector;
+
+                let result = unsafe { &mut *index.get() }
+                    .search(data, count)
+                    .map_err(|e| format!("FAISS binary search failed: {e}"))?;
+
+                for query_idx in 0..num_queries {
+                    let offset = query_idx * count;
+                    let mut found = 0;
+                    for rank in 0..count {
+                        let neighbor_idx = result.labels[offset + rank];
+                        if let Some(id) = neighbor_idx.get() {
+                            out_keys[offset + rank] = id as Key;
+                            out_distances[offset + rank] =
+                                result.distances[offset + rank] as Distance;
+                            found += 1;
+                        } else {
+                            out_keys[offset + rank] = Key::MAX;
+                            out_distances[offset + rank] = Distance::INFINITY;
+                        }
+                    }
+                    out_counts[query_idx] = found;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn memory_bytes(&self) -> usize {

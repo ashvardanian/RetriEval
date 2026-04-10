@@ -51,6 +51,17 @@
 //!     --epochs 20 \
 //!     --output results/turing_100M
 //! ```
+//!
+//! Binary 1M hamming-distance search (1024-bit vectors in `.b1bin` format):
+//! ```sh
+//! retri-eval-usearch \
+//!     --vectors datasets/binary_1M/base.1M.b1bin \
+//!     --queries datasets/binary_1M/query.10K.b1bin \
+//!     --neighbors datasets/binary_1M/groundtruth.10K.ibin \
+//!     --dtype b1 \
+//!     --metric hamming \
+//!     --output results/binary_1M
+//! ```
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};

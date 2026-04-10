@@ -12,6 +12,7 @@ enum ScalarFormat {
     F32,
     U8,
     I8,
+    B1x8,
 }
 
 /// A memory-mapped binary vector dataset.
@@ -20,11 +21,14 @@ enum ScalarFormat {
 /// - bytes 0..4: number of rows (u32)
 /// - bytes 4..8: number of dimensions (u32)
 /// - bytes 8..: row-major vector data
+///
+/// For `.b1bin` files, dimensions is the number of bits per vector.
+/// Each vector occupies `ceil(dimensions / 8)` bytes.
 pub struct Dataset {
     mmap: Mmap,
     rows: usize,
     dimensions: usize,
-    scalar_size: usize,
+    bytes_per_vector: usize,
     format: ScalarFormat,
 }
 
@@ -52,10 +56,11 @@ impl Dataset {
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        let (scalar_size, format) = match ext {
-            "fbin" => (4, ScalarFormat::F32),
-            "u8bin" => (1, ScalarFormat::U8),
-            "i8bin" => (1, ScalarFormat::I8),
+        let (bytes_per_vector, format) = match ext {
+            "fbin" => (dimensions * 4, ScalarFormat::F32),
+            "u8bin" => (dimensions, ScalarFormat::U8),
+            "i8bin" => (dimensions, ScalarFormat::I8),
+            "b1bin" => (crate::div_ceil(dimensions, 8), ScalarFormat::B1x8),
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -64,7 +69,7 @@ impl Dataset {
             }
         };
 
-        let expected = 8 + rows * dimensions * scalar_size;
+        let expected = 8 + rows * bytes_per_vector;
         if mmap.len() < expected {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -79,7 +84,7 @@ impl Dataset {
             mmap,
             rows,
             dimensions,
-            scalar_size,
+            bytes_per_vector,
             format,
         })
     }
@@ -95,15 +100,16 @@ impl Dataset {
     /// Reinterpret a raw byte slice as a typed `Vectors` based on this dataset's scalar format.
     fn wrap_bytes<'a>(&self, bytes: &'a [u8], num_vectors: usize) -> Vectors<'a> {
         let dimensions = self.dimensions;
-        let elements = num_vectors * dimensions;
+        let total_bytes = num_vectors * self.bytes_per_vector;
         let data = match self.format {
             ScalarFormat::F32 => VectorSlice::F32(unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, elements)
+                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, num_vectors * dimensions)
             }),
-            ScalarFormat::U8 => VectorSlice::U8(&bytes[..elements]),
+            ScalarFormat::U8 => VectorSlice::U8(&bytes[..num_vectors * dimensions]),
             ScalarFormat::I8 => VectorSlice::I8(unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const i8, elements)
+                std::slice::from_raw_parts(bytes.as_ptr() as *const i8, num_vectors * dimensions)
             }),
+            ScalarFormat::B1x8 => VectorSlice::B1x8(&bytes[..total_bytes]),
         };
         Vectors { data, dimensions }
     }
@@ -111,8 +117,8 @@ impl Dataset {
     /// Borrow a contiguous slice of vectors directly from the mmap. Zero-copy.
     pub fn slice(&self, start: usize, count: usize) -> Vectors<'_> {
         let count = count.min(self.rows - start);
-        let offset = 8 + start * self.dimensions * self.scalar_size;
-        let byte_len = count * self.dimensions * self.scalar_size;
+        let offset = 8 + start * self.bytes_per_vector;
+        let byte_len = count * self.bytes_per_vector;
         self.wrap_bytes(&self.mmap[offset..offset + byte_len], count)
     }
 
@@ -138,9 +144,9 @@ impl Dataset {
         self.wrap_bytes(&buf[..num_vectors * bytes_per_vector], num_vectors)
     }
 
-    /// Bytes per vector (dimensions * scalar_size).
+    /// Bytes per vector. For B1x8, this is `ceil(dimensions / 8)`.
     pub fn vector_bytes(&self) -> usize {
-        self.dimensions * self.scalar_size
+        self.bytes_per_vector
     }
 }
 
