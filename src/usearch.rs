@@ -1,6 +1,16 @@
 //! USearch HNSW benchmark binary.
 //!
-//! Quick sweep over quantization types & metrics:
+//! ## Build & Install
+//!
+//! USearch is the default backend — no extra system dependencies required:
+//!
+//! ```sh
+//! cargo install --path . --features usearch-backend
+//! ```
+//!
+//! ## Examples
+//!
+//! Quick sweep over quantization types & metrics (Wiki 1M):
 //! ```sh
 //! retri-eval-usearch \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
@@ -24,6 +34,21 @@
 //!     --expansion-add 256 \
 //!     --expansion-search 1024 \
 //!     --output results/
+//! ```
+//!
+//! Turing 100M with incremental recall curve (batch-size-add=5M):
+//! ```sh
+//! retri-eval-usearch \
+//!     --vectors datasets/turing_100M/base.100M.fbin \
+//!     --queries datasets/turing_100M/query.public.100K.fbin \
+//!     --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
+//!     --dtype f32,bf16 \
+//!     --shards 2 \
+//!     --metric l2 \
+//!     --connectivity 32 \
+//!     --expansion-add 256 \
+//!     --expansion-search 1024 \
+//!     --output results/turing_100M
 //! ```
 
 use std::cell::UnsafeCell;

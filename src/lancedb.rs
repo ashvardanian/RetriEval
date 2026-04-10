@@ -1,12 +1,22 @@
 //! LanceDB benchmark binary (in-process, no Docker).
 //!
+//! ## Build & Install
+//!
+//! No extra system dependencies — LanceDB is an in-process library:
+//!
 //! ```sh
-//! cargo run --release --bin retri-eval-lancedb --features lancedb-backend -- \
+//! cargo install --path . --features lancedb-backend
+//! ```
+//!
+//! ## Examples
+//!
+//! ```sh
+//! retri-eval-lancedb \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --metric ip \
-//!     --output wiki-1M-lancedb.jsonl
+//!     --output results/
 //! ```
 
 use std::sync::Arc;

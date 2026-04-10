@@ -1,12 +1,24 @@
 //! Qdrant benchmark binary.
 //!
+//! ## Prerequisites
+//!
+//! Requires Docker — the benchmark auto-manages a `qdrant/qdrant` container.
+//!
+//! ## Build & Install
+//!
 //! ```sh
-//! cargo run --release --bin retri-eval-qdrant --features qdrant-backend -- \
+//! cargo install --path . --features qdrant-backend
+//! ```
+//!
+//! ## Examples
+//!
+//! ```sh
+//! retri-eval-qdrant \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --metric ip \
-//!     --output wiki-1M-qdrant.jsonl
+//!     --output results/
 //! ```
 
 use std::collections::HashMap;
@@ -89,7 +101,7 @@ impl Backend for QdrantBackend {
         self.metadata.clone()
     }
 
-    fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let data = vectors.data.to_f32();
         let dimensions = vectors.dimensions;
         let num_vectors = data.len() / dimensions;
@@ -101,7 +113,7 @@ impl Backend for QdrantBackend {
                     .map(|i| {
                         let vec = data[i * dimensions..(i + 1) * dimensions].to_vec();
                         let empty: HashMap<String, qdrant_client::qdrant::Value> = HashMap::new();
-                        PointStruct::new(i as u64, vec, empty)
+                        PointStruct::new(keys[i] as u64, vec, empty)
                     })
                     .collect();
                 self.client
@@ -250,7 +262,7 @@ fn main() {
             metadata.insert("metric".into(), json!(&cli.metric));
             metadata.insert("connectivity".into(), json!(cli.connectivity));
             metadata.insert("expansion_add".into(), json!(cli.expansion_add));
-            m
+            metadata
         },
     };
 

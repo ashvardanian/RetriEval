@@ -1,12 +1,24 @@
 //! Weaviate benchmark binary.
 //!
+//! ## Prerequisites
+//!
+//! Requires Docker — the benchmark auto-manages a `semitechnologies/weaviate` container.
+//!
+//! ## Build & Install
+//!
 //! ```sh
-//! cargo run --release --bin retri-eval-weaviate --features weaviate-backend -- \
+//! cargo install --path . --features weaviate-backend
+//! ```
+//!
+//! ## Examples
+//!
+//! ```sh
+//! retri-eval-weaviate \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --metric ip \
-//!     --output wiki-1M-weaviate.jsonl
+//!     --output results/
 //! ```
 
 use std::time::Duration;
@@ -80,7 +92,7 @@ impl Backend for WeaviateBackend {
         self.metadata.clone()
     }
 
-    fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let data = vectors.data.to_f32();
         let dimensions = vectors.dimensions;
         let num_vectors = data.len() / dimensions;
@@ -91,7 +103,7 @@ impl Backend for WeaviateBackend {
                     .iter()
                     .map(|&x| x as f64)
                     .collect();
-                let obj = Object::builder(CLASS_NAME, serde_json::json!({ "idx": i as i64 }))
+                let obj = Object::builder(CLASS_NAME, serde_json::json!({ "idx": keys[i] as i64 }))
                     .with_vector(vec)
                     .build();
                 self.client

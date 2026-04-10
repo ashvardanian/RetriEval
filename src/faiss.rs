@@ -1,7 +1,26 @@
 //! FAISS HNSW benchmark binary.
 //!
+//! ## Prerequisites
+//!
+//! Requires system `libfaiss` discoverable via `pkg-config`.
+//! Install with your package manager or build from source:
+//!
 //! ```sh
-//! cargo run --release --bin retri-eval-faiss --features faiss-backend -- \
+//! # Ubuntu / Debian
+//! sudo apt install libfaiss-dev
+//! # or build from source: https://github.com/facebookresearch/faiss/blob/main/INSTALL.md
+//! ```
+//!
+//! ## Build & Install
+//!
+//! ```sh
+//! cargo install --path . --features faiss-backend
+//! ```
+//!
+//! ## Examples
+//!
+//! ```sh
+//! retri-eval-faiss \
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
@@ -11,9 +30,11 @@
 //!     --output results/
 //! ```
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 
 use clap::Parser;
+use faiss::Index as _;
 use itertools::iproduct;
 use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
 use serde_json::{json, Value};
@@ -87,10 +108,14 @@ fn is_binary(dtype: &str) -> bool {
 }
 
 struct FaissBackend {
-    index: faiss::Index,
+    index: UnsafeCell<faiss::index::IndexImpl>,
     description: String,
     metadata: HashMap<String, Value>,
 }
+
+// SAFETY: FAISS manages its own thread safety via OpenMP.
+unsafe impl Send for FaissBackend {}
+unsafe impl Sync for FaissBackend {}
 
 impl FaissBackend {
     fn new(
@@ -125,7 +150,7 @@ impl FaissBackend {
                 let c_params = std::ffi::CString::new(params_str.as_str()).unwrap();
                 faiss_ParameterSpace_set_index_parameters(
                     space,
-                    index.inner_ptr(),
+                    index.inner_ptr() as *mut std::ffi::c_void,
                     c_params.as_ptr(),
                 );
                 faiss_ParameterSpace_free(space);
@@ -146,7 +171,7 @@ impl FaissBackend {
         metadata.insert("threads".into(), json!(threads));
 
         Ok(Self {
-            index,
+            index: UnsafeCell::new(index),
             description,
             metadata,
         })
@@ -163,7 +188,8 @@ impl Backend for FaissBackend {
 
     fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let data = vectors.data.to_f32();
-        self.index
+        // SAFETY: `add` has exclusive `&mut self` access.
+        unsafe { &mut *self.index.get() }
             .add(&data)
             .map_err(|e| format!("FAISS add failed: {e}"))
     }
@@ -180,8 +206,9 @@ impl Backend for FaissBackend {
         let data = queries.data.to_f32();
         let num_queries = data.len() / dimensions;
 
-        let result = self
-            .index
+        // SAFETY: `run` never calls `search` and `add` concurrently; search is
+        // the only reader and FAISS is internally thread-safe via OpenMP.
+        let result = unsafe { &mut *self.index.get() }
             .search(&data, count)
             .map_err(|e| format!("FAISS search failed: {e}"))?;
 
@@ -190,8 +217,8 @@ impl Backend for FaissBackend {
             let mut found = 0;
             for rank in 0..count {
                 let neighbor_idx = result.labels[offset + rank];
-                if neighbor_idx >= 0 {
-                    out_keys[offset + rank] = neighbor_idx as Key;
+                if let Some(id) = neighbor_idx.get() {
+                    out_keys[offset + rank] = id as Key;
                     out_distances[offset + rank] = result.distances[offset + rank];
                     found += 1;
                 } else {

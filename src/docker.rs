@@ -87,7 +87,7 @@ impl ContainerHandle {
         &self,
         label: &str,
         timeout: Duration,
-        check: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>>,
+        check: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let deadline = tokio::time::Instant::now() + timeout;
         eprintln!("  Waiting for {label}...");
@@ -110,10 +110,14 @@ impl ContainerHandle {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let client = reqwest::Client::new();
         self.wait_until(url, timeout, || {
-            let client = &client;
+            let client = client.clone();
             let url = url.to_string();
             Box::pin(async move {
-                client.get(&url).send().await.is_ok_and(|r| r.status().is_success())
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
             })
         })
         .await
