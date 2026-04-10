@@ -1,0 +1,9 @@
+/target
+*.swp
+*.swo
+*~
+.DS_Store
+*.jsonl
+
+/datasets
+/data

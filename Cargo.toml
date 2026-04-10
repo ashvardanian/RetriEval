@@ -1,0 +1,69 @@
+[package]
+name = "usearch-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark suite for vector search engines"
+
+[lib]
+name = "usearch_bench"
+path = "src/bench.rs"
+
+[[bin]]
+name = "bench-usearch"
+path = "src/usearch.rs"
+
+[[bin]]
+name = "bench-faiss"
+path = "src/faiss.rs"
+required-features = ["faiss-backend"]
+
+[[bin]]
+name = "bench-qdrant"
+path = "src/qdrant.rs"
+required-features = ["qdrant-backend"]
+
+[[bin]]
+name = "bench-redis"
+path = "src/redis.rs"
+required-features = ["redis-backend"]
+
+[[bin]]
+name = "bench-lancedb"
+path = "src/lancedb.rs"
+required-features = ["lancedb-backend"]
+
+[[bin]]
+name = "bench-weaviate"
+path = "src/weaviate.rs"
+required-features = ["weaviate-backend"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+sysinfo = "0.32"
+indicatif = "0.17"
+itertools = "0.14"
+rand = "0.9"
+fork_union = "2"
+usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev" }
+faiss = { version = "0.13", optional = true }
+bollard = { version = "0.20", optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+reqwest = { version = "0.12", optional = true }
+qdrant-client = { version = "1", optional = true }
+redis = { version = "0.27", features = ["tokio-comp"], optional = true }
+lancedb = { version = "0.27", optional = true }
+weaviate-community = { version = "0.2", optional = true }
+arrow-array = { version = "57", optional = true }
+arrow-schema = { version = "57", optional = true }
+
+[features]
+faiss-backend = ["faiss"]
+tier2 = ["bollard", "futures-util", "tokio", "reqwest"]
+qdrant-backend = ["tier2", "qdrant-client"]
+redis-backend = ["tier2", "redis"]
+lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
+weaviate-backend = ["tier2", "weaviate-community"]
