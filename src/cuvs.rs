@@ -37,13 +37,31 @@
 //! ## Build & Run
 //!
 //! ```sh
-//! cargo build --release --features cuvs-backend
+//! cargo install --path . --features cuvs-backend
+//! ```
 //!
-//! ./target/release/retri-eval-cuvs \
+//! Quick dtype sweep:
+//! ```sh
+//! retri-eval-cuvs \
+//!     --vectors datasets/wiki_1M/base.1M.fbin \
+//!     --queries datasets/wiki_1M/query.public.100K.fbin \
+//!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+//!     --dtype f32,f16 --metric ip \
+//!     --output results/
+//! ```
+//!
+//! Turing 10M at ~99% recall (gd=64, igd=128, itopk=256, search_width=32):
+//! ```sh
+//! retri-eval-cuvs \
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
 //!     --dtype f32,f16 --metric l2 \
+//!     --graph-degree 64 \
+//!     --intermediate-graph-degree 128 \
+//!     --itopk-size 256 \
+//!     --search-width 32 \
+//!     --build-algo nn_descent \
 //!     --output results/turing_10M
 //! ```
 
@@ -256,10 +274,18 @@ impl GpuQueries {
         let error = |e| format!("GPU query alloc failed: {e}");
         unsafe {
             Ok(match dtype {
-                CuvsDtype::F32 => Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDtype::F16 => Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDtype::I8 => Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDtype::U8 => Self::U8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDtype::F32 => {
+                    Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
+                }
+                CuvsDtype::F16 => {
+                    Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
+                }
+                CuvsDtype::I8 => {
+                    Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
+                }
+                CuvsDtype::U8 => {
+                    Self::U8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?)
+                }
             })
         }
     }
@@ -300,6 +326,9 @@ struct SearchBuffers {
 
     /// Reusable host-side buffer for dtype conversion before H2D copy.
     query_staging: Vec<u8>,
+
+    /// Cached search params — never change between calls.
+    search_params: cuvs::cagra::SearchParams,
 }
 
 impl SearchBuffers {
@@ -309,10 +338,10 @@ impl SearchBuffers {
         dimensions: usize,
         neighbor_count: usize,
         dtype: CuvsDtype,
+        search_params: cuvs::cagra::SearchParams,
     ) -> Result<Self, String> {
         let error = |e| format!("GPU alloc failed: {e}");
-        let queries =
-            GpuQueries::allocate(dtype, &[num_queries, dimensions], allocator.clone())?;
+        let queries = GpuQueries::allocate(dtype, &[num_queries, dimensions], allocator.clone())?;
         let neighbors = unsafe {
             GpuTensor::<Key>::try_empty_in(&[num_queries, neighbor_count], allocator.clone())
                 .map_err(error)?
@@ -331,6 +360,7 @@ impl SearchBuffers {
             neighbors_host: vec![Key::default(); num_queries * neighbor_count],
             distances_host: vec![Distance::default(); num_queries * neighbor_count],
             query_staging: Vec::new(),
+            search_params,
         })
     }
 }
@@ -363,6 +393,27 @@ struct Cli {
     /// Higher values improve recall at the cost of speed.
     #[arg(long, value_delimiter = ',', default_value = "64")]
     itopk_size: Vec<usize>,
+
+    /// Number of graph nodes used as starting points per search iteration.
+    /// Higher values improve recall. 0 = auto.
+    #[arg(long, value_delimiter = ',', default_value = "0")]
+    search_width: Vec<usize>,
+
+    /// Minimum search iterations (prevents early termination). 0 = auto.
+    #[arg(long, default_value_t = 0)]
+    min_iterations: usize,
+
+    /// Maximum search iterations. 0 = auto.
+    #[arg(long, default_value_t = 0)]
+    max_iterations: usize,
+
+    /// Number of random seed sampling rounds for initial search points. 0 = auto.
+    #[arg(long, default_value_t = 0)]
+    num_random_samplings: u32,
+
+    /// Graph build algorithm: auto, nn_descent
+    #[arg(long, default_value = "auto")]
+    build_algo: String,
 }
 
 // #region Metric
@@ -384,6 +435,16 @@ fn metric_label(s: &str) -> &str {
     }
 }
 
+fn parse_build_algo(s: &str) -> Result<cuvs_sys::cuvsCagraGraphBuildAlgo, String> {
+    match s {
+        "auto" => Ok(cuvs_sys::cuvsCagraGraphBuildAlgo::AUTO_SELECT),
+        "nn_descent" => Ok(cuvs_sys::cuvsCagraGraphBuildAlgo::NN_DESCENT),
+        _ => Err(format!(
+            "unknown build algo: {s}. supported: auto, nn_descent"
+        )),
+    }
+}
+
 // #region Backend
 
 pub struct CuvsBackend {
@@ -399,7 +460,12 @@ pub struct CuvsBackend {
     dtype: CuvsDtype,
     graph_degree: usize,
     intermediate_graph_degree: usize,
+    build_algo: cuvs_sys::cuvsCagraGraphBuildAlgo,
     itopk_size: usize,
+    search_width: usize,
+    min_iterations: usize,
+    max_iterations: usize,
+    num_random_samplings: u32,
 
     host_vectors: Vec<u8>,
     host_keys: Vec<Key>,
@@ -419,16 +485,22 @@ impl CuvsBackend {
         metric_name: &str,
         graph_degree: usize,
         intermediate_graph_degree: usize,
+        build_algo_name: &str,
         itopk_size: usize,
+        search_width: usize,
+        min_iterations: usize,
+        max_iterations: usize,
+        num_random_samplings: u32,
     ) -> Result<Self, String> {
         let metric = parse_metric(metric_name)?;
         let dtype = CuvsDtype::from_str(dtype_name)?;
+        let build_algo = parse_build_algo(build_algo_name)?;
         let res =
             cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
         let cuda_alloc = CudaAllocator(res.0);
 
         let description = format!(
-            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} gd={graph_degree} \u{b7} igd={intermediate_graph_degree} \u{b7} itopk={itopk_size}",
+            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} gd={graph_degree} \u{b7} igd={intermediate_graph_degree} \u{b7} itopk={itopk_size} \u{b7} sw={search_width}",
             dtype.as_str(),
         );
 
@@ -443,6 +515,7 @@ impl CuvsBackend {
             json!(intermediate_graph_degree),
         );
         metadata.insert("itopk_size".into(), json!(itopk_size));
+        metadata.insert("search_width".into(), json!(search_width));
 
         Ok(Self {
             search_buffers: UnsafeCell::new(None),
@@ -454,13 +527,45 @@ impl CuvsBackend {
             dtype,
             graph_degree,
             intermediate_graph_degree,
+            build_algo,
             itopk_size,
+            search_width,
+            min_iterations,
+            max_iterations,
+            num_random_samplings,
             host_vectors: Vec::new(),
             host_keys: Vec::new(),
             dirty: Cell::new(false),
             description,
             metadata,
         })
+    }
+
+    /// Create search params once, reused across all search calls.
+    fn build_search_params(
+        &self,
+        neighbor_count: usize,
+    ) -> Result<cuvs::cagra::SearchParams, String> {
+        let effective_itopk = self.itopk_size.max(neighbor_count);
+        let params = cuvs::cagra::SearchParams::new()
+            .map_err(|e| format!("search params: {e}"))?
+            .set_itopk_size(effective_itopk);
+        unsafe {
+            let raw = params.0;
+            if self.search_width > 0 {
+                (*raw).search_width = self.search_width;
+            }
+            if self.min_iterations > 0 {
+                (*raw).min_iterations = self.min_iterations;
+            }
+            if self.max_iterations > 0 {
+                (*raw).max_iterations = self.max_iterations;
+            }
+            if self.num_random_samplings > 0 {
+                (*raw).num_random_samplings = self.num_random_samplings;
+            }
+        }
+        Ok(params)
     }
 
     /// Build (or rebuild) the CAGRA index from accumulated host buffers.
@@ -482,7 +587,8 @@ impl CuvsBackend {
         let build_params = cuvs::cagra::IndexParams::new()
             .map_err(|e| format!("failed to create CAGRA index params: {e}"))?
             .set_graph_degree(self.graph_degree)
-            .set_intermediate_graph_degree(self.intermediate_graph_degree);
+            .set_intermediate_graph_degree(self.intermediate_graph_degree)
+            .set_build_algo(self.build_algo);
         unsafe { (*build_params.0).metric = self.metric };
 
         let managed = unsafe { as_managed(host_dl) };
@@ -563,86 +669,85 @@ impl Backend for CuvsBackend {
         }
 
         let num_queries = queries.len();
-        let dimensions = queries.dimensions;
-        let neighbor_count = count;
 
-        // Lazily allocate GPU search buffers; reused on subsequent calls.
+        // Lazily allocate GPU buffers and search params; reused on subsequent calls.
         let buffers = unsafe { &mut *self.search_buffers.get() };
         if buffers.is_none() {
+            let search_params = self.build_search_params(count)?;
             *buffers = Some(SearchBuffers::allocate(
                 self.cuda_alloc.clone(),
                 num_queries,
-                dimensions,
-                neighbor_count,
+                queries.dimensions,
+                count,
                 self.dtype,
+                search_params,
             )?);
         }
         let buffers = buffers.as_mut().unwrap();
 
-        // Convert queries to target dtype on the reusable staging buffer.
-        buffers.query_staging.clear();
+        // Upload queries to GPU. For f32 dtype, copy directly from the source
+        // data without an intermediate staging buffer.
         let query_f32 = queries.data.to_f32();
-        self.dtype
-            .convert_from_f32(&query_f32, &mut buffers.query_staging);
+        if matches!(self.dtype, CuvsDtype::F32) {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    query_f32.as_ptr() as *const u8,
+                    query_f32.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            unsafe { self.host_to_device(bytes, buffers.queries.as_mut_ptr())? };
+        } else {
+            buffers.query_staging.clear();
+            self.dtype
+                .convert_from_f32(&query_f32, &mut buffers.query_staging);
+            unsafe { self.host_to_device(&buffers.query_staging, buffers.queries.as_mut_ptr())? };
+        }
 
-        // H2D copy into pre-allocated GPU tensor.
-        unsafe { self.host_to_device(&buffers.query_staging, buffers.queries.as_mut_ptr())? };
-
-        // Build non-owning DLPack descriptors over the GpuTensor memory.
-        let queries_tensor = unsafe {
-            dl_tensor(
+        // Non-owning DLPack views over the pre-allocated GpuTensor memory.
+        // Transmuted to ManagedTensor for the safe API; forgotten after use
+        // so Drop doesn't touch the GpuTensor-owned allocations.
+        let queries_managed = unsafe {
+            as_managed(dl_tensor(
                 buffers.queries.as_mut_ptr(),
                 buffers.queries_shape.as_mut_ptr(),
                 2,
                 self.dtype.dl_type(),
                 true,
-            )
+            ))
         };
-        let neighbors_tensor = unsafe {
-            dl_tensor(
+        let neighbors_managed = unsafe {
+            as_managed(dl_tensor(
                 buffers.neighbors.as_mut_ptr() as _,
                 buffers.neighbors_shape.as_mut_ptr(),
                 2,
                 dl_key(),
                 true,
-            )
+            ))
         };
-        let distances_tensor = unsafe {
-            dl_tensor(
+        let distances_managed = unsafe {
+            as_managed(dl_tensor(
                 buffers.distances.as_mut_ptr() as _,
                 buffers.distances_shape.as_mut_ptr(),
                 2,
                 dl_distance(),
                 true,
-            )
+            ))
         };
-
-        // CAGRA requires itopk_size >= the number of neighbors requested.
-        let effective_itopk = self.itopk_size.max(neighbor_count);
-        let search_params = cuvs::cagra::SearchParams::new()
-            .map_err(|e| format!("search params: {e}"))?
-            .set_itopk_size(effective_itopk);
 
         let index = unsafe { &*self.index.get() }
             .as_ref()
             .ok_or("index not built")?;
 
-        // Wrap as ManagedTensor for the safe search API (deleter=None, Drop is no-op).
-        let queries_managed = unsafe { as_managed(queries_tensor) };
-        let neighbors_managed = unsafe { as_managed(neighbors_tensor) };
-        let distances_managed = unsafe { as_managed(distances_tensor) };
-
         index
             .search(
                 &self.res,
-                &search_params,
+                &buffers.search_params,
                 &queries_managed,
                 &neighbors_managed,
                 &distances_managed,
             )
             .map_err(|e| format!("cuVS CAGRA search failed: {e}"))?;
 
-        // Prevent Drop from touching our GpuTensor-owned memory.
         std::mem::forget(queries_managed);
         std::mem::forget(neighbors_managed);
         std::mem::forget(distances_managed);
@@ -654,12 +759,13 @@ impl Backend for CuvsBackend {
         }
 
         // Map CAGRA 0-based indices back to original keys.
+        let num_indexed = self.host_keys.len();
         for query_idx in 0..num_queries {
-            let offset = query_idx * neighbor_count;
+            let offset = query_idx * count;
             let mut found = 0;
-            for rank in 0..neighbor_count {
+            for rank in 0..count {
                 let neighbor_idx = buffers.neighbors_host[offset + rank] as usize;
-                if neighbor_idx < self.host_keys.len() {
+                if neighbor_idx < num_indexed {
                     out_keys[offset + rank] = self.host_keys[neighbor_idx];
                     out_distances[offset + rank] = buffers.distances_host[offset + rank];
                     found += 1;
@@ -694,12 +800,13 @@ fn main() {
     });
     let dimensions = state.dimensions();
 
-    for (dtype, metric, graph_degree, intermediate_graph_degree, itopk_size) in iproduct!(
+    for (dtype, metric, graph_degree, intermediate_graph_degree, itopk_size, search_width) in iproduct!(
         &cli.dtype,
         &cli.metric,
         &cli.graph_degree,
         &cli.intermediate_graph_degree,
-        &cli.itopk_size
+        &cli.itopk_size,
+        &cli.search_width
     ) {
         let mut backend = CuvsBackend::new(
             dimensions,
@@ -707,7 +814,12 @@ fn main() {
             metric,
             *graph_degree,
             *intermediate_graph_degree,
+            &cli.build_algo,
             *itopk_size,
+            *search_width,
+            cli.min_iterations,
+            cli.max_iterations,
+            cli.num_random_samplings,
         )
         .unwrap_or_else(|e| {
             eprintln!("{e}");

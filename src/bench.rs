@@ -96,7 +96,7 @@ pub trait Backend: Send {
 // #region Formatting
 
 /// Format a number with thousand separators: 1234567 → "1,234,567"
-pub fn fmt_thousands(n: u64) -> String {
+pub fn format_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
@@ -131,11 +131,15 @@ pub struct CommonArgs {
 
     /// Number of vectors to index per measurement step
     #[arg(long, default_value_t = 1_000_000)]
-    pub step_size: usize,
+    pub batch_size_add: usize,
 
     /// Disable shuffling of insertion order (shuffle is on by default)
     #[arg(long, default_value_t = false)]
     pub no_shuffle: bool,
+
+    /// Number of queries per search batch (0 = all at once)
+    #[arg(long, default_value_t = 0)]
+    pub batch_size_search: usize,
 
     /// Output directory for JSON result files
     #[arg(long)]
@@ -151,7 +155,8 @@ pub struct BenchState {
     pub query_dataset: Dataset,
     pub ground_truth: GroundTruth,
     pub perm: dataset::Permutation,
-    pub step_size: usize,
+    pub batch_size_add: usize,
+    pub batch_size_search: usize,
     pub output_dir: Option<PathBuf>,
     pub machine_info: MachineInfo,
     pub dataset_info: DatasetInfo,
@@ -164,8 +169,8 @@ pub struct BenchState {
 
 impl BenchState {
     pub fn load(args: &CommonArgs) -> Result<Self, Box<dyn std::error::Error>> {
-        if args.step_size == 0 {
-            return Err("--step-size must be greater than 0".into());
+        if args.batch_size_add == 0 {
+            return Err("--batch-size-add must be greater than 0".into());
         }
 
         // Create output directory if specified
@@ -192,7 +197,7 @@ impl BenchState {
         let dimensions = dataset.dimensions();
         eprintln!(
             "  {} vectors, {} dimensions",
-            fmt_thousands(total_vectors as u64),
+            format_thousands(total_vectors as u64),
             dimensions
         );
 
@@ -200,7 +205,7 @@ impl BenchState {
             Some(path) => {
                 eprintln!("Loading keys: {}", path.display());
                 let k = Keys::load(path)?;
-                eprintln!("  {} keys", fmt_thousands(k.count() as u64));
+                eprintln!("  {} keys", format_thousands(k.count() as u64));
                 k
             }
             None => Keys::sequential(total_vectors),
@@ -211,7 +216,7 @@ impl BenchState {
         let num_queries = query_dataset.rows();
         eprintln!(
             "  {} queries, {} dimensions",
-            fmt_thousands(num_queries as u64),
+            format_thousands(num_queries as u64),
             query_dataset.dimensions()
         );
 
@@ -219,7 +224,7 @@ impl BenchState {
         let ground_truth = GroundTruth::load(&args.neighbors)?;
         eprintln!(
             "  {} queries, {} neighbors each",
-            fmt_thousands(ground_truth.queries() as u64),
+            format_thousands(ground_truth.queries() as u64),
             ground_truth.neighbors_per_query(),
         );
 
@@ -231,7 +236,7 @@ impl BenchState {
         };
 
         let search_count = ground_truth.neighbors_per_query();
-        let batch_size = 10_000.min(args.step_size);
+        let add_chunk_size = 10_000.min(args.batch_size_add);
 
         let dataset_info = DatasetInfo {
             vectors_path: args.vectors.display().to_string(),
@@ -243,17 +248,24 @@ impl BenchState {
             neighbors_per_query: search_count,
         };
 
+        let batch_size_search = if args.batch_size_search > 0 {
+            args.batch_size_search
+        } else {
+            num_queries
+        };
+
         Ok(Self {
             perm,
-            step_size: args.step_size,
+            batch_size_add: args.batch_size_add,
+            batch_size_search,
             output_dir: args.output.clone(),
             machine_info,
             dataset_info,
             out_keys: vec![0 as Key; num_queries * search_count],
             out_distances: vec![0.0 as Distance; num_queries * search_count],
             out_counts: vec![0usize; num_queries],
-            key_scratch: vec![0 as Key; batch_size],
-            gather_buf: vec![0u8; batch_size * dataset.vector_bytes()],
+            key_scratch: vec![0 as Key; add_chunk_size],
+            gather_buf: vec![0u8; add_chunk_size * dataset.vector_bytes()],
             dataset,
             keys,
             query_dataset,
@@ -276,38 +288,39 @@ pub fn run(
     let total_vectors = state.dataset.rows();
     let num_queries = state.query_dataset.rows();
     let search_count = state.ground_truth.neighbors_per_query();
-    let batch_size = state.key_scratch.len();
+    let add_chunk_size = state.key_scratch.len();
 
     let description = index.description();
     let metadata = index.metadata();
     eprintln!("\n── {description} ──");
 
-    let num_steps = div_ceil(total_vectors, state.step_size);
+    let num_steps = div_ceil(total_vectors, state.batch_size_add);
     let add_style = ProgressStyle::default_bar()
         .template("  add    [{elapsed_precise}] {bar:40.cyan/blue} {msg}")
         .unwrap()
         .progress_chars("##-");
-    let search_style = ProgressStyle::default_spinner()
-        .template("  search [{elapsed_precise}] {msg}")
-        .unwrap();
+    let search_style = ProgressStyle::default_bar()
+        .template("  search [{elapsed_precise}] {bar:40.green/blue} {msg}")
+        .unwrap()
+        .progress_chars("##-");
 
     let mut vectors_indexed = 0usize;
     let mut steps: Vec<StepEntry> = Vec::with_capacity(num_steps);
 
     for step in 0..num_steps {
-        let step_start = step * state.step_size;
-        let step_count = state.step_size.min(total_vectors - step_start);
+        let step_start = step * state.batch_size_add;
+        let step_count = state.batch_size_add.min(total_vectors - step_start);
         let is_final_step = step == num_steps - 1;
 
-        // --- Add ---
-        let pb_add = ProgressBar::new(total_vectors as u64);
-        pb_add.set_style(add_style.clone());
-        pb_add.set_position(vectors_indexed as u64);
+
+        let progress_add = ProgressBar::new(total_vectors as u64);
+        progress_add.set_style(add_style.clone());
+        progress_add.set_position(vectors_indexed as u64);
 
         let add_start = Instant::now();
         let mut added = 0;
         while added < step_count {
-            let batch = batch_size.min(step_count - added);
+            let batch = add_chunk_size.min(step_count - added);
             let logical_offset = step_start + added;
             let indices = state.perm.range(logical_offset, batch);
 
@@ -326,12 +339,12 @@ pub fn run(
             } else {
                 0
             };
-            pb_add.set_position(vectors_indexed as u64);
-            pb_add.set_message(format!(
-                "{}/{} ({} IPS)",
-                fmt_thousands(vectors_indexed as u64),
-                fmt_thousands(total_vectors as u64),
-                fmt_thousands(throughput),
+            progress_add.set_position(vectors_indexed as u64);
+            progress_add.set_message(format!(
+                "{}/{} ({} add/s)",
+                format_thousands(vectors_indexed as u64),
+                format_thousands(total_vectors as u64),
+                format_thousands(throughput),
             ));
         }
         let add_elapsed = add_start.elapsed().as_secs_f64();
@@ -340,32 +353,50 @@ pub fn run(
         } else {
             0
         };
-        pb_add.set_message(format!(
-            "{}/{} ({} IPS)",
-            fmt_thousands(vectors_indexed as u64),
-            fmt_thousands(total_vectors as u64),
-            fmt_thousands(add_throughput),
+        progress_add.set_message(format!(
+            "{}/{} ({} add/s)",
+            format_thousands(vectors_indexed as u64),
+            format_thousands(total_vectors as u64),
+            format_thousands(add_throughput),
         ));
-        pb_add.finish();
+        progress_add.finish();
 
-        // --- Search ---
-        let pb_search = ProgressBar::new_spinner();
-        pb_search.set_style(search_style.clone());
-        pb_search.set_message(format!(
-            "{} queries against {} vectors...",
-            fmt_thousands(num_queries as u64),
-            fmt_thousands(vectors_indexed as u64),
-        ));
-        pb_search.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        let progress_search = ProgressBar::new(num_queries as u64);
+        progress_search.set_style(search_style.clone());
+        progress_search.set_position(0);
 
         let search_start = Instant::now();
-        index.search(
-            state.query_dataset.all(),
-            search_count,
-            &mut state.out_keys,
-            &mut state.out_distances,
-            &mut state.out_counts,
-        )?;
+        let mut searched = 0usize;
+        while searched < num_queries {
+            let batch_count = state.batch_size_search.min(num_queries - searched);
+            let batch_queries = state.query_dataset.slice(searched, batch_count);
+            let key_offset = searched * search_count;
+            let key_end = key_offset + batch_count * search_count;
+
+            index.search(
+                batch_queries,
+                search_count,
+                &mut state.out_keys[key_offset..key_end],
+                &mut state.out_distances[key_offset..key_end],
+                &mut state.out_counts[searched..searched + batch_count],
+            )?;
+
+            searched += batch_count;
+            let elapsed = search_start.elapsed().as_secs_f64();
+            let throughput = if elapsed > 0.0 {
+                (searched as f64 / elapsed) as u64
+            } else {
+                0
+            };
+            progress_search.set_position(searched as u64);
+            progress_search.set_message(format!(
+                "{}/{} ({} search/s)",
+                format_thousands(searched as u64),
+                format_thousands(num_queries as u64),
+                format_thousands(throughput),
+            ));
+        }
         let search_elapsed = search_start.elapsed().as_secs_f64();
 
         let search_throughput = if search_elapsed > 0.0 {
@@ -400,10 +431,10 @@ pub fn run(
         let ndcg10_norm = eval::normalize_metric(ndcg10, vectors_indexed, total_vectors);
 
         let approx = if is_final_step { "" } else { "~" };
-        pb_search.finish_with_message(format!(
-            "{} QPS, {approx}recall@1={recall1_norm:.4}, {approx}recall@10={recall10_norm:.4}, {approx}NDCG@10={ndcg10_norm:.4} ({} vectors)",
-            fmt_thousands(search_throughput),
-            fmt_thousands(vectors_indexed as u64),
+        progress_search.finish_with_message(format!(
+            "{} search/s, {approx}recall@1={recall1_norm:.4}, {approx}recall@10={recall10_norm:.4}, {approx}NDCG@10={ndcg10_norm:.4} ({} vectors)",
+            format_thousands(search_throughput),
+            format_thousands(vectors_indexed as u64),
         ));
 
         steps.push(StepEntry {

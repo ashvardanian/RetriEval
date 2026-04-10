@@ -48,8 +48,8 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memmap2 = "0.9"
-sysinfo = "0.32"
-indicatif = "0.17"
+sysinfo = "0.38"
+indicatif = "0.18"
 rand = "0.9"
 
 # USearch backend
@@ -83,8 +83,7 @@ weaviate-community = { version = "0.2", optional = true }
 # cuVS
 cuvs = { version = "26.4", optional = true }
 cuvs-sys = { version = "26.4", optional = true }
-ndarray = { version = "0.15", optional = true }
-numkong = { version = "7", optional = true }
+numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", optional = true }
 
 [features]
 default = ["usearch-backend"]
@@ -95,4 +94,4 @@ qdrant-backend = ["tier2", "qdrant-client"]
 redis-backend = ["tier2", "redis"]
 lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
 weaviate-backend = ["tier2", "weaviate-community"]
-cuvs-backend = ["cuvs", "cuvs-sys", "ndarray", "itertools", "numkong"]
+cuvs-backend = ["cuvs", "cuvs-sys", "itertools", "numkong"]

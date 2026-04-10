@@ -1,7 +1,8 @@
-# RetriEval
+![RetriEval benchmarks thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/RetriEval.jpg?raw=true) 
 
-Benchmark suite for vector search engines, written to be as fast as the underlying engines.
-Compares in-memory ANN libraries (USearch, FAISS) and vector databases (Qdrant, Redis, Weaviate, LanceDB) on [BigANN](https://big-ann-benchmarks.com/) and similar datasets.
+__RetriEval__ is a bencmarking suite designed for Billion-scale Vector Search workloads.
+It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/rapidsai/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
+It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, & machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
 
 ## Quick Start
 
@@ -9,7 +10,8 @@ Compares in-memory ANN libraries (USearch, FAISS) and vector databases (Qdrant, 
 cargo install --path .
 ```
 
-This installs all backend binaries to `~/.cargo/bin/`. Run USearch against a dataset:
+This installs all backend binaries to `~/.cargo/bin/`.
+Run USearch against a dataset:
 
 ```sh
 retri-eval-usearch \
@@ -25,6 +27,151 @@ Generate plots from the results:
 
 ```sh
 uv run scripts/plot.py results/ --output-dir plots/
+```
+
+## Backends
+
+### Search Engines
+
+| Backend     | Parallelism | Quantization                                            | Metrics                   |
+| ----------- | ----------- | ------------------------------------------------------- | ------------------------- |
+| __USearch__ | ForkUnion   | f64, f32, bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | ip, l2, cos, hamming, ... |
+| __FAISS__   | OpenMP      | f32, f16, bf16, u8, i8, b1                              | ip, l2                    |
+| __cuVS__    | CUDA        | f32, f16, i8, u8                                        | l2, ip, cos               |
+
+- __USearch__: Input is passed directly in the specified type.
+  `--dtype` selects both the input interpretation and the internal quantization.
+- __FAISS__: Input is always f32.
+  `--dtype` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8bit_direct, etc.).
+- __cuVS__: Currently benchmarks with f32.
+  CAGRA natively supports f32, f16, i8, u8 for build.
+
+```sh
+retri-eval-usearch --dtype bf16 --metric l2 ...
+retri-eval-faiss --dtype f16 --metric l2 ...
+retri-eval-cuvs --metric l2 ...
+```
+
+### Vector Databases
+
+Input vectors are converted to `f32` before sending to the database.
+Server-side quantization is managed by the database engine, not the benchmark.
+
+| Backend      | Client                       | Docker Image                | Metrics                         |
+| ------------ | ---------------------------- | --------------------------- | ------------------------------- |
+| __Qdrant__   | `qdrant-client`, gRPC        | `qdrant/qdrant`             | ip, l2, cos, manhattan          |
+| __Redis__    | `redis`, RESP                | `redis/redis-stack`         | ip, l2, cos                     |
+| __Weaviate__ | `weaviate-community`, REST   | `semitechnologies/weaviate` | ip, l2, cos, hamming, manhattan |
+| __LanceDB__  | `lancedb`, in-process, Arrow | —                           | ip, l2, cos, hamming            |
+
+---
+
+Each backend is behind its own feature flag.
+Build only what you need:
+
+```sh
+cargo build --release --features usearch-backend    # USearch
+cargo build --release --features faiss-backend      # FAISS
+cargo build --release --features qdrant-backend     # Qdrant
+cargo build --release --features redis-backend      # Redis
+cargo build --release --features lancedb-backend    # LanceDB
+cargo build --release --features weaviate-backend   # Weaviate
+cargo build --release --features cuvs-backend       # cuVS
+```
+
+Or combine multiple:
+
+```sh
+cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
+```
+
+## CLI Reference
+
+Each backend is a separate binary. Common flags shared by all:
+
+```
+--vectors <PATH>           # Base vectors (.fbin, .u8bin, .i8bin)
+--queries <PATH>           # Query vectors
+--neighbors <PATH>         # Ground-truth neighbors (.ibin)
+--keys <PATH>              # Optional keys file (.i32bin)
+--step-size <N>            # Vectors per measurement step (default: 1000000)
+--no-shuffle               # Disable random insertion order (shuffle is on by default)
+--output <DIR>             # Output directory for JSON result files (omit for progress-only)
+```
+
+__retri-eval-usearch__ additionally supports comma-separated sweeps:
+
+```
+--dtype <LIST>             # f32,f16,bf16,e5m2,e4m3,e3m2,e2m3,i8,u8,b1
+--metric <LIST>            # ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence
+--connectivity <LIST>      # HNSW M parameter (default: 0 = auto)
+--expansion-add <LIST>     # expansion factor during indexing (default: 0 = auto)
+--expansion-search <LIST>  # expansion factor during search (default: 0 = auto)
+--shards <LIST>            # Index shards (default: 2)
+--threads <LIST>           # Thread count (default: available cores)
+```
+
+__retri-eval-cuvs__ (requires `--features cuvs-backend` and an NVIDIA GPU):
+
+```
+--metric <LIST>                    # l2, ip, cos (default: l2)
+--graph-degree <LIST>              # CAGRA output graph degree (default: 32)
+--intermediate-graph-degree <LIST> # CAGRA intermediate graph degree (default: 64)
+--itopk-size <LIST>                # Search-time intermediate results (default: 64)
+```
+
+## Output Format
+
+One JSON file per backend configuration, written to `--output <dir>`.
+Files are auto-named `<backend>-<hash>.json`.
+
+```json
+{
+  "machine": { "cpu_model": "Intel Xeon 6776P", "physical_cores": 96, ... },
+  "dataset": { "vectors_path": "...", "vectors_count": 10000000, "dimensions": 100, ... },
+  "config": { "backend": "usearch", "dtype": "f32", "metric": "l2", "connectivity": 16, ... },
+  "steps": [
+    {
+      "vectors_indexed": 1000000,
+      "add_elapsed": 12.3,
+      "add_throughput": 81300,
+      "memory_bytes": 412000000,
+      "search_elapsed": 0.45,
+      "search_throughput": 222000,
+      "recall_at_1": 0.0942,
+      "recall_at_10": 0.2815,
+      "ndcg_at_10": 0.1847,
+      "recall_at_1_normalized": 0.9420,
+      "recall_at_10_normalized": 0.9512,
+      "ndcg_at_10_normalized": 0.8470
+    }
+  ]
+}
+```
+
+## Project Structure
+
+```
+Cargo.toml
+src/
+    bench.rs            # Library root: Backend trait, types, BenchState, benchmark loop
+    dataset.rs          # Memory-mapped .fbin/.ibin loading (zero-copy)
+    eval.rs             # Recall@K, NDCG@K
+    output.rs           # Report types, JSON writer, machine info
+    docker.rs           # Docker container lifecycle (Tier 2 backends)
+    usearch.rs          # retri-eval-usearch binary
+    faiss.rs            # retri-eval-faiss binary
+    cuvs.rs             # retri-eval-cuvs binary
+    qdrant.rs           # retri-eval-qdrant binary
+    redis.rs            # retri-eval-redis binary
+    lancedb.rs          # retri-eval-lancedb binary
+    weaviate.rs         # retri-eval-weaviate binary
+docker/
+    qdrant.yml          # Docker compose for Qdrant
+    redis.yml           # Docker compose for Redis Stack
+    weaviate.yml        # Docker compose for Weaviate
+scripts/
+    plot.py             # JSON results → PNG plots (Plotly, runnable via uv)
 ```
 
 ## Datasets
@@ -277,141 +424,3 @@ mkdir -p datasets/t2i_1B/ && \
     wget -nc https://storage.yandexcloud.net/yandex-research/ann-datasets/T2I/groundtruth.public.100K.ibin -P datasets/t2i_1B/
 ```
 
-## Backends
-
-### Tier 1 — In-Memory ANN Libraries
-
-| Backend     | Quantization                                            | Metrics                                                                 | Parallelism |
-| ----------- | ------------------------------------------------------- | ----------------------------------------------------------------------- | ----------- |
-| __USearch__ | f64, f32, bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence | ForkUnion   |
-| __FAISS__   | f32, f16, bf16, u8, i8, b1                              | ip, l2                                                                  | OpenMP      |
-| __cuVS__    | f32, f16, i8, u8                                        | l2, ip, cos                                                             | CUDA        |
-
-- __USearch__: Input is passed directly in the specified type. `--dtype` selects both the input interpretation and the internal quantization.
-- __FAISS__: Input is always f32. `--dtype` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8bit_direct, etc.).
-- __cuVS__: Currently benchmarks with f32. CAGRA natively supports f32, f16, i8, u8 for build.
-
-```sh
-retri-eval-usearch --dtype bf16 --metric l2 ...
-retri-eval-faiss --dtype f16 --metric l2 ...
-retri-eval-cuvs --metric l2 ...
-```
-
-### Tier 2 — Vector Databases
-
-Input vectors are converted to f32 before sending to the database.
-Server-side quantization is managed by the database engine, not the benchmark.
-
-| Backend      | Client                        | Docker Image                | Metrics                         | Server-Side Quantization            |
-| ------------ | ----------------------------- | --------------------------- | ------------------------------- | ----------------------------------- |
-| __Qdrant__   | `qdrant-client` (gRPC)        | `qdrant/qdrant`             | ip, l2, cos, manhattan          | scalar (8-bit), binary, product     |
-| __Redis__    | `redis` (RESP)                | `redis/redis-stack`         | ip, l2, cos                     | HNSW, FLAT, SVS-VAMANA (8.2+)       |
-| __Weaviate__ | `weaviate-community` (REST)   | `semitechnologies/weaviate` | ip, l2, cos, hamming, manhattan | scalar, binary, product, rotational |
-| __LanceDB__  | `lancedb` (in-process, Arrow) | —                           | ip, l2, cos, hamming            | IVF-PQ, IVF-SQ, IVF-RQ              |
-
-Each backend is behind its own feature flag. Build only what you need:
-
-```sh
-cargo build --release                              # USearch (default)
-cargo build --release --features faiss-backend      # FAISS
-cargo build --release --features qdrant-backend     # Qdrant
-cargo build --release --features redis-backend      # Redis
-cargo build --release --features lancedb-backend    # LanceDB
-cargo build --release --features weaviate-backend   # Weaviate
-cargo build --release --features cuvs-backend       # cuVS (NVIDIA GPU)
-```
-
-Or combine multiple:
-
-```sh
-cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
-```
-
-## CLI Reference
-
-Each backend is a separate binary. Common flags shared by all:
-
-```
---vectors <PATH>           # Base vectors (.fbin, .u8bin, .i8bin)
---queries <PATH>           # Query vectors
---neighbors <PATH>         # Ground-truth neighbors (.ibin)
---keys <PATH>              # Optional keys file (.i32bin)
---step-size <N>            # Vectors per measurement step (default: 1000000)
---no-shuffle               # Disable random insertion order (shuffle is on by default)
---output <DIR>             # Output directory for JSON result files (omit for progress-only)
-```
-
-__retri-eval-usearch__ additionally supports comma-separated sweeps:
-
-```
---dtype <LIST>             # f32,f16,bf16,e5m2,e4m3,e3m2,e2m3,i8,u8,b1
---metric <LIST>            # ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence
---connectivity <LIST>      # HNSW M parameter (default: 0 = auto)
---expansion-add <LIST>     # expansion factor during indexing (default: 0 = auto)
---expansion-search <LIST>  # expansion factor during search (default: 0 = auto)
---shards <LIST>            # Index shards (default: 2)
---threads <LIST>           # Thread count (default: available cores)
-```
-
-__retri-eval-cuvs__ (requires `--features cuvs-backend` and an NVIDIA GPU):
-
-```
---metric <LIST>                    # l2, ip, cos (default: l2)
---graph-degree <LIST>              # CAGRA output graph degree (default: 32)
---intermediate-graph-degree <LIST> # CAGRA intermediate graph degree (default: 64)
---itopk-size <LIST>                # Search-time intermediate results (default: 64)
-```
-
-## Output Format
-
-One JSON file per backend configuration, written to `--output <dir>`.
-Files are auto-named `<backend>-<hash>.json`.
-
-```json
-{
-  "machine": { "cpu_model": "Intel Xeon 6776P", "physical_cores": 96, ... },
-  "dataset": { "vectors_path": "...", "vectors_count": 10000000, "dimensions": 100, ... },
-  "config": { "backend": "usearch", "dtype": "f32", "metric": "l2", "connectivity": 16, ... },
-  "steps": [
-    {
-      "vectors_indexed": 1000000,
-      "add_elapsed": 12.3,
-      "add_throughput": 81300,
-      "memory_bytes": 412000000,
-      "search_elapsed": 0.45,
-      "search_throughput": 222000,
-      "recall_at_1": 0.0942,
-      "recall_at_10": 0.2815,
-      "ndcg_at_10": 0.1847,
-      "recall_at_1_normalized": 0.9420,
-      "recall_at_10_normalized": 0.9512,
-      "ndcg_at_10_normalized": 0.8470
-    }
-  ]
-}
-```
-
-## Project Structure
-
-```
-Cargo.toml
-src/
-    bench.rs            # Library root: Backend trait, types, BenchState, benchmark loop
-    dataset.rs          # Memory-mapped .fbin/.ibin loading (zero-copy)
-    eval.rs             # Recall@K, NDCG@K
-    output.rs           # Report types, JSON writer, machine info
-    docker.rs           # Docker container lifecycle (Tier 2 backends)
-    usearch.rs          # retri-eval-usearch binary
-    faiss.rs            # retri-eval-faiss binary
-    cuvs.rs             # retri-eval-cuvs binary
-    qdrant.rs           # retri-eval-qdrant binary
-    redis.rs            # retri-eval-redis binary
-    lancedb.rs          # retri-eval-lancedb binary
-    weaviate.rs         # retri-eval-weaviate binary
-docker/
-    qdrant.yml          # Docker compose for Qdrant
-    redis.yml           # Docker compose for Redis Stack
-    weaviate.yml        # Docker compose for Weaviate
-scripts/
-    plot.py             # JSON results → PNG plots (Plotly, runnable via uv)
-```

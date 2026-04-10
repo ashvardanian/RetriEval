@@ -64,7 +64,7 @@ pub fn collect_machine_info() -> MachineInfo {
         .map(|cpu| cpu.brand().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let physical_cores = sys.physical_core_count().unwrap_or(0);
+    let physical_cores = System::physical_core_count().unwrap_or(0);
     let logical_cores = sys.cpus().len();
     let ram_bytes = sys.total_memory();
 
