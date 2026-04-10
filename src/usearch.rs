@@ -36,7 +36,7 @@
 //!     --output results/
 //! ```
 //!
-//! Turing 100M with incremental recall curve (batch-size-add=5M):
+//! Turing 100M with 20 measurement steps:
 //! ```sh
 //! retri-eval-usearch \
 //!     --vectors datasets/turing_100M/base.100M.fbin \
@@ -48,6 +48,7 @@
 //!     --connectivity 32 \
 //!     --expansion-add 256 \
 //!     --expansion-search 1024 \
+//!     --epochs 20 \
 //!     --output results/turing_100M
 //! ```
 

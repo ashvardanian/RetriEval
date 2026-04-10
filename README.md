@@ -94,7 +94,7 @@ Each backend is a separate binary. Common flags shared by all:
 --queries <PATH>           # Query vectors
 --neighbors <PATH>         # Ground-truth neighbors (.ibin)
 --keys <PATH>              # Optional keys file (.i32bin)
---step-size <N>            # Vectors per measurement step (default: 1000000)
+--epochs <N>               # Measurement steps (dataset split into N parts, default: 10)
 --no-shuffle               # Disable random insertion order (shuffle is on by default)
 --output <DIR>             # Output directory for JSON result files (omit for progress-only)
 ```
@@ -250,7 +250,7 @@ retri-eval-usearch \
     --queries datasets/sift_100M/query.public.10K.u8bin \
     --neighbors datasets/sift_100M/groundtruth.public.10K.ibin \
     --dtype f32,f16,i8 --metric l2 --threads 96 \
-    --step-size 5000000 --output results/sift_100M
+    --epochs 20 --output results/sift_100M
 ```
 
 ### Microsoft Turing-ANNS
@@ -337,7 +337,7 @@ retri-eval-usearch \
     --queries datasets/turing_100M/query.public.100K.fbin \
     --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
     --dtype f32,bf16,f16,i8 --metric l2 --threads 96 \
-    --step-size 5000000 --output results/turing_100M
+    --epochs 20 --output results/turing_100M
 ```
 
 ### Microsoft SpaceV
@@ -359,7 +359,7 @@ retri-eval-usearch \
     --queries datasets/spacev_100M/query.30K.i8bin \
     --neighbors datasets/spacev_100M/groundtruth.30K.i32bin \
     --dtype f32,f16,i8 --metric l2 --threads 96 \
-    --step-size 5000000 --output results/spacev_100M
+    --epochs 20 --output results/spacev_100M
 ```
 
 ### Yandex Deep

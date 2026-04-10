@@ -129,16 +129,20 @@ pub struct CommonArgs {
     #[arg(long)]
     pub keys: Option<PathBuf>,
 
-    /// Number of vectors to index per measurement step
-    #[arg(long, default_value_t = 1_000_000)]
-    pub batch_size_add: usize,
-
     /// Disable shuffling of insertion order (shuffle is on by default)
     #[arg(long, default_value_t = false)]
     pub no_shuffle: bool,
 
-    /// Number of queries per search batch (0 = all at once)
-    #[arg(long, default_value_t = 0)]
+    /// Number of measurement steps (dataset is split into this many equal parts)
+    #[arg(long, default_value_t = 10)]
+    pub epochs: usize,
+
+    /// Vectors per backend add() call
+    #[arg(long, default_value_t = 10_000)]
+    pub batch_size_add: usize,
+
+    /// Queries per backend search() call
+    #[arg(long, default_value_t = 10_000)]
     pub batch_size_search: usize,
 
     /// Output directory for JSON result files
@@ -155,6 +159,7 @@ pub struct BenchState {
     pub query_dataset: Dataset,
     pub ground_truth: GroundTruth,
     pub perm: dataset::Permutation,
+    pub epochs: usize,
     pub batch_size_add: usize,
     pub batch_size_search: usize,
     pub output_dir: Option<PathBuf>,
@@ -169,6 +174,9 @@ pub struct BenchState {
 
 impl BenchState {
     pub fn load(args: &CommonArgs) -> Result<Self, Box<dyn std::error::Error>> {
+        if args.epochs == 0 {
+            return Err("--epochs must be greater than 0".into());
+        }
         if args.batch_size_add == 0 {
             return Err("--batch-size-add must be greater than 0".into());
         }
@@ -236,7 +244,7 @@ impl BenchState {
         };
 
         let search_count = ground_truth.neighbors_per_query();
-        let add_chunk_size = 10_000.min(args.batch_size_add);
+        let add_chunk_size = args.batch_size_add;
 
         let dataset_info = DatasetInfo {
             vectors_path: args.vectors.display().to_string(),
@@ -248,16 +256,11 @@ impl BenchState {
             neighbors_per_query: search_count,
         };
 
-        let batch_size_search = if args.batch_size_search > 0 {
-            args.batch_size_search
-        } else {
-            num_queries
-        };
-
         Ok(Self {
             perm,
-            batch_size_add: args.batch_size_add,
-            batch_size_search,
+            epochs: args.epochs,
+            batch_size_add: add_chunk_size,
+            batch_size_search: args.batch_size_search,
             output_dir: args.output.clone(),
             machine_info,
             dataset_info,
@@ -294,7 +297,8 @@ pub fn run(
     let metadata = index.metadata();
     eprintln!("\n── {description} ──");
 
-    let num_steps = div_ceil(total_vectors, state.batch_size_add);
+    let num_steps = state.epochs;
+    let step_size = div_ceil(total_vectors, num_steps);
     let add_style = ProgressStyle::default_bar()
         .template("  add    [{elapsed_precise}] {bar:40.cyan/blue} {msg}")
         .unwrap()
@@ -308,10 +312,9 @@ pub fn run(
     let mut steps: Vec<StepEntry> = Vec::with_capacity(num_steps);
 
     for step in 0..num_steps {
-        let step_start = step * state.batch_size_add;
-        let step_count = state.batch_size_add.min(total_vectors - step_start);
+        let step_start = step * step_size;
+        let step_count = step_size.min(total_vectors - step_start);
         let is_final_step = step == num_steps - 1;
-
 
         let progress_add = ProgressBar::new(total_vectors as u64);
         progress_add.set_style(add_style.clone());
@@ -360,7 +363,6 @@ pub fn run(
             format_thousands(add_throughput),
         ));
         progress_add.finish();
-
 
         let progress_search = ProgressBar::new(num_queries as u64);
         progress_search.set_style(search_style.clone());
