@@ -1,4 +1,5 @@
 /target
+/.cargo/config.toml
 *.swp
 *.swo
 *~
@@ -12,4 +13,4 @@
 __pycache__/
 *.pyc
 *.pyo
-/results/
+/results*/

@@ -246,13 +246,13 @@ fn main() {
         ),
         metadata: {
             use serde_json::json;
-            let mut m = std::collections::HashMap::new();
-            m.insert("backend".into(), json!("weaviate"));
-            m.insert("metric".into(), json!(&cli.metric));
-            m.insert("connectivity".into(), json!(cli.connectivity));
-            m.insert("expansion_add".into(), json!(cli.expansion_add));
-            m.insert("expansion_search".into(), json!(cli.expansion_search));
-            m
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("backend".into(), json!("weaviate"));
+            metadata.insert("metric".into(), json!(&cli.metric));
+            metadata.insert("connectivity".into(), json!(cli.connectivity));
+            metadata.insert("expansion_add".into(), json!(cli.expansion_add));
+            metadata.insert("expansion_search".into(), json!(cli.expansion_search));
+            metadata
         },
     };
 

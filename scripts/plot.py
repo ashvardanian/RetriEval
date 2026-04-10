@@ -48,9 +48,13 @@ def series_key(report: dict[str, Any]) -> str:
     for field in ("dtype", "metric"):
         if field in config:
             parts.append(str(config[field]))
+    if "connectivity" in config:
+        parts.append(f"M={config['connectivity']}")
+    if "expansion_add" in config and "expansion_search" in config:
+        parts.append(f"ef={config['expansion_add']}/{config['expansion_search']}")
     shards = config.get("shards", 1)
     if isinstance(shards, int) and shards > 1:
-        parts.append(f"{shards}shards")
+        parts.append(f"{shards}s")
     return " · ".join(parts)
 
 

@@ -65,12 +65,12 @@ impl VectorSlice<'_> {
 
 impl Vectors<'_> {
     pub fn len(&self) -> usize {
-        let d = self.dimensions;
+        let dimensions = self.dimensions;
         match self.data {
-            VectorSlice::F32(data) => data.len() / d,
-            VectorSlice::I8(data) => data.len() / d,
-            VectorSlice::U8(data) => data.len() / d,
-            VectorSlice::B1x8(data) => data.len() / div_ceil(d, 8),
+            VectorSlice::F32(data) => data.len() / dimensions,
+            VectorSlice::I8(data) => data.len() / dimensions,
+            VectorSlice::U8(data) => data.len() / dimensions,
+            VectorSlice::B1x8(data) => data.len() / div_ceil(dimensions, 8),
         }
     }
 }
@@ -422,6 +422,8 @@ pub fn run(
         });
     }
 
+    let peak_memory = steps.iter().map(|s| s.memory_bytes).max().unwrap_or(0);
+
     // Write JSON report if output directory is set
     if let Some(dir) = &state.output_dir {
         let backend_name = metadata
@@ -450,6 +452,9 @@ pub fn run(
         write_report(&path, &report)?;
         eprintln!("  → {}", path.display());
     }
+
+    let memory_gb = peak_memory as f64 / 1e9;
+    eprintln!("  peak memory: {:.2} GB", memory_gb);
 
     eprintln!();
     Ok(())

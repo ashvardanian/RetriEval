@@ -39,7 +39,7 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_value = "bf16")]
     dtype: Vec<String>,
 
-    /// Comma-separated distance metrics: ip, l2, cos
+    /// Comma-separated distance metrics: ip, l2
     #[arg(long, value_delimiter = ',', default_value = "l2")]
     metric: Vec<String>,
 
@@ -60,18 +60,13 @@ struct Cli {
     threads: usize,
 }
 
-fn parse_metric(s: &str) -> &'static str {
+fn parse_metric(s: &str) -> Result<(&'static str, faiss::MetricType), String> {
     match s {
-        "ip" => "ip",
-        "cos" => "cos",
-        _ => "l2",
-    }
-}
-
-fn parse_faiss_metric(s: &str) -> faiss::MetricType {
-    match s {
-        "ip" => faiss::MetricType::InnerProduct,
-        _ => faiss::MetricType::L2,
+        "ip" => Ok(("ip", faiss::MetricType::InnerProduct)),
+        "l2" | "l2sq" => Ok(("l2", faiss::MetricType::L2)),
+        _ => Err(format!(
+            "unknown FAISS metric: {s}. FAISS HNSW supports: ip, l2"
+        )),
     }
 }
 
@@ -117,7 +112,7 @@ impl FaissBackend {
         } else {
             dimensions
         } as u32;
-        let faiss_metric = parse_faiss_metric(metric_name);
+        let (metric_label, faiss_metric) = parse_metric(metric_name)?;
 
         let index = faiss::index::index_factory(dim, &factory, faiss_metric)
             .map_err(|e| format!("failed to create FAISS index: {e}"))?;
@@ -137,7 +132,6 @@ impl FaissBackend {
             }
         }
 
-        let metric_label = parse_metric(metric_name);
         let description = format!(
             "faiss · {dtype_name} · {metric_label} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads",
         );
@@ -191,21 +185,21 @@ impl Backend for FaissBackend {
             .search(&data, count)
             .map_err(|e| format!("FAISS search failed: {e}"))?;
 
-        for query in 0..num_queries {
-            let offset = query * count;
+        for query_idx in 0..num_queries {
+            let offset = query_idx * count;
             let mut found = 0;
-            for j in 0..count {
-                let idx = result.labels[offset + j];
-                if idx >= 0 {
-                    out_keys[offset + j] = idx as Key;
-                    out_distances[offset + j] = result.distances[offset + j];
+            for rank in 0..count {
+                let neighbor_idx = result.labels[offset + rank];
+                if neighbor_idx >= 0 {
+                    out_keys[offset + rank] = neighbor_idx as Key;
+                    out_distances[offset + rank] = result.distances[offset + rank];
                     found += 1;
                 } else {
-                    out_keys[offset + j] = Key::MAX;
-                    out_distances[offset + j] = Distance::INFINITY;
+                    out_keys[offset + rank] = Key::MAX;
+                    out_distances[offset + rank] = Distance::INFINITY;
                 }
             }
-            out_counts[query] = found;
+            out_counts[query_idx] = found;
         }
         Ok(())
     }

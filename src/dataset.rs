@@ -92,32 +92,28 @@ impl Dataset {
         self.dimensions
     }
 
+    /// Reinterpret a raw byte slice as a typed `Vectors` based on this dataset's scalar format.
+    fn wrap_bytes<'a>(&self, bytes: &'a [u8], num_vectors: usize) -> Vectors<'a> {
+        let dimensions = self.dimensions;
+        let elements = num_vectors * dimensions;
+        let data = match self.format {
+            ScalarFormat::F32 => VectorSlice::F32(unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, elements)
+            }),
+            ScalarFormat::U8 => VectorSlice::U8(&bytes[..elements]),
+            ScalarFormat::I8 => VectorSlice::I8(unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const i8, elements)
+            }),
+        };
+        Vectors { data, dimensions }
+    }
+
     /// Borrow a contiguous slice of vectors directly from the mmap. Zero-copy.
     pub fn slice(&self, start: usize, count: usize) -> Vectors<'_> {
         let count = count.min(self.rows - start);
-        let d = self.dimensions;
-        let offset = 8 + start * d * self.scalar_size;
-        let byte_len = count * d * self.scalar_size;
-        let bytes = &self.mmap[offset..offset + byte_len];
-
-        let data = match self.format {
-            ScalarFormat::F32 => {
-                let slice =
-                    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, count * d) };
-                VectorSlice::F32(slice)
-            }
-            ScalarFormat::U8 => VectorSlice::U8(bytes),
-            ScalarFormat::I8 => {
-                let slice =
-                    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i8, count * d) };
-                VectorSlice::I8(slice)
-            }
-        };
-
-        Vectors {
-            data,
-            dimensions: d,
-        }
+        let offset = 8 + start * self.dimensions * self.scalar_size;
+        let byte_len = count * self.dimensions * self.scalar_size;
+        self.wrap_bytes(&self.mmap[offset..offset + byte_len], count)
     }
 
     /// Borrow all vectors from the mmap.
@@ -126,13 +122,11 @@ impl Dataset {
     }
 
     /// Gather vectors at the given indices into the provided buffer.
-    /// Returns the number of bytes written. The buffer must be at least
-    /// `indices.len() * dimensions * scalar_size` bytes.
+    /// The buffer must be at least `indices.len() * vector_bytes()` bytes.
     pub fn gather<'a>(&self, indices: &[usize], buf: &'a mut [u8]) -> Vectors<'a> {
-        let dimensions = self.dimensions;
-        let bytes_per_vector = dimensions * self.scalar_size;
-        let n = indices.len();
-        debug_assert!(buf.len() >= n * bytes_per_vector);
+        let bytes_per_vector = self.vector_bytes();
+        let num_vectors = indices.len();
+        debug_assert!(buf.len() >= num_vectors * bytes_per_vector);
 
         for (out_idx, &src_idx) in indices.iter().enumerate() {
             let src_offset = 8 + src_idx * bytes_per_vector;
@@ -141,23 +135,7 @@ impl Dataset {
                 .copy_from_slice(&self.mmap[src_offset..src_offset + bytes_per_vector]);
         }
 
-        let data = match self.format {
-            ScalarFormat::F32 => {
-                let slice = unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr() as *const f32, n * dimensions)
-                };
-                VectorSlice::F32(slice)
-            }
-            ScalarFormat::U8 => VectorSlice::U8(&buf[..n * dimensions]),
-            ScalarFormat::I8 => {
-                let slice = unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr() as *const i8, n * dimensions)
-                };
-                VectorSlice::I8(slice)
-            }
-        };
-
-        Vectors { data, dimensions }
+        self.wrap_bytes(&buf[..num_vectors * bytes_per_vector], num_vectors)
     }
 
     /// Bytes per vector (dimensions * scalar_size).

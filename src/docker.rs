@@ -82,26 +82,41 @@ impl ContainerHandle {
         })
     }
 
+    /// Poll `check` every 500ms until it returns `true` or `timeout` expires.
+    async fn wait_until(
+        &self,
+        label: &str,
+        timeout: Duration,
+        check: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        eprintln!("  Waiting for {label}...");
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                return Err(format!("timeout waiting for {label}").into());
+            }
+            if check().await {
+                eprintln!("  {} is ready.", self.name);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     pub async fn wait_for_http(
         &self,
         url: &str,
         timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let client = reqwest::Client::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-        eprintln!("  Waiting for {url}...");
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                return Err(format!("timeout waiting for {url}").into());
-            }
-            if let Ok(resp) = client.get(url).send().await {
-                if resp.status().is_success() {
-                    eprintln!("  {} is ready.", self.name);
-                    return Ok(());
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        self.wait_until(url, timeout, || {
+            let client = &client;
+            let url = url.to_string();
+            Box::pin(async move {
+                client.get(&url).send().await.is_ok_and(|r| r.status().is_success())
+            })
+        })
+        .await
     }
 
     pub async fn wait_for_tcp(
@@ -110,19 +125,12 @@ impl ContainerHandle {
         port: u16,
         timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let addr = format!("{host}:{port}");
-        eprintln!("  Waiting for {addr}...");
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                return Err(format!("timeout waiting for {addr}").into());
-            }
-            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-                eprintln!("  {} is ready.", self.name);
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        let address = format!("{host}:{port}");
+        self.wait_until(&address, timeout, || {
+            let address = address.clone();
+            Box::pin(async move { tokio::net::TcpStream::connect(&address).await.is_ok() })
+        })
+        .await
     }
 
     pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {

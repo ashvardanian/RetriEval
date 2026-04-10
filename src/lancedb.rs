@@ -229,10 +229,10 @@ fn main() {
         description: format!("lancedb · {} · {dimensions}d", cli.metric),
         metadata: {
             use serde_json::json;
-            let mut m = std::collections::HashMap::new();
-            m.insert("backend".into(), json!("lancedb"));
-            m.insert("metric".into(), json!(&cli.metric));
-            m
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("backend".into(), json!("lancedb"));
+            metadata.insert("metric".into(), json!(&cli.metric));
+            metadata
         },
     };
 

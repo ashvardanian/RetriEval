@@ -61,7 +61,7 @@ pub fn collect_machine_info() -> MachineInfo {
     let cpu_model = sys
         .cpus()
         .first()
-        .map(|c| c.brand().to_string())
+        .map(|cpu| cpu.brand().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
     let physical_cores = sys.physical_core_count().unwrap_or(0);

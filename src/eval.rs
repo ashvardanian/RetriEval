@@ -17,15 +17,15 @@ pub fn recall_at_k(
 
     let mut hits = 0usize;
 
-    for q in 0..num_queries {
-        let gt = ground_truth.neighbors(q);
-        if gt.is_empty() {
+    for query_idx in 0..num_queries {
+        let ground_truth_neighbors = ground_truth.neighbors(query_idx);
+        if ground_truth_neighbors.is_empty() {
             continue;
         }
-        let true_nearest = gt[0];
+        let true_nearest = ground_truth_neighbors[0];
 
-        let offset = q * max_count;
-        let found = out_counts[q].min(k);
+        let offset = query_idx * max_count;
+        let found = out_counts[query_idx].min(k);
         if out_keys[offset..offset + found].contains(&true_nearest) {
             hits += 1;
         }
@@ -37,7 +37,7 @@ pub fn recall_at_k(
 /// Precomputed log2 table for NDCG discount factors: 1/log2(rank+1) for rank 1..=K.
 /// discount[0] = 1/log2(2) = 1.0, discount[1] = 1/log2(3) ≈ 0.63, etc.
 fn discount_table(k: usize) -> Vec<f64> {
-    (0..k).map(|r| 1.0 / ((r + 2) as f64).log2()).collect()
+    (0..k).map(|rank| 1.0 / ((rank + 2) as f64).log2()).collect()
 }
 
 /// Compute NDCG@K (Normalized Discounted Cumulative Gain).
@@ -59,26 +59,24 @@ pub fn ndcg_at_k(
     let discount = discount_table(k);
     let mut total_ndcg = 0.0;
 
-    for q in 0..num_queries {
-        let gt = ground_truth.neighbors(q);
-        let gt_k = gt.len().min(k);
-        let offset = q * max_count;
-        let found = out_counts[q].min(k);
+    for query_idx in 0..num_queries {
+        let ground_truth_neighbors = ground_truth.neighbors(query_idx);
+        let ground_truth_count = ground_truth_neighbors.len().min(k);
+        let offset = query_idx * max_count;
+        let found = out_counts[query_idx].min(k);
         let results = &out_keys[offset..offset + found];
 
         let mut dcg = 0.0;
         for (rank, &key) in results.iter().enumerate() {
-            // Check if this result is among the top-K ground truth
-            for g in 0..gt_k {
-                if key == gt[g] {
+            for gt_rank in 0..ground_truth_count {
+                if key == ground_truth_neighbors[gt_rank] {
                     dcg += discount[rank];
                     break;
                 }
             }
         }
 
-        // Ideal DCG for this query uses min(gt_k, k) relevant docs
-        let query_idcg: f64 = discount[..gt_k].iter().sum();
+        let query_idcg: f64 = discount[..ground_truth_count].iter().sum();
         if query_idcg > 0.0 {
             total_ndcg += dcg / query_idcg;
         }

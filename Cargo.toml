@@ -11,6 +11,7 @@ path = "src/bench.rs"
 [[bin]]
 name = "retri-eval-usearch"
 path = "src/usearch.rs"
+required-features = ["usearch-backend"]
 
 [[bin]]
 name = "retri-eval-faiss"
@@ -37,6 +38,11 @@ name = "retri-eval-weaviate"
 path = "src/weaviate.rs"
 required-features = ["weaviate-backend"]
 
+[[bin]]
+name = "retri-eval-cuvs"
+path = "src/cuvs.rs"
+required-features = ["cuvs-backend"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -44,26 +50,49 @@ serde_json = "1"
 memmap2 = "0.9"
 sysinfo = "0.32"
 indicatif = "0.17"
-itertools = "0.14"
 rand = "0.9"
-fork_union = "2"
-usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev" }
+
+# USearch backend
+usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", optional = true }
+fork_union = { version = "2", optional = true }
+itertools = { version = "0.14", optional = true }
+
+# FAISS backend (links against system libfaiss via pkg-config)
 faiss = { version = "0.13", optional = true }
+
+# Tier 2 shared (Docker + async)
 bollard = { version = "0.20", optional = true }
 futures-util = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 reqwest = { version = "0.12", optional = true }
+
+# Qdrant
 qdrant-client = { version = "1", optional = true }
+
+# Redis
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
+
+# LanceDB
 lancedb = { version = "0.27", optional = true }
-weaviate-community = { version = "0.2", optional = true }
 arrow-array = { version = "57", optional = true }
 arrow-schema = { version = "57", optional = true }
 
+# Weaviate
+weaviate-community = { version = "0.2", optional = true }
+
+# cuVS
+cuvs = { version = "26.4", optional = true }
+cuvs-sys = { version = "26.4", optional = true }
+ndarray = { version = "0.15", optional = true }
+numkong = { version = "7", optional = true }
+
 [features]
+default = ["usearch-backend"]
+usearch-backend = ["usearch", "fork_union", "itertools"]
 faiss-backend = ["faiss"]
 tier2 = ["bollard", "futures-util", "tokio", "reqwest"]
 qdrant-backend = ["tier2", "qdrant-client"]
 redis-backend = ["tier2", "redis"]
 lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
 weaviate-backend = ["tier2", "weaviate-community"]
+cuvs-backend = ["cuvs", "cuvs-sys", "ndarray", "itertools", "numkong"]

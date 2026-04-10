@@ -6,13 +6,13 @@ Compares in-memory ANN libraries (USearch, FAISS) and vector databases (Qdrant, 
 ## Quick Start
 
 ```sh
-cargo build --release
+cargo install --path .
 ```
 
-Each backend is a separate binary. Run USearch against a dataset:
+This installs all backend binaries to `~/.cargo/bin/`. Run USearch against a dataset:
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/wiki_1M/base.1M.fbin \
     --queries datasets/wiki_1M/query.public.100K.fbin \
     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
@@ -42,12 +42,12 @@ mkdir -p datasets/wiki_1M/ && \
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/wiki_1M/base.1M.fbin \
     --queries datasets/wiki_1M/query.public.100K.fbin \
     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
     --dtype f32,f16,i8 --metric ip --threads 16 \
-    --output wiki-1M.jsonl
+    --output results/wiki_1M
 ```
 
 ### Meta BIGANN — SIFT
@@ -73,12 +73,12 @@ with open('datasets/sift_10M/base.10M.u8bin', 'r+b') as f:
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/sift_10M/base.10M.u8bin \
     --queries datasets/sift_10M/query.public.10K.u8bin \
     --neighbors datasets/sift_10M/groundtruth.public.10K.ibin \
     --dtype f32,f16,i8 --metric l2 --threads 16 \
-    --output sift-10M.jsonl
+    --output results/sift_10M
 ```
 
 #### 100M subset, u8, 128d, L2, ~12 GB
@@ -98,12 +98,12 @@ with open('datasets/sift_100M/base.100M.u8bin', 'r+b') as f:
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/sift_100M/base.100M.u8bin \
     --queries datasets/sift_100M/query.public.10K.u8bin \
     --neighbors datasets/sift_100M/groundtruth.public.10K.ibin \
     --dtype f32,f16,i8 --metric l2 --threads 96 \
-    --step-size 5000000 --output sift-100M.jsonl
+    --step-size 5000000 --output results/sift_100M
 ```
 
 ### Microsoft Turing-ANNS
@@ -131,12 +131,12 @@ with open('datasets/turing_1M/base.1M.fbin', 'r+b') as f:
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/turing_1M/base.1M.fbin \
     --queries datasets/turing_1M/query.public.100K.fbin \
     --neighbors datasets/turing_1M/groundtruth.public.100K.ibin \
     --dtype f32,bf16,f16,i8 --metric l2 --threads 16 \
-    --output turing-1M.jsonl
+    --output results/turing_1M
 ```
 
 #### 10M subset, f32, 100d, L2, ~3.7 GB
@@ -158,12 +158,12 @@ with open('datasets/turing_10M/base.10M.fbin', 'r+b') as f:
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/turing_10M/base.10M.fbin \
     --queries datasets/turing_10M/query.public.100K.fbin \
     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
     --dtype f32,bf16,f16,i8 --metric l2 --threads 16 \
-    --output turing-10M.jsonl
+    --output results/turing_10M
 ```
 
 #### 100M subset, f32, 100d, L2, ~37 GB
@@ -185,12 +185,12 @@ with open('datasets/turing_100M/base.100M.fbin', 'r+b') as f:
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/turing_100M/base.100M.fbin \
     --queries datasets/turing_100M/query.public.100K.fbin \
     --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
     --dtype f32,bf16,f16,i8 --metric l2 --threads 96 \
-    --step-size 5000000 --output turing-100M.jsonl
+    --step-size 5000000 --output results/turing_100M
 ```
 
 ### Microsoft SpaceV
@@ -207,12 +207,12 @@ mkdir -p datasets/spacev_100M/ && \
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/spacev_100M/base.100M.i8bin \
     --queries datasets/spacev_100M/query.30K.i8bin \
     --neighbors datasets/spacev_100M/groundtruth.30K.i32bin \
     --dtype f32,f16,i8 --metric l2 --threads 96 \
-    --step-size 5000000 --output spacev-100M.jsonl
+    --step-size 5000000 --output results/spacev_100M
 ```
 
 ### Yandex Deep
@@ -229,12 +229,12 @@ mkdir -p datasets/deep_10M/ && \
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/deep_10M/base.10M.fbin \
     --queries datasets/deep_10M/query.public.10K.fbin \
     --neighbors datasets/deep_10M/groundtruth.public.10K.ibin \
     --dtype f32,bf16,f16,i8 --metric l2 --threads 16 \
-    --output deep-10M.jsonl
+    --output results/deep_10M
 ```
 
 #### 1B, f32, 96d, L2, ~358 GB
@@ -260,12 +260,12 @@ mkdir -p datasets/t2i/ && \
 ```
 
 ```sh
-./target/release/retri-eval-usearch \
+retri-eval-usearch \
     --vectors datasets/t2i/base.1M.fbin \
     --queries datasets/t2i/query.public.100K.fbin \
     --neighbors datasets/t2i/groundtruth.public.100K.ibin \
     --dtype f32,bf16,f16,i8 --metric cos --threads 16 \
-    --output t2i-1M.jsonl
+    --output results/t2i_1M
 ```
 
 #### 1B, f32, 200d, Cos, ~750 GB
@@ -281,24 +281,50 @@ mkdir -p datasets/t2i_1B/ && \
 
 ### Tier 1 — In-Memory ANN Libraries
 
-| Backend     | Quantization                                       | Metrics                | Threading                    |
-| ----------- | -------------------------------------------------- | ---------------------- | ---------------------------- |
-| __USearch__ | f32, bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | ip, l2sq, cos, hamming | fork_union pool per instance |
-| __FAISS__   | f32, f16, bf16, u8, i8, b1                         | ip, l2sq               | OpenMP (omp_set_num_threads) |
+| Backend     | Quantization                                            | Metrics                                                                 | Parallelism |
+| ----------- | ------------------------------------------------------- | ----------------------------------------------------------------------- | ----------- |
+| __USearch__ | f64, f32, bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence | ForkUnion   |
+| __FAISS__   | f32, f16, bf16, u8, i8, b1                              | ip, l2                                                                  | OpenMP      |
+| __cuVS__    | f32, f16, i8, u8                                        | l2, ip, cos                                                             | CUDA        |
+
+- __USearch__: Input is passed directly in the specified type. `--dtype` selects both the input interpretation and the internal quantization.
+- __FAISS__: Input is always f32. `--dtype` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8bit_direct, etc.).
+- __cuVS__: Currently benchmarks with f32. CAGRA natively supports f32, f16, i8, u8 for build.
+
+```sh
+retri-eval-usearch --dtype bf16 --metric l2 ...
+retri-eval-faiss --dtype f16 --metric l2 ...
+retri-eval-cuvs --metric l2 ...
+```
 
 ### Tier 2 — Vector Databases
 
-| Backend      | Client               | Docker Image              |
-| ------------ | -------------------- | ------------------------- |
-| __Qdrant__   | qdrant-client (gRPC) | qdrant/qdrant             |
-| __Redis__    | redis (RediSearch)   | redis/redis-stack         |
-| __Weaviate__ | weaviate-community   | semitechnologies/weaviate |
-| __LanceDB__  | lancedb (in-process) | —                         |
+Input vectors are converted to f32 before sending to the database.
+Server-side quantization is managed by the database engine, not the benchmark.
 
-Tier 2 backends are behind feature flags:
+| Backend      | Client                        | Docker Image                | Metrics                         | Server-Side Quantization            |
+| ------------ | ----------------------------- | --------------------------- | ------------------------------- | ----------------------------------- |
+| __Qdrant__   | `qdrant-client` (gRPC)        | `qdrant/qdrant`             | ip, l2, cos, manhattan          | scalar (8-bit), binary, product     |
+| __Redis__    | `redis` (RESP)                | `redis/redis-stack`         | ip, l2, cos                     | HNSW, FLAT, SVS-VAMANA (8.2+)       |
+| __Weaviate__ | `weaviate-community` (REST)   | `semitechnologies/weaviate` | ip, l2, cos, hamming, manhattan | scalar, binary, product, rotational |
+| __LanceDB__  | `lancedb` (in-process, Arrow) | —                           | ip, l2, cos, hamming            | IVF-PQ, IVF-SQ, IVF-RQ              |
+
+Each backend is behind its own feature flag. Build only what you need:
 
 ```sh
-cargo build --release --features qdrant-backend,redis-backend,lancedb-backend,weaviate-backend
+cargo build --release                              # USearch (default)
+cargo build --release --features faiss-backend      # FAISS
+cargo build --release --features qdrant-backend     # Qdrant
+cargo build --release --features redis-backend      # Redis
+cargo build --release --features lancedb-backend    # LanceDB
+cargo build --release --features weaviate-backend   # Weaviate
+cargo build --release --features cuvs-backend       # cuVS (NVIDIA GPU)
+```
+
+Or combine multiple:
+
+```sh
+cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
 ```
 
 ## CLI Reference
@@ -320,11 +346,20 @@ __retri-eval-usearch__ additionally supports comma-separated sweeps:
 ```
 --dtype <LIST>             # f32,f16,bf16,e5m2,e4m3,e3m2,e2m3,i8,u8,b1
 --metric <LIST>            # ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence
---connectivity <LIST>      # HNSW M parameter (default: 16)
---expansion-add <LIST>     # efConstruction (default: 128)
---expansion-search <LIST>  # efSearch (default: 64)
---shards <LIST>            # Index shards (default: 1)
+--connectivity <LIST>      # HNSW M parameter (default: 0 = auto)
+--expansion-add <LIST>     # expansion factor during indexing (default: 0 = auto)
+--expansion-search <LIST>  # expansion factor during search (default: 0 = auto)
+--shards <LIST>            # Index shards (default: 2)
 --threads <LIST>           # Thread count (default: available cores)
+```
+
+__retri-eval-cuvs__ (requires `--features cuvs-backend` and an NVIDIA GPU):
+
+```
+--metric <LIST>                    # l2, ip, cos (default: l2)
+--graph-degree <LIST>              # CAGRA output graph degree (default: 32)
+--intermediate-graph-degree <LIST> # CAGRA intermediate graph degree (default: 64)
+--itopk-size <LIST>                # Search-time intermediate results (default: 64)
 ```
 
 ## Output Format
@@ -368,6 +403,7 @@ src/
     docker.rs           # Docker container lifecycle (Tier 2 backends)
     usearch.rs          # retri-eval-usearch binary
     faiss.rs            # retri-eval-faiss binary
+    cuvs.rs             # retri-eval-cuvs binary
     qdrant.rs           # retri-eval-qdrant binary
     redis.rs            # retri-eval-redis binary
     lancedb.rs          # retri-eval-lancedb binary
