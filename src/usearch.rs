@@ -28,11 +28,10 @@
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
 //!     --dtype f32,bf16,e5m2,e4m3,e3m2,e2m3,i8 \
-//!     --shards 2 \
 //!     --metric l2 \
-//!     --connectivity 32 \
-//!     --expansion-add 256 \
-//!     --expansion-search 1024 \
+//!     --connectivity 48 \
+//!     --expansion-add 768 \
+//!     --expansion-search 384 \
 //!     --output results/
 //! ```
 //!

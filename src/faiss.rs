@@ -2,32 +2,21 @@
 //!
 //! ## Prerequisites
 //!
-//! Requires the FAISS C API library (`libfaiss_c`). Install via conda:
+//! Requires a C++ compiler, CMake, and BLAS (FAISS is built from bundled source):
 //!
 //! ```sh
-//! conda install -c conda-forge libfaiss
-//! ```
-//!
-//! The conda package includes `libfaiss.so` but not the C API wrapper.
-//! Build `libfaiss_c.so` from the FAISS source `c_api/` directory against
-//! the installed `libfaiss`:
-//!
-//! ```sh
-//! git clone --depth 1 --branch v1.10.0 https://github.com/facebookresearch/faiss.git /tmp/faiss
-//! cd /tmp/faiss/c_api && mkdir build && cd build
-//! cmake .. -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
-//!     -DCMAKE_INSTALL_PREFIX="$CONDA_PREFIX" \
-//!     -DCMAKE_CXX_FLAGS="-I$CONDA_PREFIX/include" \
-//!     -DCMAKE_SHARED_LINKER_FLAGS="-L$CONDA_PREFIX/lib" \
-//!     -DBUILD_SHARED_LIBS=ON -DFAISS_ENABLE_GPU=OFF
-//! make -j$(nproc) && cp libfaiss_c.so "$CONDA_PREFIX/lib/"
+//! # Ubuntu / Debian
+//! sudo apt install cmake g++ libopenblas-dev
 //! ```
 //!
 //! ## Build & Install
 //!
 //! ```sh
-//! RUSTFLAGS="-L $CONDA_PREFIX/lib" cargo install --path . --features faiss-backend
+//! cargo install --path . --features faiss-static
 //! ```
+//!
+//! This statically links a bundled copy of FAISS — no system `libfaiss` needed.
+//! For dynamic linking against a pre-installed `libfaiss_c`, use `--features faiss-backend` instead.
 //!
 //! ## Examples
 //!
@@ -36,9 +25,8 @@
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --dtype f32,f16,i8 \
+//!     --dtype f32,bf16,f16,i8 \
 //!     --metric l2 \
-//!     --threads 16 \
 //!     --output results/
 //! ```
 //!
@@ -50,7 +38,6 @@
 //!     --neighbors datasets/binary_1M/groundtruth.10K.ibin \
 //!     --dtype b1 \
 //!     --metric hamming \
-//!     --threads 16 \
 //!     --output results/binary_1M
 //! ```
 
@@ -120,7 +107,7 @@ fn index_factory_string(dtype: &str, connectivity: usize) -> Result<String, Stri
         "bf16" => Ok(format!("HNSW{connectivity},SQbf16")),
         "u8" => Ok(format!("HNSW{connectivity},SQ8bit_direct")),
         "i8" => Ok(format!("HNSW{connectivity},SQ8bit_direct_signed")),
-        "b1" => Ok(format!("BinaryHNSW{connectivity}")),
+        "b1" => Ok(format!("BHNSW{connectivity}")),
         _ => Err(format!("unknown FAISS dtype: {dtype}")),
     }
 }
@@ -129,11 +116,12 @@ fn is_binary(dtype: &str) -> bool {
     dtype == "b1"
 }
 
-/// Unpack FAISS search results into output buffers.
-/// Generic over the distance type — FAISS returns `f32` for float indices and `i32` for binary.
+/// Unpack FAISS search results into output buffers, translating FAISS internal
+/// sequential IDs back to our keys via `key_map`.
 fn unpack_search_results<D: Copy>(
     labels: &[faiss::Idx],
     distances: &[D],
+    key_map: &[Key],
     count: usize,
     to_distance: impl Fn(D) -> Distance,
     out_keys: &mut [Key],
@@ -144,9 +132,9 @@ fn unpack_search_results<D: Copy>(
         let offset = query_idx * count;
         let mut found = 0;
         for rank in 0..count {
-            let neighbor_idx = labels[offset + rank];
-            if let Some(id) = neighbor_idx.get() {
-                out_keys[offset + rank] = id as Key;
+            let faiss_id = labels[offset + rank];
+            if let Some(internal_id) = faiss_id.get() {
+                out_keys[offset + rank] = key_map[internal_id as usize];
                 out_distances[offset + rank] = to_distance(distances[offset + rank]);
                 found += 1;
             } else {
@@ -165,6 +153,9 @@ enum FaissIndex {
 
 struct FaissBackend {
     index: FaissIndex,
+    /// Maps FAISS internal sequential ID → our Key. FAISS assigns IDs 0, 1, 2, ...
+    /// in insertion order, but our keys come from the (shuffled) dataset.
+    key_map: Vec<Key>,
     description: String,
     metadata: HashMap<String, Value>,
 }
@@ -235,6 +226,7 @@ impl FaissBackend {
 
         Ok(Self {
             index,
+            key_map: Vec::new(),
             description,
             metadata,
         })
@@ -249,7 +241,10 @@ impl Backend for FaissBackend {
         self.metadata.clone()
     }
 
-    fn add(&mut self, _keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+        // Record keys in insertion order — FAISS assigns internal IDs 0, 1, 2, ...
+        self.key_map.extend_from_slice(keys);
+
         // SAFETY: `add` has exclusive `&mut self` access.
         match &self.index {
             FaissIndex::Float(index) => {
@@ -291,6 +286,7 @@ impl Backend for FaissBackend {
                 unpack_search_results(
                     &result.labels,
                     &result.distances,
+                    &self.key_map,
                     count,
                     |d| d,
                     out_keys,
@@ -312,6 +308,7 @@ impl Backend for FaissBackend {
                 unpack_search_results(
                     &result.labels,
                     &result.distances,
+                    &self.key_map,
                     count,
                     |d| d as Distance,
                     out_keys,
@@ -324,7 +321,7 @@ impl Backend for FaissBackend {
     }
 
     fn memory_bytes(&self) -> usize {
-        0
+        retrieval::process_rss_bytes() as usize
     }
 }
 

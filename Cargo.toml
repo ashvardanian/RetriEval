@@ -62,7 +62,8 @@ usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-de
 fork_union = { version = "2", optional = true }
 itertools = { version = "0.14", optional = true }
 
-# FAISS backend (links against system libfaiss via pkg-config)
+# FAISS backend — use `faiss-static` feature to bundle FAISS from source,
+# or plain `faiss-backend` to link against a pre-installed libfaiss_c.
 faiss = { version = "0.13", optional = true }
 
 # Tier 2 shared (Docker + async)
@@ -94,6 +95,7 @@ numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-de
 default = ["usearch-backend"]
 usearch-backend = ["usearch", "fork_union", "itertools"]
 faiss-backend = ["faiss"]
+faiss-static = ["faiss-backend", "faiss/static"]
 tier2 = ["bollard", "futures-util", "tokio", "reqwest"]
 qdrant-backend = ["tier2", "qdrant-client"]
 redis-backend = ["tier2", "redis"]

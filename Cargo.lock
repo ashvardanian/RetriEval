@@ -2075,6 +2075,9 @@ name = "faiss-sys"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4a8fa67f7070bb81f41dc71c98813b3e40a66bedab12d6c2ac2af50f0837a7e"
+dependencies = [
+ "cmake",
+]
 
 [[package]]
 name = "fast-float2"

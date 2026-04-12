@@ -18,10 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 
 pub use dataset::{Dataset, GroundTruth, Keys};
-pub use output::{
-    collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo,
-    StepEntry,
-};
+pub use output::{collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo, StepEntry};
 
 // #region Core types
 
@@ -72,6 +69,14 @@ impl Vectors<'_> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Get the current process resident set size (RSS) in bytes.
+pub fn process_rss_bytes() -> u64 {
+    let pid = sysinfo::get_current_pid().expect("get current pid");
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).map(|p| p.memory()).unwrap_or(0)
 }
 
 // #region Backend trait
@@ -182,10 +187,7 @@ impl BenchState {
 
         // Create output directory if specified
         if let Some(dir) = &args.output {
-            if dir
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "jsonl")
-            {
+            if dir.extension().is_some_and(|ext| ext == "json" || ext == "jsonl") {
                 return Err(format!(
                     "--output should be a directory, not a file: {}. \
                      Each config produces its own JSON file inside this directory.",
@@ -283,10 +285,7 @@ impl BenchState {
 // #region Benchmark loop
 
 /// Run one benchmark configuration. Accumulates steps, writes JSON report at the end.
-pub fn run(
-    index: &mut dyn Backend,
-    state: &mut BenchState,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(index: &mut dyn Backend, state: &mut BenchState) -> Result<(), Box<dyn std::error::Error>> {
     let total_vectors = state.dataset.rows();
     let num_queries = state.query_dataset.rows();
     let search_count = state.ground_truth.neighbors_per_query();
@@ -405,13 +404,7 @@ pub fn run(
         } else {
             0
         };
-        let recall1 = eval::recall_at_k(
-            &state.out_keys,
-            &state.out_counts,
-            search_count,
-            &state.ground_truth,
-            1,
-        );
+        let recall1 = eval::recall_at_k(&state.out_keys, &state.out_counts, search_count, &state.ground_truth, 1);
         let recall10 = eval::recall_at_k(
             &state.out_keys,
             &state.out_counts,
@@ -458,10 +451,7 @@ pub fn run(
 
     // Write JSON report if output directory is set
     if let Some(dir) = &state.output_dir {
-        let backend_name = metadata
-            .get("backend")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let backend_name = metadata.get("backend").and_then(|v| v.as_str()).unwrap_or("unknown");
         let hash = config_hash(&metadata);
         let filename = format!("{backend_name}-{hash}.json");
         let path = dir.join(&filename);

@@ -176,10 +176,60 @@ scripts/
 
 ## Datasets
 
-BigANN benchmark datasets with precomputed ground-truth neighbors.
-Only configurations with matching ground truth support recall evaluation.
+BigANN benchmark is a good starting point, if you are searching for large collections of high-dimensional vectors.
+Those often come with precomputed ground-truth neighbors, which is handy for recall evaluation.
+Datasets below are grouped by scale; only configurations with matching ground truth support recall evaluation.
 
-### Unum UForm Wiki — 1M, f32, 256d, IP
+### ~1M Scale — Development & Testing
+
+| Dataset                                    | Scalar Type | Dimensions | Metric | Base Size |    Ground Truth     |
+| :----------------------------------------- | :---------: | :--------: | :----: | :-------: | :-----------------: |
+| [Unum UForm Wiki][unum-wiki-1m]            |    `f32`    |    256     |   IP   |   1 GB    |  100K queries, yes  |
+| [Unum UForm Creative Captions][unum-cc-3m] |    `f32`    |    256     |   IP   |   3 GB    | cross-modal pairing |
+| [Arxiv with E5][unum-arxiv-2m]             |    `f32`    |    768     |   IP   |   6 GB    | cross-modal pairing |
+
+### ~10M Scale
+
+| Dataset                              | Scalar Type | Dimensions | Metric | Base Size |   Ground Truth    |
+| :----------------------------------- | :---------: | :--------: | :----: | :-------: | :---------------: |
+| [Meta BIGANN (SIFT)][meta-bigann]    |    `u8`     |    128     |   L2   |  1.2 GB   | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing] |    `f32`    |    100     |   L2   |  3.7 GB   | 100K queries, yes |
+| [Yandex Deep][yandex-deep]           |    `f32`    |     96     |   L2   |  3.6 GB   |  ¹ no subset GT   |
+
+> ¹ Yandex only publishes ground truth computed against the full 1B dataset. A `base.10M.fbin` exists for
+> download but using 1B ground truth with a subset will produce misleadingly low recall. Use it only for
+> throughput/latency testing, not recall evaluation.
+
+### ~100M Scale
+
+| Dataset                              | Scalar Type | Dimensions | Metric | Base Size |   Ground Truth    |
+| :----------------------------------- | :---------: | :--------: | :----: | :-------: | :---------------: |
+| [Meta BIGANN (SIFT)][meta-bigann]    |    `u8`     |    128     |   L2   |   12 GB   | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing] |    `f32`    |    100     |   L2   |   37 GB   | 100K queries, yes |
+| [Microsoft SpaceV][msft-spacev]      |    `i8`     |    100     |   L2   |  9.3 GB   | 30K queries, yes  |
+
+### ~1B Scale
+
+| Dataset                              | Scalar Type | Dimensions | Metric | Base Size |   Ground Truth    |
+| :----------------------------------- | :---------: | :--------: | :----: | :-------: | :---------------: |
+| [Meta BIGANN (SIFT)][meta-bigann]    |    `u8`     |    128     |   L2   |  119 GB   | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing] |    `f32`    |    100     |   L2   |  373 GB   | 100K queries, yes |
+| [Microsoft SpaceV][msft-spacev]      |    `i8`     |    100     |   L2   |   93 GB   | 30K queries, yes  |
+| [Yandex Text-to-Image][yandex-t2i]   |    `f32`    |    200     |  Cos   |  750 GB   | 100K queries, yes |
+| [Yandex Deep][yandex-deep]           |    `f32`    |     96     |   L2   |  358 GB   | 10K queries, yes  |
+
+[unum-cc-3m]: https://huggingface.co/datasets/unum-cloud/ann-cc-3m
+[unum-wiki-1m]: https://huggingface.co/datasets/unum-cloud/ann-wiki-1m
+[unum-arxiv-2m]: https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m
+[msft-spacev]: https://github.com/ashvardanian/SpaceV
+[msft-turing]: https://learning2hash.github.io/publications/microsoftturinganns1B/
+[yandex-t2i]: https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search
+[yandex-deep]: https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search
+[meta-bigann]: https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/
+
+### Download Instructions
+
+#### Unum UForm Wiki — 1M, f32, 256d, IP
 
 ```sh
 mkdir -p datasets/wiki_1M/ && \
