@@ -39,9 +39,7 @@ impl ContainerHandle {
         let remove_opts = bollard::query_parameters::RemoveContainerOptionsBuilder::default()
             .force(true)
             .build();
-        let _ = docker
-            .remove_container(container_name, Some(remove_opts))
-            .await;
+        let _ = docker.remove_container(container_name, Some(remove_opts)).await;
 
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         for &(host_port, container_port) in ports {
@@ -103,22 +101,12 @@ impl ContainerHandle {
         }
     }
 
-    pub async fn wait_for_http(
-        &self,
-        url: &str,
-        timeout: Duration,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn wait_for_http(&self, url: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
         let client = reqwest::Client::new();
         self.wait_until(url, timeout, || {
             let client = client.clone();
             let url = url.to_string();
-            Box::pin(async move {
-                client
-                    .get(&url)
-                    .send()
-                    .await
-                    .is_ok_and(|r| r.status().is_success())
-            })
+            Box::pin(async move { client.get(&url).send().await.is_ok_and(|r| r.status().is_success()) })
         })
         .await
     }
@@ -135,6 +123,20 @@ impl ContainerHandle {
             Box::pin(async move { tokio::net::TcpStream::connect(&address).await.is_ok() })
         })
         .await
+    }
+
+    /// Get the container's current memory usage in bytes via Docker stats API.
+    pub async fn memory_usage_bytes(&self) -> u64 {
+        let opts = bollard::query_parameters::StatsOptionsBuilder::default()
+            .stream(false)
+            .one_shot(true)
+            .build();
+        let mut stream = self.docker.stats(&self.container_id, Some(opts));
+        if let Some(Ok(stats)) = stream.next().await {
+            stats.memory_stats.and_then(|m| m.usage).unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {

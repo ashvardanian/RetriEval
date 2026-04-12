@@ -161,7 +161,10 @@ impl Backend for WeaviateBackend {
     }
 
     fn memory_bytes(&self) -> usize {
-        0
+        self.container
+            .as_ref()
+            .map(|c| self.runtime.block_on(c.memory_usage_bytes()) as usize)
+            .unwrap_or(0)
     }
 }
 
@@ -205,17 +208,13 @@ fn main() {
         .await
         .expect("docker start");
         handle
-            .wait_for_http(
-                &format!("http://localhost:{}/v1/.well-known/ready", cli.port),
-                timeout,
-            )
+            .wait_for_http(&format!("http://localhost:{}/v1/.well-known/ready", cli.port), timeout)
             .await
             .expect("weaviate not ready");
         handle
     });
 
-    let client = WeaviateClient::new(&format!("http://localhost:{}", cli.port), None, None)
-        .expect("weaviate client");
+    let client = WeaviateClient::new(&format!("http://localhost:{}", cli.port), None, None).expect("weaviate client");
 
     runtime.block_on(async {
         let _ = client.schema.delete(CLASS_NAME).await;
@@ -231,15 +230,9 @@ fn main() {
                     .with_max_connections(cli.connectivity as u64)
                     .build(),
             )
-            .with_properties(Properties::new(vec![
-                Property::builder("idx", vec!["int"]).build()
-            ]))
+            .with_properties(Properties::new(vec![Property::builder("idx", vec!["int"]).build()]))
             .build();
-        client
-            .schema
-            .create_class(&class)
-            .await
-            .expect("create class");
+        client.schema.create_class(&class).await.expect("create class");
     });
 
     let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {

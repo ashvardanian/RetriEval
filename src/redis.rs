@@ -104,10 +104,7 @@ impl Backend for RedisBackend {
             let batch_end = (batch_start + self.batch_size).min(num_vectors);
             let mut pipe = redis::pipe();
             for i in batch_start..batch_end {
-                for (j, f) in data[i * dimensions..(i + 1) * dimensions]
-                    .iter()
-                    .enumerate()
-                {
+                for (j, f) in data[i * dimensions..(i + 1) * dimensions].iter().enumerate() {
                     vec_bytes[j * 4..(j + 1) * 4].copy_from_slice(&f.to_le_bytes());
                 }
                 let key = format!("{PREFIX}{}", keys[i]);
@@ -135,10 +132,7 @@ impl Backend for RedisBackend {
         let mut query_bytes = vec![0u8; dimensions * 4];
 
         for q in 0..num_vectors {
-            for (i, f) in data[q * dimensions..(q + 1) * dimensions]
-                .iter()
-                .enumerate()
-            {
+            for (i, f) in data[q * dimensions..(q + 1) * dimensions].iter().enumerate() {
                 query_bytes[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
             }
 
@@ -177,7 +171,10 @@ impl Backend for RedisBackend {
     }
 
     fn memory_bytes(&self) -> usize {
-        0
+        self.container
+            .as_ref()
+            .map(|c| self.runtime.block_on(c.memory_usage_bytes()) as usize)
+            .unwrap_or(0)
     }
 }
 

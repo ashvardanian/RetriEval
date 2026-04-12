@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use qdrant_client::qdrant::{
-    point_id, CreateCollectionBuilder, Distance as QdrantDistance, HnswConfigDiffBuilder,
-    PointStruct, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    point_id, CreateCollectionBuilder, Distance as QdrantDistance, HnswConfigDiffBuilder, PointStruct,
+    SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use retrieval::docker::ContainerHandle;
@@ -173,7 +173,10 @@ impl Backend for QdrantBackend {
     }
 
     fn memory_bytes(&self) -> usize {
-        0
+        self.container
+            .as_ref()
+            .map(|c| self.runtime.block_on(c.memory_usage_bytes()) as usize)
+            .unwrap_or(0)
     }
 }
 
@@ -211,10 +214,7 @@ fn main() {
         .await
         .expect("docker start");
         handle
-            .wait_for_http(
-                &format!("http://localhost:{}/healthz", cli.http_port),
-                timeout,
-            )
+            .wait_for_http(&format!("http://localhost:{}/healthz", cli.http_port), timeout)
             .await
             .expect("health");
         handle
