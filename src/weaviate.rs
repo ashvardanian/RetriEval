@@ -194,7 +194,7 @@ fn main() {
 
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start(
-            "semitechnologies/weaviate:latest",
+            "semitechnologies/weaviate:1.36.10",
             "retrieval-weaviate",
             &vec![(cli.port, 8080), (50051, 50051)],
             &[

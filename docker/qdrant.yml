@@ -1,6 +1,8 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    # Qdrant v1.17.x — exposes Datatype::{Float32,Float16,Uint8} and
+    # quantization_config.binary / scalar / product (we only use BQ and SQ).
+    image: qdrant/qdrant:v1.17.1
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -8,10 +10,6 @@ services:
       - QDRANT__SERVICE__GRPC_PORT=6334
     volumes:
       - qdrant_data:/qdrant/storage
-    deploy:
-      resources:
-        limits:
-          memory: 64G
 
 volumes:
   qdrant_data:

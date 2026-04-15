@@ -244,13 +244,7 @@ fn main() {
     let timeout = Duration::from_secs(cli.docker_timeout);
 
     let handle = runtime.block_on(async {
-        let handle = ContainerHandle::start(
-            "redis/redis-stack:latest",
-            "retrieval-redis",
-            &vec![(cli.port, 6379)],
-            &[],
-            timeout,
-        )
+        let handle = ContainerHandle::start("redis:8.6", "retrieval-redis", &vec![(cli.port, 6379)], &[], timeout)
         .await
         .expect("docker start");
         handle

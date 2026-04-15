@@ -1,6 +1,8 @@
 services:
   weaviate:
-    image: semitechnologies/weaviate:latest
+    # Weaviate 1.37.x — HNSW with bq / sq / pq / rq quantization configs.
+    # We wire BQ only in the first pass (deterministic sign-based).
+    image: semitechnologies/weaviate:1.36.10
     ports:
       - "8080:8080"
       - "50051:50051"
@@ -12,10 +14,6 @@ services:
       CLUSTER_HOSTNAME: "node1"
     volumes:
       - weaviate_data:/var/lib/weaviate
-    deploy:
-      resources:
-        limits:
-          memory: 64G
 
 volumes:
   weaviate_data:

@@ -1,15 +1,13 @@
 services:
   redis:
-    image: redis/redis-stack:latest
+    # Redis 8.x native — vector search is now in core (redis-search built in).
+    # Accepts TYPE FLOAT32 / FLOAT64 / FLOAT16 / BFLOAT16 / INT8 / UINT8; the older
+    # redis-stack image caps at the first four. No RediSearch UI on :8001.
+    image: redis:8.6
     ports:
       - "6379:6379"
-      - "8001:8001"
     volumes:
       - redis_data:/data
-    deploy:
-      resources:
-        limits:
-          memory: 64G
 
 volumes:
   redis_data:

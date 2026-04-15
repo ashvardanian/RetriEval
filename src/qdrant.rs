@@ -206,7 +206,7 @@ fn main() {
 
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start(
-            "qdrant/qdrant:latest",
+            "qdrant/qdrant:v1.17.1",
             "retrieval-qdrant",
             &vec![(cli.http_port, 6333), (cli.grpc_port, 6334)],
             &[],
