@@ -1,8 +1,11 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use serde::Serialize;
 use serde_json::Value;
+use sysinfo::System;
 
 /// Machine descriptor.
 #[derive(Debug, Serialize)]
@@ -26,6 +29,12 @@ pub struct DatasetInfo {
 }
 
 /// One measurement step combining add + search results.
+///
+/// Fields under "Optional perf counters" are populated only when the benchmark
+/// was run with `--features perf-counters` on Linux AND the caller has
+/// `CAP_PERFMON` (or `kernel.perf_event_paranoid ≤ 1`). They are serde-skipped
+/// when absent, so historical reports parse against the updated struct
+/// without schema changes.
 #[derive(Debug, Serialize)]
 pub struct StepEntry {
     pub vectors_indexed: usize,
@@ -40,6 +49,25 @@ pub struct StepEntry {
     pub recall_at_1_normalized: f64,
     pub recall_at_10_normalized: f64,
     pub ndcg_at_10_normalized: f64,
+
+    // Optional perf counters — summed across all online CPUs, system-wide
+    // for the duration of the add-loop (…_add) or search-loop (…_search).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycles_add: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions_add: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_misses_add: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_misses_add: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycles_search: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions_search: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_misses_search: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_misses_search: Option<u64>,
 }
 
 /// Complete report for one backend configuration.
@@ -53,8 +81,6 @@ pub struct ConfigReport {
 
 /// Collects machine info using the `sysinfo` crate.
 pub fn collect_machine_info() -> MachineInfo {
-    use sysinfo::System;
-
     let mut sys = System::new_all();
     sys.refresh_all();
 
@@ -84,10 +110,14 @@ pub fn write_report(path: &Path, report: &ConfigReport) -> std::io::Result<()> {
 
 /// Generate a short hash from config metadata for file naming.
 pub fn config_hash(config: &HashMap<String, Value>) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     let sorted: std::collections::BTreeMap<&String, &Value> = config.iter().collect();
     format!("{sorted:?}").hash(&mut hasher);
-    format!("{:06x}", hasher.finish() & 0xFFFFFF)
+    format!("{:06x}", hasher.finish() & CONFIG_HASH_MASK)
 }
+
+/// Keep the low 24 bits of the hash — 6 hex digits, ~16M distinct file names.
+/// 6 chars is short enough to paste in commit messages without wrapping but
+/// wide enough to avoid collisions across the few hundred config permutations
+/// a typical benchmark sweep produces.
+const CONFIG_HASH_MASK: u64 = 0xFF_FFFF;

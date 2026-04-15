@@ -48,6 +48,16 @@ name = "retri-generate"
 path = "src/generate.rs"
 required-features = ["generate"]
 
+[[bin]]
+name = "retri-download-molecules"
+path = "scripts/download_molecules.rs"
+required-features = ["download"]
+
+[[bin]]
+name = "retri-download-cohere"
+path = "scripts/download_cohere.rs"
+required-features = ["download"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -56,10 +66,11 @@ memmap2 = "0.9"
 sysinfo = "0.38"
 indicatif = "0.18"
 rand = "0.9"
+thiserror = "2"
 
 # USearch backend
 usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", optional = true }
-fork_union = { version = "2", optional = true }
+fork_union = { version = "2" }
 itertools = { version = "0.14", optional = true }
 
 # FAISS backend — use `faiss-static` feature to bundle FAISS from source,
@@ -89,11 +100,22 @@ weaviate-community = { version = "0.2", optional = true }
 # cuVS
 cuvs = { version = "26.4", optional = true }
 cuvs-sys = { version = "26.4", optional = true }
-numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", optional = true }
+numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", features = ["parallel"], optional = true }
+
+# Dataset download binaries (Parquet readers for USearchMolecules / Cohere Wikipedia)
+parquet = { version = "57", default-features = false, features = ["arrow", "snap", "lz4", "zstd", "brotli"], optional = true }
+futures = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+
+# Linux-only: scoped hardware perf counters wired into StepEntry JSON output.
+# Gated both by `cfg(target_os = "linux")` (so macOS/Windows builds skip the
+# dep entirely) and the `perf-counters` feature flag (opt-in).
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event2 = { version = "0.7", optional = true }
 
 [features]
 default = ["usearch-backend"]
-usearch-backend = ["usearch", "fork_union", "itertools"]
+usearch-backend = ["usearch", "itertools"]
 faiss-backend = ["faiss"]
 faiss-static = ["faiss-backend", "faiss/static"]
 tier2 = ["bollard", "futures-util", "tokio", "reqwest"]
@@ -103,3 +125,5 @@ lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
 weaviate-backend = ["tier2", "weaviate-community"]
 cuvs-backend = ["cuvs", "cuvs-sys", "itertools", "numkong"]
 generate = ["numkong"]
+download = ["numkong", "parquet", "arrow-array", "arrow-schema", "reqwest", "reqwest/json", "reqwest/rustls-tls", "tokio", "futures", "bytes"]
+perf-counters = ["dep:perf-event2"]

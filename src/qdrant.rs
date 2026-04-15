@@ -32,6 +32,7 @@ use qdrant_client::qdrant::{
 use qdrant_client::Qdrant;
 use retrieval::docker::ContainerHandle;
 use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use serde_json::json;
 
 const COLLECTION: &str = "bench";
 
@@ -256,7 +257,6 @@ fn main() {
             cli.metric, cli.connectivity, cli.expansion_add,
         ),
         metadata: {
-            use serde_json::json;
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("backend".into(), json!("qdrant"));
             metadata.insert("metric".into(), json!(&cli.metric));

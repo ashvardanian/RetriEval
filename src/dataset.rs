@@ -1,11 +1,37 @@
 use std::fs::File;
 use std::path::Path;
 
+use fork_union::{SyncMutPtr, ThreadPool};
 use memmap2::Mmap;
+use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
+use rand::{RngCore, SeedableRng};
 
+use crate::error::DatasetError;
 use crate::{Key, VectorSlice, Vectors};
+
+/// Below this many elements the thread-pool spin-up cost outweighs any
+/// parallelism benefit; the shuffle falls back to the serial `SliceRandom`
+/// path. Measured at ~70 µs pool launch on a 192-thread Xeon 6776P, which
+/// is slower than shuffling 65 K elements serially.
+const PERMUTATION_SERIAL_THRESHOLD: usize = 65_536;
+
+/// Mixes the user's seed with the thread index to give each worker its own
+/// deterministic `SmallRng`. Value is the fractional part of the golden ratio
+/// times 2^64 — a standard choice (same constant fxhash et al. use) whose
+/// avalanche properties won't cluster seeds for adjacent thread indices.
+const THREAD_SEED_MIXER: u64 = 0x9E3779B97F4A7C15;
+
+/// In-place Fisher–Yates on a `&mut [usize]`. Pure safe code — the
+/// unsafe-slice-reconstruction lives at the caller (see
+/// [`Permutation::shuffled`]). Kept out of line so the parallel shuffle
+/// closure reads as three lines instead of ten.
+fn fisher_yates_shuffle(slice: &mut [usize], rng: &mut SmallRng) {
+    for swap_target_ceiling in (1..slice.len()).rev() {
+        let swap_target = (rng.next_u64() as usize) % (swap_target_ceiling + 1);
+        slice.swap(swap_target_ceiling, swap_target);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarFormat {
@@ -45,10 +71,11 @@ impl Dataset {
         let mmap = unsafe { Mmap::map(&file)? };
 
         if mmap.len() < 8 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "file too small for header",
-            ));
+            return Err(std::io::Error::other(DatasetError::HeaderTooSmall {
+                path: path.to_path_buf(),
+                kind: "dataset",
+                got: mmap.len() as u64,
+            }));
         }
 
         let rows = u32::from_le_bytes(mmap[0..4].try_into().unwrap()) as usize;
@@ -62,22 +89,22 @@ impl Dataset {
             "i8bin" => (dimensions, ScalarFormat::I8),
             "b1bin" => (dimensions.div_ceil(8), ScalarFormat::B1x8),
             _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("unsupported file extension: .{ext}"),
-                ))
+                return Err(std::io::Error::other(DatasetError::UnsupportedExtension {
+                    path: path.to_path_buf(),
+                    extension: ext.to_string(),
+                }))
             }
         };
 
         let expected = 8 + rows * bytes_per_vector;
         if mmap.len() < expected {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "file too small: expected {expected} bytes for {rows}x{dimensions}, got {}",
-                    mmap.len()
-                ),
-            ));
+            return Err(std::io::Error::other(DatasetError::BodyTooSmall {
+                path: path.to_path_buf(),
+                expected: expected as u64,
+                rows: rows as u32,
+                dims: dimensions as u32,
+                got: mmap.len() as u64,
+            }));
         }
 
         Ok(Self {
@@ -156,11 +183,74 @@ pub struct Permutation {
 }
 
 impl Permutation {
-    /// Create a shuffled permutation of `[0..n]` with a deterministic seed.
+    /// Create a shuffled permutation of `[0..n]` with a deterministic seed,
+    /// parallelized across the ForkUnion thread pool.
+    ///
+    /// The output is uniformly random *within each chunk* of `ceil(n/threads)`
+    /// consecutive positions. Across chunks, element ranges remain ordered
+    /// (chunk 0 holds some subset of `[0, n/threads)`, chunk 1 holds a subset
+    /// of `[n/threads, 2n/threads)`, etc.). This is sufficient for ANN
+    /// benchmarking — it eliminates natural orderings (e.g. sorted molecules)
+    /// and gives HNSW construction ~`chunk`-sized random windows to see a
+    /// representative sample before moving on. A fully-uniform parallel
+    /// shuffle would require parallel sort by random keys, which we skip to
+    /// avoid adding a rayon/sort dep.
     pub fn shuffled(n: usize, seed: u64) -> Self {
         let mut indices: Vec<usize> = (0..n).collect();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        indices.shuffle(&mut rng);
+        if n < PERMUTATION_SERIAL_THRESHOLD {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            indices.shuffle(&mut rng);
+            return Self { indices };
+        }
+
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        let mut pool = match ThreadPool::try_spawn(threads) {
+            Ok(pool) => pool,
+            Err(_) => {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                indices.shuffle(&mut rng);
+                return Self { indices };
+            }
+        };
+
+        let chunk = n.div_ceil(threads);
+        let shared_base = SyncMutPtr::new(indices.as_mut_ptr());
+
+        // Per-chunk Fisher–Yates. Each thread only writes to its own
+        // `[thread_index * chunk, (thread_index+1) * chunk)` range, so
+        // there are no cross-thread races. Seeds per thread are derived
+        // from `seed ^ mixer(thread_index)` for reproducibility.
+        //
+        // ForkUnion's `for_threads` takes a shared-ref closure (`Fn`), so
+        // we can't capture `&mut [usize]` directly. We pass the disjoint
+        // ranges via a `SyncMutPtr` and rebuild each thread's own
+        // `&mut [usize]` inside the closure — one `from_raw_parts_mut`
+        // call per thread, then safe `slice.swap(i, j)` in the hot loop.
+        pool.for_threads(|thread_index, _| {
+            let range_start = thread_index * chunk;
+            if range_start >= n {
+                return;
+            }
+            let range_end = (range_start + chunk).min(n);
+            // SAFETY: the chunks are disjoint by construction
+            // (`thread_index * chunk` is a monotonic multiple), so the
+            // `&mut [usize]` rebuilt here never aliases with any other
+            // thread's slice.
+            let chunk_slice: &mut [usize] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    shared_base.as_ptr().add(range_start),
+                    range_end - range_start,
+                )
+            };
+            let mut rng = SmallRng::seed_from_u64(
+                seed ^ (thread_index as u64).wrapping_mul(THREAD_SEED_MIXER),
+            );
+            fisher_yates_shuffle(chunk_slice, &mut rng);
+        });
+
         Self { indices }
     }
 
@@ -192,19 +282,23 @@ impl Keys {
         let mmap = unsafe { Mmap::map(&file)? };
 
         if mmap.len() < 8 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "keys file too small for header",
-            ));
+            return Err(std::io::Error::other(DatasetError::HeaderTooSmall {
+                path: path.to_path_buf(),
+                kind: "keys",
+                got: mmap.len() as u64,
+            }));
         }
 
         let count = u32::from_le_bytes(mmap[0..4].try_into().unwrap()) as usize;
         let expected = 8 + count * std::mem::size_of::<Key>();
         if mmap.len() < expected {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("keys file too small: expected {expected} bytes for {count} keys"),
-            ));
+            return Err(std::io::Error::other(DatasetError::BodyTooSmall {
+                path: path.to_path_buf(),
+                expected: expected as u64,
+                rows: count as u32,
+                dims: 1,
+                got: mmap.len() as u64,
+            }));
         }
 
         Ok(Keys::Mapped { mmap, count })
@@ -265,10 +359,11 @@ impl GroundTruth {
         let mmap = unsafe { Mmap::map(&file)? };
 
         if mmap.len() < 8 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ground truth file too small for header",
-            ));
+            return Err(std::io::Error::other(DatasetError::HeaderTooSmall {
+                path: path.to_path_buf(),
+                kind: "ground_truth",
+                got: mmap.len() as u64,
+            }));
         }
 
         let queries = u32::from_le_bytes(mmap[0..4].try_into().unwrap()) as usize;
@@ -276,10 +371,13 @@ impl GroundTruth {
 
         let expected = 8 + queries * neighbors_per_query * std::mem::size_of::<Key>();
         if mmap.len() < expected {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("ground truth too small: expected {expected} bytes for {queries}x{neighbors_per_query}"),
-            ));
+            return Err(std::io::Error::other(DatasetError::BodyTooSmall {
+                path: path.to_path_buf(),
+                expected: expected as u64,
+                rows: queries as u32,
+                dims: neighbors_per_query as u32,
+                got: mmap.len() as u64,
+            }));
         }
 
         Ok(Self {

@@ -68,6 +68,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Parser;
 use fork_union::{IndexedSplit, SyncMutPtr, ThreadPool};
 use retrieval::*;
+use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(name = "retri-eval-usearch", about = "Benchmark USearch HNSW")]
@@ -200,7 +201,6 @@ impl USearchBackend {
             description.push_str(&format!(" · {shards} shards"));
         }
 
-        use serde_json::json;
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("backend".into(), json!("usearch"));
         metadata.insert("dtype".into(), json!(dtype_name));

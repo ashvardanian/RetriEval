@@ -27,6 +27,7 @@ use std::time::Duration;
 use clap::Parser;
 use retrieval::docker::ContainerHandle;
 use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use serde_json::json;
 
 const INDEX_NAME: &str = "bench_idx";
 const PREFIX: &str = "vec:";
@@ -305,7 +306,6 @@ fn main() {
             cli.metric, cli.connectivity, cli.expansion_add,
         ),
         metadata: {
-            use serde_json::json;
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("backend".into(), json!("redis"));
             metadata.insert("metric".into(), json!(&cli.metric));

@@ -73,6 +73,7 @@ use clap::Parser;
 use cuvs::distance_type::DistanceType;
 use itertools::iproduct;
 use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use serde_json::json;
 
 // #region CudaAllocator
 
@@ -472,7 +473,6 @@ impl CuvsBackend {
             dtype.as_str(),
         );
 
-        use serde_json::json;
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("backend".into(), json!("cuvs-cagra"));
         metadata.insert("dtype".into(), json!(dtype.as_str()));

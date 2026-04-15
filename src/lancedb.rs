@@ -24,8 +24,10 @@ use std::sync::Arc;
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use clap::Parser;
+use futures_util::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use serde_json::json;
 
 const TABLE_NAME: &str = "bench";
 
@@ -163,7 +165,6 @@ impl Backend for LanceDbBackend {
                     .await
                     .map_err(|e| format!("LanceDB search: {e}"))?;
 
-                use futures_util::TryStreamExt;
                 let batches: Vec<RecordBatch> = results
                     .try_collect()
                     .await
@@ -238,7 +239,6 @@ fn main() {
         runtime: runtime.handle().clone(),
         description: format!("lancedb · {} · {dimensions}d", cli.metric),
         metadata: {
-            use serde_json::json;
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("backend".into(), json!("lancedb"));
             metadata.insert("metric".into(), json!(&cli.metric));

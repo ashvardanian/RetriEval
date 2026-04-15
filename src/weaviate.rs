@@ -26,6 +26,7 @@ use std::time::Duration;
 use clap::Parser;
 use retrieval::docker::ContainerHandle;
 use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use serde_json::json;
 use weaviate_community::collections::objects::Object;
 use weaviate_community::collections::query::RawQuery;
 use weaviate_community::collections::schema::*;
@@ -250,7 +251,6 @@ fn main() {
             cli.metric, cli.connectivity, cli.expansion_add,
         ),
         metadata: {
-            use serde_json::json;
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("backend".into(), json!("weaviate"));
             metadata.insert("metric".into(), json!(&cli.metric));
