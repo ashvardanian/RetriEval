@@ -469,7 +469,8 @@ impl CuvsBackend {
         let cuda_alloc = CudaAllocator(res.0);
 
         let description = format!(
-            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} gd={graph_degree} \u{b7} igd={intermediate_graph_degree} \u{b7} itopk={itopk_size} \u{b7} sw={search_width}",
+            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} gd={graph_degree} \u{b7} \
+             igd={intermediate_graph_degree} \u{b7} itopk={itopk_size} \u{b7} sw={search_width}",
             dtype.as_str(),
         );
 

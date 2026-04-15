@@ -17,15 +17,16 @@
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-//!     --metric ip \
+//!     --metric cos --quantization none,binary \
 //!     --output results/
 //! ```
 
 use std::time::Duration;
 
 use clap::Parser;
+use itertools::iproduct;
 use retrieval::docker::ContainerHandle;
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
 use serde_json::json;
 use weaviate_community::collections::objects::Object;
 use weaviate_community::collections::query::RawQuery;
@@ -34,19 +35,45 @@ use weaviate_community::WeaviateClient;
 
 const CLASS_NAME: &str = "Bench";
 
-// #region Local metric mapping
-
 fn parse_weaviate_distance(s: &str) -> Result<DistanceMetric, String> {
     match s {
         "ip" => Ok(DistanceMetric::DOT),
         "cos" => Ok(DistanceMetric::COSINE),
         "l2sq" | "l2" => Ok(DistanceMetric::L2SQUARED),
-        "hamming" => Ok(DistanceMetric::HAMMING),
-        _ => Err(format!("unknown Weaviate distance metric: {s}")),
+        _ => Err(format!(
+            "unknown Weaviate metric: {s} (supported: ip, cos, l2; Hamming needs bit-packed vectors \
+             which Weaviate doesn't natively store)"
+        )),
     }
 }
 
-// #region CLI
+/// Weaviate distance metric -> the string Weaviate's REST schema expects.
+/// Used when we bypass the typed client and hand-craft the JSON body for BQ.
+fn distance_as_json_str(m: DistanceMetric) -> &'static str {
+    match m {
+        DistanceMetric::DOT => "dot",
+        DistanceMetric::COSINE => "cosine",
+        DistanceMetric::L2SQUARED => "l2-squared",
+        DistanceMetric::HAMMING => "hamming",
+        DistanceMetric::MANHATTAN => "manhattan",
+    }
+}
+
+fn parse_weaviate_quantization(s: &str) -> Result<WeaviateQuant, String> {
+    match s {
+        "none" => Ok(WeaviateQuant::None),
+        "binary" => Ok(WeaviateQuant::Binary),
+        _ => Err(format!(
+            "unknown Weaviate quantization: {s} (supported: none, binary; sq/pq not in this pass)"
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WeaviateQuant {
+    None,
+    Binary,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "retri-eval-weaviate", about = "Benchmark Weaviate")]
@@ -54,8 +81,13 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    #[arg(long, default_value = "l2")]
-    metric: String,
+    /// Distance metric (comma-separated for sweep): ip, cos, l2
+    #[arg(long, value_delimiter = ',', default_value = "l2")]
+    metric: Vec<String>,
+
+    /// Server-side quantization (comma-separated for sweep): none, binary
+    #[arg(long, value_delimiter = ',', default_value = "none")]
+    quantization: Vec<String>,
 
     #[arg(long, default_value_t = 16)]
     connectivity: usize,
@@ -73,8 +105,6 @@ struct Cli {
     #[arg(long, default_value_t = 8080)]
     port: u16,
 }
-
-// #region Backend
 
 struct WeaviateBackend {
     client: WeaviateClient,
@@ -131,24 +161,38 @@ impl Backend for WeaviateBackend {
 
         self.runtime.block_on(async {
             for q in 0..num_vectors {
-                let query: Vec<f64> = data[q * dimensions..(q + 1) * dimensions].iter().map(|&x| x as f64).collect();
+                let query: Vec<f64> = data[q * dimensions..(q + 1) * dimensions]
+                    .iter()
+                    .map(|&x| x as f64)
+                    .collect();
                 let gql = format!(
-                    r#"{{ Get {{ {CLASS_NAME}(nearVector: {{ vector: {query:?} }} limit: {count}) {{ idx _additional {{ distance }} }} }} }}"#
+                    "{{ Get {{ {CLASS_NAME}(nearVector: {{ vector: {query:?} }} limit: {count}) \
+                     {{ idx _additional {{ distance }} }} }} }}"
                 );
-                let response = self.client.query.raw(RawQuery::new(&gql)).await
+                let response = self
+                    .client
+                    .query
+                    .raw(RawQuery::new(&gql))
+                    .await
                     .map_err(|e| format!("Weaviate query failed: {e}"))?;
 
                 let offset = q * count;
                 let mut found = 0;
-                if let Some(items) = response.pointer(&format!("/data/Get/{CLASS_NAME}"))
-                    .and_then(|v| v.as_array()) {
+                if let Some(items) = response
+                    .pointer(&format!("/data/Get/{CLASS_NAME}"))
+                    .and_then(|v| v.as_array())
+                {
                     for (j, item) in items.iter().enumerate().take(count) {
                         let idx = item.get("idx").and_then(|v| v.as_i64()).unwrap_or(-1);
-                        let distance_value = item.pointer("/_additional/distance")
-                            .and_then(|d| d.as_f64()).unwrap_or(f64::INFINITY) as f32;
+                        let distance_value = item
+                            .pointer("/_additional/distance")
+                            .and_then(|d| d.as_f64())
+                            .unwrap_or(f64::INFINITY) as f32;
                         out_keys[offset + j] = if idx >= 0 { idx as Key } else { Key::MAX };
                         out_distances[offset + j] = distance_value;
-                        if idx >= 0 { found += 1; }
+                        if idx >= 0 {
+                            found += 1;
+                        }
                     }
                 }
                 for j in found..count {
@@ -177,14 +221,85 @@ impl Drop for WeaviateBackend {
     }
 }
 
-// #region main
+/// Create the Weaviate class. When `quant == Binary` we bypass the typed
+/// `VectorIndexConfig::builder` path — the `weaviate-community` 0.2 crate has
+/// no `.with_bq(...)` method — and POST the schema directly via `reqwest`.
+/// When `quant == None` we use the existing typed builder so the rest of the
+/// crate's schema validation keeps running.
+async fn create_class(
+    client: &WeaviateClient,
+    http_base: &str,
+    metric: DistanceMetric,
+    quant: WeaviateQuant,
+    max_connections: u64,
+    ef_construction: u64,
+    ef: i64,
+) -> Result<(), String> {
+    let _ = client.schema.delete(CLASS_NAME).await;
+    match quant {
+        WeaviateQuant::None => {
+            let class = Class::builder(CLASS_NAME)
+                .with_description("Benchmark vectors")
+                .with_vectorizer("none")
+                .with_vector_index_type(VectorIndexType::HNSW)
+                .with_vector_index_config(
+                    VectorIndexConfig::builder()
+                        .with_distance(metric)
+                        .with_ef(ef)
+                        .with_ef_construction(ef_construction)
+                        .with_max_connections(max_connections)
+                        .build(),
+                )
+                .with_properties(Properties::new(vec![Property::builder("idx", vec!["int"]).build()]))
+                .build();
+            client
+                .schema
+                .create_class(&class)
+                .await
+                .map_err(|e| format!("create class failed: {e}"))?;
+        }
+        WeaviateQuant::Binary => {
+            let body = json!({
+                "class": CLASS_NAME,
+                "description": "Benchmark vectors",
+                "vectorizer": "none",
+                "vectorIndexType": "hnsw",
+                "vectorIndexConfig": {
+                    "distance": distance_as_json_str(metric),
+                    "ef": ef,
+                    "efConstruction": ef_construction,
+                    "maxConnections": max_connections,
+                    "bq": { "enabled": true }
+                },
+                "properties": [
+                    { "name": "idx", "dataType": ["int"] }
+                ]
+            });
+            let resp = reqwest::Client::new()
+                .post(format!("{http_base}/v1/schema"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("POST /v1/schema failed: {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("POST /v1/schema -> {status}: {text}"));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn main() {
     let cli = Cli::parse();
-    let distance_metric = parse_weaviate_distance(&cli.metric).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1);
-    });
+
+    for m in &cli.metric {
+        parse_weaviate_distance(m).unwrap_or_else(|e| bail(&e));
+    }
+    for q in &cli.quantization {
+        parse_weaviate_quantization(q).unwrap_or_else(|e| bail(&e));
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -215,26 +330,8 @@ fn main() {
         handle
     });
 
-    let client = WeaviateClient::new(&format!("http://localhost:{}", cli.port), None, None).expect("weaviate client");
-
-    runtime.block_on(async {
-        let _ = client.schema.delete(CLASS_NAME).await;
-        let class = Class::builder(CLASS_NAME)
-            .with_description("Benchmark vectors")
-            .with_vectorizer("none")
-            .with_vector_index_type(VectorIndexType::HNSW)
-            .with_vector_index_config(
-                VectorIndexConfig::builder()
-                    .with_distance(distance_metric)
-                    .with_ef(cli.expansion_search as i64)
-                    .with_ef_construction(cli.expansion_add as u64)
-                    .with_max_connections(cli.connectivity as u64)
-                    .build(),
-            )
-            .with_properties(Properties::new(vec![Property::builder("idx", vec!["int"]).build()]))
-            .build();
-        client.schema.create_class(&class).await.expect("create class");
-    });
+    let http_base = format!("http://localhost:{}", cli.port);
+    let client = WeaviateClient::new(&http_base, None, None).expect("weaviate client");
 
     let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {
         eprintln!("Failed to load benchmark state: {e}");
@@ -242,28 +339,53 @@ fn main() {
     });
     let dimensions = state.dimensions();
 
-    let mut backend = WeaviateBackend {
-        client,
-        container: Some(handle),
-        runtime: runtime.handle().clone(),
-        description: format!(
-            "weaviate · {} · M={} · ef={} · {dimensions}d",
-            cli.metric, cli.connectivity, cli.expansion_add,
-        ),
-        metadata: {
-            let mut metadata = std::collections::HashMap::new();
-            metadata.insert("backend".into(), json!("weaviate"));
-            metadata.insert("metric".into(), json!(&cli.metric));
-            metadata.insert("connectivity".into(), json!(cli.connectivity));
-            metadata.insert("expansion_add".into(), json!(cli.expansion_add));
-            metadata.insert("expansion_search".into(), json!(cli.expansion_search));
-            metadata
-        },
-    };
+    let mut container_slot = Some(handle);
+    let num_configs = cli.metric.len() * cli.quantization.len();
+    for (idx, (metric_str, quant_str)) in iproduct!(&cli.metric, &cli.quantization).enumerate() {
+        let is_last = idx + 1 == num_configs;
+        let metric = parse_weaviate_distance(metric_str).expect("validated above");
+        let quant = parse_weaviate_quantization(quant_str).expect("validated above");
 
-    run(&mut backend, &mut state).unwrap_or_else(|e| {
-        eprintln!("Benchmark failed: {e}");
-        std::process::exit(1);
-    });
+        runtime.block_on(async {
+            create_class(
+                &client,
+                &http_base,
+                metric,
+                quant,
+                cli.connectivity as u64,
+                cli.expansion_add as u64,
+                cli.expansion_search as i64,
+            )
+            .await
+            .expect("create class");
+        });
+
+        let container_for_this_run = if is_last { container_slot.take() } else { None };
+
+        let mut backend = WeaviateBackend {
+            client: WeaviateClient::new(&http_base, None, None).expect("weaviate client"),
+            container: container_for_this_run,
+            runtime: runtime.handle().clone(),
+            description: format!(
+                "weaviate · {metric_str} · quant={quant_str} · M={} · ef={}/{} · {dimensions}d",
+                cli.connectivity, cli.expansion_add, cli.expansion_search,
+            ),
+            metadata: {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("backend".into(), json!("weaviate"));
+                metadata.insert("metric".into(), json!(metric_str));
+                metadata.insert("quantization".into(), json!(quant_str));
+                metadata.insert("connectivity".into(), json!(cli.connectivity));
+                metadata.insert("expansion_add".into(), json!(cli.expansion_add));
+                metadata.insert("expansion_search".into(), json!(cli.expansion_search));
+                metadata
+            },
+        };
+
+        run(&mut backend, &mut state).unwrap_or_else(|e| {
+            eprintln!("Benchmark failed: {e}");
+            std::process::exit(1);
+        });
+    }
     eprintln!("Benchmark complete.");
 }

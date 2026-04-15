@@ -101,7 +101,11 @@ struct Cli {
     shards: Vec<usize>,
 
     /// Number of threads (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_values_t = vec![std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)])]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = vec![std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)]
+    )]
     threads: Vec<usize>,
 }
 

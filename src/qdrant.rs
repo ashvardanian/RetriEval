@@ -25,26 +25,62 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use clap::Parser;
+use itertools::iproduct;
 use qdrant_client::qdrant::{
-    point_id, CreateCollectionBuilder, Distance as QdrantDistance, HnswConfigDiffBuilder, PointStruct,
+    point_id, quantization_config::Quantization, BinaryQuantization, CreateCollectionBuilder, Datatype,
+    Distance as QdrantDistance, HnswConfigDiffBuilder, PointStruct, QuantizationType, ScalarQuantization,
     SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use retrieval::docker::ContainerHandle;
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
 use serde_json::json;
 
 const COLLECTION: &str = "bench";
-
-// #region Local metric mapping
 
 fn parse_qdrant_distance(s: &str) -> Result<QdrantDistance, String> {
     match s {
         "ip" => Ok(QdrantDistance::Dot),
         "cos" => Ok(QdrantDistance::Cosine),
         "l2sq" | "l2" => Ok(QdrantDistance::Euclid),
-        "hamming" => Ok(QdrantDistance::Manhattan),
-        _ => Err(format!("unknown Qdrant distance metric: {s}")),
+        "manhattan" => Ok(QdrantDistance::Manhattan),
+        _ => Err(format!(
+            "unknown Qdrant distance metric: {s} (supported: ip, cos, l2, manhattan)"
+        )),
+    }
+}
+
+/// Qdrant named-vector storage datatype. Server auto-converts from the f32
+/// upserts the client sends — no wire-format change needed on our side.
+fn parse_qdrant_datatype(s: &str) -> Result<Datatype, String> {
+    match s {
+        "f32" => Ok(Datatype::Float32),
+        "f16" => Ok(Datatype::Float16),
+        "u8" => Ok(Datatype::Uint8),
+        _ => Err(format!("unknown Qdrant dtype: {s} (supported: f32, f16, u8)")),
+    }
+}
+
+/// Server-side quantization — `binary` is deterministic `sign(x)` per dim;
+/// `scalar` is one-pass per-dim min/max mapping to int8. Both stay inside the
+/// "no learned codebook" constraint. `product` (k-means) is deliberately not
+/// offered here.
+fn parse_qdrant_quantization(s: &str) -> Result<Option<Quantization>, String> {
+    match s {
+        "none" => Ok(None),
+        "binary" => Ok(Some(Quantization::Binary(BinaryQuantization {
+            always_ram: Some(true),
+            encoding: None,
+            query_encoding: None,
+        }))),
+        "scalar" => Ok(Some(Quantization::Scalar(ScalarQuantization {
+            r#type: QuantizationType::Int8 as i32,
+            quantile: Some(0.99),
+            always_ram: Some(true),
+        }))),
+        _ => Err(format!(
+            "unknown Qdrant quantization: {s} (supported: none, binary, scalar)"
+        )),
     }
 }
 
@@ -56,13 +92,22 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    #[arg(long, default_value = "l2")]
-    metric: String,
+    /// Distance metric (comma-separated for sweep): ip, cos, l2, manhattan
+    #[arg(long, value_delimiter = ',', default_value = "l2")]
+    metric: Vec<String>,
 
-    #[arg(long, default_value_t = 16)]
+    /// Storage dtype (comma-separated for sweep): f32, f16, u8
+    #[arg(long, value_delimiter = ',', default_value = "f32")]
+    dtype: Vec<String>,
+
+    /// Quantization (comma-separated for sweep): none, binary, scalar
+    #[arg(long, value_delimiter = ',', default_value = "none")]
+    quantization: Vec<String>,
+
+    #[arg(long, value_delimiter = ',', default_value_t = 16)]
     connectivity: usize,
 
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, value_delimiter = ',', default_value_t = 128)]
     expansion_add: usize,
 
     /// Docker timeout in seconds
@@ -193,10 +238,19 @@ impl Drop for QdrantBackend {
 
 fn main() {
     let cli = Cli::parse();
-    let distance_metric = parse_qdrant_distance(&cli.metric).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1);
-    });
+
+    // Validate sweep axes up front so we fail fast on bad CLI input.
+    let sweeps: Vec<(String, Datatype, Option<Quantization>, QdrantDistance)> =
+        iproduct!(&cli.metric, &cli.dtype, &cli.quantization)
+            .map(|(metric, dtype, quant)| {
+                let m = parse_qdrant_distance(metric).unwrap_or_else(|e| bail(&e));
+                let d = parse_qdrant_datatype(dtype).unwrap_or_else(|e| bail(&e));
+                let q = parse_qdrant_quantization(quant).unwrap_or_else(|e| bail(&e));
+                (quant.clone(), d, q, m)
+            })
+            .enumerate()
+            .map(|(_, v)| v)
+            .collect();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -231,44 +285,64 @@ fn main() {
     });
     let dimensions = state.dimensions();
 
-    runtime.block_on(async {
-        let _ = client.delete_collection(COLLECTION).await;
-        client
-            .create_collection(
-                CreateCollectionBuilder::new(COLLECTION)
-                    .vectors_config(VectorParamsBuilder::new(dimensions as u64, distance_metric))
-                    .hnsw_config(
-                        HnswConfigDiffBuilder::default()
-                            .m(cli.connectivity as u64)
-                            .ef_construct(cli.expansion_add as u64),
-                    ),
-            )
-            .await
-            .expect("create collection");
-    });
+    let mut container_slot = Some(handle);
+    let num_configs = cli.metric.len() * cli.dtype.len() * cli.quantization.len();
+    for (idx, ((metric_str, dtype_str, quant_str), (_raw_q, dtype_enum, quant_opt, metric_enum))) in
+        iproduct!(&cli.metric, &cli.dtype, &cli.quantization)
+            .zip(sweeps.into_iter())
+            .enumerate()
+    {
+        let is_last = idx + 1 == num_configs;
 
-    let mut backend = QdrantBackend {
-        client,
-        container: Some(handle),
-        runtime: runtime.handle().clone(),
-        batch_size: cli.batch_size,
-        description: format!(
-            "qdrant · {} · M={} · ef={} · {dimensions}d",
-            cli.metric, cli.connectivity, cli.expansion_add,
-        ),
-        metadata: {
-            let mut metadata = std::collections::HashMap::new();
-            metadata.insert("backend".into(), json!("qdrant"));
-            metadata.insert("metric".into(), json!(&cli.metric));
-            metadata.insert("connectivity".into(), json!(cli.connectivity));
-            metadata.insert("expansion_add".into(), json!(cli.expansion_add));
-            metadata
-        },
-    };
+        runtime.block_on(async {
+            let _ = client.delete_collection(COLLECTION).await;
+            let mut vector_params = VectorParamsBuilder::new(dimensions as u64, metric_enum);
+            vector_params = vector_params.datatype(dtype_enum);
+            let mut create = CreateCollectionBuilder::new(COLLECTION)
+                .vectors_config(vector_params)
+                .hnsw_config(
+                    HnswConfigDiffBuilder::default()
+                        .m(cli.connectivity as u64)
+                        .ef_construct(cli.expansion_add as u64),
+                );
+            if let Some(q) = quant_opt {
+                create = create.quantization_config(q);
+            }
+            client.create_collection(create).await.expect("create collection");
+        });
 
-    run(&mut backend, &mut state).unwrap_or_else(|e| {
-        eprintln!("Benchmark failed: {e}");
-        std::process::exit(1);
-    });
+        // The container handle is held by the backend so it tears down on
+        // Drop — for the final config, we give it the real handle; earlier
+        // configs stay running (we reuse the same container across sweeps).
+        let container_for_this_run = if is_last { container_slot.take() } else { None };
+
+        let description = format!(
+            "qdrant · {metric_str} · dtype={dtype_str} · quant={quant_str} · M={} · ef={} · {dimensions}d",
+            cli.connectivity, cli.expansion_add
+        );
+
+        let mut backend = QdrantBackend {
+            client: client.clone(),
+            container: container_for_this_run,
+            runtime: runtime.handle().clone(),
+            batch_size: cli.batch_size,
+            description,
+            metadata: {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("backend".into(), json!("qdrant"));
+                metadata.insert("metric".into(), json!(metric_str));
+                metadata.insert("dtype".into(), json!(dtype_str));
+                metadata.insert("quantization".into(), json!(quant_str));
+                metadata.insert("connectivity".into(), json!(cli.connectivity));
+                metadata.insert("expansion_add".into(), json!(cli.expansion_add));
+                metadata
+            },
+        };
+
+        run(&mut backend, &mut state).unwrap_or_else(|e| {
+            eprintln!("Benchmark failed: {e}");
+            std::process::exit(1);
+        });
+    }
     eprintln!("Benchmark complete.");
 }

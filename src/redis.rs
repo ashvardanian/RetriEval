@@ -25,22 +25,169 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use clap::Parser;
+use itertools::iproduct;
 use retrieval::docker::ContainerHandle;
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{bail, pod_slice_as_bytes, run, Backend, BenchState, CommonArgs, Distance, Key, VectorSlice, Vectors};
 use serde_json::json;
 
 const INDEX_NAME: &str = "bench_idx";
 const PREFIX: &str = "vec:";
-
-// #region Local metric mapping
 
 fn parse_redis_metric(s: &str) -> Result<&'static str, String> {
     match s {
         "ip" => Ok("IP"),
         "cos" => Ok("COSINE"),
         "l2sq" | "l2" => Ok("L2"),
-        _ => Err(format!("unknown Redis distance metric: {s}")),
+        _ => Err(format!(
+            "unknown Redis metric: {s} (supported: ip, cos, l2; engine does not expose Hamming / \
+             Jaccard on vector indexes)"
+        )),
     }
+}
+
+/// RediSearch `FT.CREATE VECTOR ... TYPE <name>` strings.
+/// Redis 8+ adds the half-float and narrow-int dtypes; older redis-stack
+/// images only accept the four float formats. Bytes-per-element is fixed by
+/// the type and used to size the RESP payload.
+#[derive(Clone, Copy)]
+struct RedisDtype {
+    token: &'static str,
+    bytes_per_element: usize,
+}
+
+fn parse_redis_dtype(s: &str) -> Result<RedisDtype, String> {
+    match s {
+        "f32" => Ok(RedisDtype {
+            token: "FLOAT32",
+            bytes_per_element: 4,
+        }),
+        "f64" => Ok(RedisDtype {
+            token: "FLOAT64",
+            bytes_per_element: 8,
+        }),
+        "f16" => Ok(RedisDtype {
+            token: "FLOAT16",
+            bytes_per_element: 2,
+        }),
+        "bf16" => Ok(RedisDtype {
+            token: "BFLOAT16",
+            bytes_per_element: 2,
+        }),
+        "u8" => Ok(RedisDtype {
+            token: "UINT8",
+            bytes_per_element: 1,
+        }),
+        "i8" => Ok(RedisDtype {
+            token: "INT8",
+            bytes_per_element: 1,
+        }),
+        _ => Err(format!(
+            "unknown Redis dtype: {s} (supported on Redis 8+: f32, f64, f16, bf16, u8, i8)"
+        )),
+    }
+}
+
+/// Pipeline-batch of rows pre-encoded for the wire. Either borrows the source slice directly (source
+/// element type matches target wire type) or owns a single `Vec<Target>` produced by one
+/// `numkong::cast` from the source to the target type. Row bytes are served by indexing into the
+/// stored buffer — `Cmd::write_arg` already memcpys into its own data buffer, so we hand it a
+/// borrowed `&[u8]` and skip the per-row `Vec<u8>` the earlier design allocated.
+enum EncodedBatch<'src> {
+    Identity(&'src [u8]),
+    CastF32(Vec<f32>),
+    CastF64(Vec<f64>),
+    CastF16(Vec<numkong::f16>),
+    CastBF16(Vec<numkong::bf16>),
+    CastU8(Vec<u8>),
+    CastI8(Vec<i8>),
+}
+
+impl EncodedBatch<'_> {
+    fn row_bytes(&self, row_within_batch: usize, bytes_per_row: usize) -> &[u8] {
+        // SAFETY: every variant is a dense slice of POD elements; the stored length covers full rows.
+        let all_bytes: &[u8] = match self {
+            Self::Identity(bytes) => bytes,
+            Self::CastF32(values) => unsafe { pod_slice_as_bytes(values) },
+            Self::CastF64(values) => unsafe { pod_slice_as_bytes(values) },
+            Self::CastF16(values) => unsafe { pod_slice_as_bytes(values) },
+            Self::CastBF16(values) => unsafe { pod_slice_as_bytes(values) },
+            Self::CastU8(values) => values,
+            Self::CastI8(values) => unsafe { pod_slice_as_bytes(values) },
+        };
+        let start = row_within_batch * bytes_per_row;
+        &all_bytes[start..start + bytes_per_row]
+    }
+}
+
+/// Encode one pipeline's worth of rows for the wire in a single pass.
+///
+/// Fast paths: if the source element type already matches the target `TYPE` token, borrow the
+/// source bytes directly — zero allocation, zero cast work. Otherwise allocate one `Vec<Target>`
+/// for the whole batch and hand it to `numkong::cast` once; every row is then a borrow into the
+/// owned buffer. Replaces the earlier per-row shape that allocated `2 × num_rows` vectors per
+/// pipeline and round-tripped through `f32` even when source and target matched.
+fn encode_batch<'src>(
+    dtype: RedisDtype,
+    source: &'src VectorSlice<'_>,
+    start_row: usize,
+    num_rows: usize,
+    dimensions: usize,
+) -> EncodedBatch<'src> {
+    let elements = num_rows * dimensions;
+    let start = start_row * dimensions;
+    let end = start + elements;
+
+    // Zero-copy identity paths: the source slice is already in the wire format Redis wants.
+    // SAFETY: element types are POD, dense-packed row-major.
+    match (source, dtype.token) {
+        (VectorSlice::F32(data), "FLOAT32") => {
+            return EncodedBatch::Identity(unsafe { pod_slice_as_bytes(&data[start..end]) })
+        }
+        (VectorSlice::I8(data), "INT8") => {
+            return EncodedBatch::Identity(unsafe { pod_slice_as_bytes(&data[start..end]) })
+        }
+        (VectorSlice::U8(data), "UINT8") => return EncodedBatch::Identity(&data[start..end]),
+        (VectorSlice::B1x8(_), _) => unreachable!("parse_redis_metric rejects bit-packed inputs"),
+        _ => {}
+    }
+
+    // Cast path: one `numkong::cast` from source element type straight to target type. No f32 hop
+    // even when source ≠ f32 (i.e. `.u8bin` + `--dtype f16` goes u8 → f16 directly).
+    match dtype.token {
+        "FLOAT32" => EncodedBatch::CastF32(cast_batch(source, start, end, elements)),
+        "FLOAT64" => EncodedBatch::CastF64(cast_batch(source, start, end, elements)),
+        "FLOAT16" => EncodedBatch::CastF16(cast_batch(source, start, end, elements)),
+        "BFLOAT16" => EncodedBatch::CastBF16(cast_batch(source, start, end, elements)),
+        "UINT8" => EncodedBatch::CastU8(cast_batch(source, start, end, elements)),
+        "INT8" => EncodedBatch::CastI8(cast_batch(source, start, end, elements)),
+        token => unreachable!("unknown Redis dtype token {token}"),
+    }
+}
+
+/// Allocate an uninitialized `Vec<Target>` of exactly `elements` slots, dispatch on the source
+/// variant, and let `numkong::cast` fill it in one SIMD batch. Skips the `vec![T::default(); n]`
+/// zero-fill because `nk_cast` writes every element before we read it back.
+fn cast_batch<Target>(source: &VectorSlice<'_>, start: usize, end: usize, elements: usize) -> Vec<Target>
+where
+    Target: numkong::CastDtype + Copy,
+{
+    let mut target: Vec<Target> = Vec::with_capacity(elements);
+    // SAFETY: `target.as_mut_ptr()` points to `elements` valid-for-write slots (reserved by
+    //         `with_capacity`). `numkong::cast` writes every slot via a C-side memcpy/SIMD store;
+    //         we only reveal those slots through `set_len` after the cast returns. Target types
+    //         are all POD so any bit pattern produced by the cast is a valid value.
+    unsafe {
+        let slot = std::slice::from_raw_parts_mut(target.as_mut_ptr(), elements);
+        let cast_outcome = match source {
+            VectorSlice::F32(data) => numkong::cast(&data[start..end], slot),
+            VectorSlice::I8(data) => numkong::cast(&data[start..end], slot),
+            VectorSlice::U8(data) => numkong::cast(&data[start..end], slot),
+            VectorSlice::B1x8(_) => unreachable!(),
+        };
+        cast_outcome.expect("numkong::cast: source and target slice lengths must match (checked above)");
+        target.set_len(elements);
+    }
+    target
 }
 
 // #region CLI
@@ -51,8 +198,14 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    #[arg(long, default_value = "l2")]
-    metric: String,
+    /// Distance metric (comma-separated for sweep): ip, cos, l2
+    #[arg(long, value_delimiter = ',', default_value = "l2")]
+    metric: Vec<String>,
+
+    /// FT.CREATE VECTOR TYPE (comma-separated for sweep): f32, f64, f16, bf16, u8, i8
+    /// (requires Redis 8+ for anything other than f32/f64/f16/bf16)
+    #[arg(long, value_delimiter = ',', default_value = "f32")]
+    dtype: Vec<String>,
 
     #[arg(long, default_value_t = 16)]
     connectivity: usize,
@@ -79,6 +232,7 @@ struct RedisBackend {
     container: Option<ContainerHandle>,
     runtime: tokio::runtime::Handle,
     batch_size: usize,
+    dtype: RedisDtype,
     description: String,
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -95,21 +249,23 @@ impl Backend for RedisBackend {
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let data = vectors.data.to_f32();
         let dimensions = vectors.dimensions;
-        let num_vectors = data.len() / dimensions;
-
-        let mut vec_bytes = vec![0u8; dimensions * 4];
+        let num_vectors = vectors.len();
+        let bytes_per_row = dimensions * self.dtype.bytes_per_element;
 
         for batch_start in (0..num_vectors).step_by(self.batch_size) {
             let batch_end = (batch_start + self.batch_size).min(num_vectors);
+            let batch_rows = batch_end - batch_start;
+            let encoded = encode_batch(self.dtype, &vectors.data, batch_start, batch_rows, dimensions);
+
             let mut pipe = redis::pipe();
-            for i in batch_start..batch_end {
-                for (j, f) in data[i * dimensions..(i + 1) * dimensions].iter().enumerate() {
-                    vec_bytes[j * 4..(j + 1) * 4].copy_from_slice(&f.to_le_bytes());
-                }
-                let key = format!("{PREFIX}{}", keys[i]);
-                pipe.cmd("HSET").arg(&key).arg("vector").arg(&vec_bytes[..]);
+            for row_within_batch in 0..batch_rows {
+                let global_index = batch_start + row_within_batch;
+                let key = format!("{PREFIX}{}", keys[global_index]);
+                pipe.cmd("HSET")
+                    .arg(&key)
+                    .arg("vector")
+                    .arg(encoded.row_bytes(row_within_batch, bytes_per_row));
             }
             let _: () = pipe
                 .query(&mut *self.connection.borrow_mut())
@@ -126,16 +282,17 @@ impl Backend for RedisBackend {
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String> {
-        let data = queries.data.to_f32();
         let dimensions = queries.dimensions;
-        let num_vectors = data.len() / dimensions;
+        let num_vectors = queries.len();
+        let bytes_per_row = dimensions * self.dtype.bytes_per_element;
         let query_str = format!("*=>[KNN {count} @vector $BLOB]");
-        let mut query_bytes = vec![0u8; dimensions * 4];
+
+        // FT.SEARCH is one request per query (no pipelining for vector search), so encode the whole
+        // query batch once and index into it per iteration — single allocation for num_vectors rows.
+        let encoded = encode_batch(self.dtype, &queries.data, 0, num_vectors, dimensions);
 
         for q in 0..num_vectors {
-            for (i, f) in data[q * dimensions..(q + 1) * dimensions].iter().enumerate() {
-                query_bytes[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
-            }
+            let query_bytes = encoded.row_bytes(q, bytes_per_row);
 
             let raw: redis::Value = redis::cmd("FT.SEARCH")
                 .arg(INDEX_NAME)
@@ -143,7 +300,7 @@ impl Backend for RedisBackend {
                 .arg("PARAMS")
                 .arg("2")
                 .arg("BLOB")
-                .arg(&query_bytes[..])
+                .arg(query_bytes)
                 .arg("DIALECT")
                 .arg("2")
                 .arg("SORTBY")
@@ -232,10 +389,13 @@ fn parse_ft_search(value: &redis::Value) -> Vec<(Key, Distance)> {
 
 fn main() {
     let cli = Cli::parse();
-    let distance_metric = parse_redis_metric(&cli.metric).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1);
-    });
+
+    for m in &cli.metric {
+        parse_redis_metric(m).unwrap_or_else(|e| bail(&e));
+    }
+    for d in &cli.dtype {
+        parse_redis_dtype(d).unwrap_or_else(|e| bail(&e));
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -245,8 +405,8 @@ fn main() {
 
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start("redis:8.6", "retrieval-redis", &vec![(cli.port, 6379)], &[], timeout)
-        .await
-        .expect("docker start");
+            .await
+            .expect("docker start");
         handle
             .wait_for_tcp("localhost", cli.port, timeout)
             .await
@@ -262,56 +422,69 @@ fn main() {
 
     let redis_url = format!("redis://localhost:{}/", cli.port);
     let client = redis::Client::open(redis_url.as_str()).expect("redis client");
-    let mut conn = client.get_connection().expect("redis connection");
 
-    let _: () = redis::cmd("FLUSHALL").query(&mut conn).expect("FLUSHALL");
-    let _: () = redis::cmd("FT.CREATE")
-        .arg(INDEX_NAME)
-        .arg("ON")
-        .arg("HASH")
-        .arg("PREFIX")
-        .arg("1")
-        .arg(PREFIX)
-        .arg("SCHEMA")
-        .arg("vector")
-        .arg("VECTOR")
-        .arg("HNSW")
-        .arg("10")
-        .arg("TYPE")
-        .arg("FLOAT32")
-        .arg("DIM")
-        .arg(dimensions)
-        .arg("DISTANCE_METRIC")
-        .arg(distance_metric)
-        .arg("M")
-        .arg(cli.connectivity)
-        .arg("EF_CONSTRUCTION")
-        .arg(cli.expansion_add)
-        .query(&mut conn)
-        .expect("FT.CREATE");
+    let mut container_slot = Some(handle);
+    let num_configs = cli.metric.len() * cli.dtype.len();
+    for (idx, (metric_str, dtype_str)) in iproduct!(&cli.metric, &cli.dtype).enumerate() {
+        let is_last = idx + 1 == num_configs;
+        let metric = parse_redis_metric(metric_str).expect("metric validated above");
+        let dtype = parse_redis_dtype(dtype_str).expect("dtype validated above");
 
-    let mut backend = RedisBackend {
-        connection: RefCell::new(conn),
-        container: Some(handle),
-        runtime: runtime.handle().clone(),
-        batch_size: cli.batch_size,
-        description: format!(
-            "redis · {} · M={} · ef={} · {dimensions}d",
-            cli.metric, cli.connectivity, cli.expansion_add,
-        ),
-        metadata: {
-            let mut metadata = std::collections::HashMap::new();
-            metadata.insert("backend".into(), json!("redis"));
-            metadata.insert("metric".into(), json!(&cli.metric));
-            metadata.insert("connectivity".into(), json!(cli.connectivity));
-            metadata.insert("expansion_add".into(), json!(cli.expansion_add));
-            metadata
-        },
-    };
+        let mut conn = client.get_connection().expect("redis connection");
+        let _: () = redis::cmd("FLUSHALL").query(&mut conn).expect("FLUSHALL");
+        let _: () = redis::cmd("FT.CREATE")
+            .arg(INDEX_NAME)
+            .arg("ON")
+            .arg("HASH")
+            .arg("PREFIX")
+            .arg("1")
+            .arg(PREFIX)
+            .arg("SCHEMA")
+            .arg("vector")
+            .arg("VECTOR")
+            .arg("HNSW")
+            .arg("10")
+            .arg("TYPE")
+            .arg(dtype.token)
+            .arg("DIM")
+            .arg(dimensions)
+            .arg("DISTANCE_METRIC")
+            .arg(metric)
+            .arg("M")
+            .arg(cli.connectivity)
+            .arg("EF_CONSTRUCTION")
+            .arg(cli.expansion_add)
+            .query(&mut conn)
+            .expect("FT.CREATE");
 
-    run(&mut backend, &mut state).unwrap_or_else(|e| {
-        eprintln!("Benchmark failed: {e}");
-        std::process::exit(1);
-    });
+        let container_for_this_run = if is_last { container_slot.take() } else { None };
+
+        let mut backend = RedisBackend {
+            connection: RefCell::new(conn),
+            container: container_for_this_run,
+            runtime: runtime.handle().clone(),
+            batch_size: cli.batch_size,
+            dtype,
+            description: format!(
+                "redis · {metric_str} · dtype={dtype_str} · M={} · ef={} · {dimensions}d",
+                cli.connectivity, cli.expansion_add,
+            ),
+            metadata: {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("backend".into(), json!("redis"));
+                metadata.insert("metric".into(), json!(metric_str));
+                metadata.insert("dtype".into(), json!(dtype_str));
+                metadata.insert("bytes_per_element".into(), json!(dtype.bytes_per_element));
+                metadata.insert("connectivity".into(), json!(cli.connectivity));
+                metadata.insert("expansion_add".into(), json!(cli.expansion_add));
+                metadata
+            },
+        };
+
+        run(&mut backend, &mut state).unwrap_or_else(|e| {
+            eprintln!("Benchmark failed: {e}");
+            std::process::exit(1);
+        });
+    }
     eprintln!("Benchmark complete.");
 }

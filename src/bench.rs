@@ -22,9 +22,9 @@ pub mod output;
 pub mod packed_distance;
 pub mod perf_counters;
 
-pub use error::{BackendError, DatasetError, GroundTruthError, PerfCountersError};
 #[cfg(feature = "download")]
 pub use error::DownloadError;
+pub use error::{BackendError, DatasetError, GroundTruthError, PerfCountersError};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -184,6 +184,11 @@ pub struct CommonArgs {
     /// Output directory for JSON result files
     #[arg(long)]
     pub output: Option<PathBuf>,
+
+    /// Cap the number of base vectors used (for calibration on a slice of a larger file).
+    /// Queries and ground truth are unaffected; only the add/permutation range shrinks.
+    #[arg(long)]
+    pub max_base_vectors: Option<usize>,
 }
 
 // #region BenchState
@@ -191,6 +196,8 @@ pub struct CommonArgs {
 /// Pre-loaded benchmark state. Call `BenchState::load()` once, then `run()` per configuration.
 pub struct BenchState {
     pub dataset: Dataset,
+    /// Effective base-vector count; equals `dataset.rows()` unless `--max-base-vectors` capped it.
+    pub total_vectors: usize,
     pub keys: Keys,
     pub query_dataset: Dataset,
     pub ground_truth: GroundTruth,
@@ -234,13 +241,25 @@ impl BenchState {
 
         eprintln!("Loading dataset: {}", args.vectors.display());
         let dataset = Dataset::load(&args.vectors)?;
-        let total_vectors = dataset.rows();
+        let file_vectors = dataset.rows();
+        let total_vectors = match args.max_base_vectors {
+            Some(cap) => cap.min(file_vectors),
+            None => file_vectors,
+        };
         let dimensions = dataset.dimensions();
-        eprintln!(
-            "  {} vectors, {} dimensions",
-            format_thousands(total_vectors as u64),
-            dimensions
-        );
+        if total_vectors < file_vectors {
+            eprintln!(
+                "  {} vectors in file, capping to {} (--max-base-vectors)",
+                format_thousands(file_vectors as u64),
+                format_thousands(total_vectors as u64),
+            );
+        } else {
+            eprintln!(
+                "  {} vectors, {} dimensions",
+                format_thousands(total_vectors as u64),
+                dimensions
+            );
+        }
 
         let keys = match &args.keys {
             Some(path) => {
@@ -290,6 +309,7 @@ impl BenchState {
         };
 
         Ok(Self {
+            total_vectors,
             perm,
             epochs: args.epochs,
             batch_size_add: add_chunk_size,
@@ -564,7 +584,7 @@ fn save_report(state: &BenchState, metadata: HashMap<String, Value>, steps: Vec<
 
 /// Run one benchmark configuration. Accumulates steps, writes JSON report at the end.
 pub fn run(index: &mut dyn Backend, state: &mut BenchState) -> BenchResult<()> {
-    let total_vectors = state.dataset.rows();
+    let total_vectors = state.total_vectors;
     let num_queries = state.query_dataset.rows();
     let search_count = state.ground_truth.neighbors_per_query();
     let add_chunk_size = state.key_scratch.len();
@@ -730,4 +750,12 @@ impl SweepSummary {
             self.ran, self.skipped, self.failed
         );
     }
+}
+
+/// Print a CLI validation error and exit with status 1. Backend binaries call this from their `main()`
+/// when `--metric`/`--dtype`/etc. parsing fails — at that point we haven't started the sweep yet, so an
+/// early exit is the right shape (vs. a per-config skip).
+pub fn bail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
 }

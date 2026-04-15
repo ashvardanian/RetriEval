@@ -77,7 +77,10 @@ itertools = { version = "0.14", optional = true }
 # or plain `faiss-backend` to link against a pre-installed libfaiss_c.
 faiss = { version = "0.13", optional = true }
 
-# Tier 2 shared (Docker + async)
+# Tier 2 shared (Docker + async). `numkong` is unconditionally enabled
+# (not gated behind a feature) so `src/redis.rs` can route source → wire
+# dtype conversions through `numkong::cast` for `FT.CREATE VECTOR TYPE`
+# payloads (f16 / bf16 / u8 / i8) without a feature-flag scavenger hunt.
 bollard = { version = "0.20", optional = true }
 futures-util = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
@@ -100,7 +103,7 @@ weaviate-community = { version = "0.2", optional = true }
 # cuVS
 cuvs = { version = "26.4", optional = true }
 cuvs-sys = { version = "26.4", optional = true }
-numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", features = ["parallel"], optional = true }
+numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", features = ["parallel"] }
 
 # Dataset download binaries (Parquet readers for USearchMolecules / Cohere Wikipedia)
 parquet = { version = "57", default-features = false, features = ["arrow", "snap", "lz4", "zstd", "brotli"], optional = true }
@@ -118,12 +121,12 @@ default = ["usearch-backend"]
 usearch-backend = ["usearch", "itertools"]
 faiss-backend = ["faiss"]
 faiss-static = ["faiss-backend", "faiss/static"]
-tier2 = ["bollard", "futures-util", "tokio", "reqwest"]
+tier2 = ["bollard", "futures-util", "tokio", "reqwest", "reqwest/json"]
 qdrant-backend = ["tier2", "qdrant-client"]
 redis-backend = ["tier2", "redis"]
 lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
 weaviate-backend = ["tier2", "weaviate-community"]
-cuvs-backend = ["cuvs", "cuvs-sys", "itertools", "numkong"]
-generate = ["numkong"]
-download = ["numkong", "parquet", "arrow-array", "arrow-schema", "reqwest", "reqwest/json", "reqwest/rustls-tls", "tokio", "futures", "bytes"]
+cuvs-backend = ["cuvs", "cuvs-sys", "itertools"]
+generate = []
+download = ["parquet", "arrow-array", "arrow-schema", "reqwest", "reqwest/json", "reqwest/rustls-tls", "tokio", "futures", "bytes"]
 perf-counters = ["dep:perf-event2"]
