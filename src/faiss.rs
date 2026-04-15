@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use clap::Parser;
 use faiss::Index as _;
 use itertools::iproduct;
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{try_run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, Vectors};
 use serde_json::{json, Value};
 
 extern "C" {
@@ -59,6 +59,76 @@ extern "C" {
         params: *const std::ffi::c_char,
     ) -> i32;
     fn faiss_ParameterSpace_free(space: *mut std::ffi::c_void);
+    fn faiss_get_last_error() -> *const std::ffi::c_char;
+}
+
+/// Compile-time defaults in `faiss/IndexBinaryHNSW.h` — the only ef values reachable from the C API for binary HNSW.
+const BINARY_HNSW_DEFAULT_EF_CONSTRUCTION: usize = 40;
+const BINARY_HNSW_DEFAULT_EF_SEARCH: usize = 16;
+
+/// FAISS C-API convention: `0` means success, anything else means the thread-local error is populated.
+#[inline]
+fn faiss_call_succeeded(return_code: i32) -> bool {
+    return_code == 0
+}
+
+/// Read the thread-local last-error message populated by `FAISS_TRY` in `faiss/c_api/macros_impl.h`.
+fn faiss_last_error() -> Option<String> {
+    // SAFETY: pointer is either null or into FAISS's thread-local buffer — we copy into an owned String.
+    unsafe {
+        let error_ptr = faiss_get_last_error();
+        if error_ptr.is_null() {
+            return None;
+        }
+        let message = std::ffi::CStr::from_ptr(error_ptr).to_string_lossy().into_owned();
+        (!message.is_empty()).then_some(message)
+    }
+}
+
+/// RAII wrapper over `faiss::ParameterSpace` — free on drop, no manual cleanup at every exit path.
+struct FaissParameterSpace {
+    handle: *mut std::ffi::c_void,
+}
+
+impl FaissParameterSpace {
+    fn new() -> Result<Self, String> {
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `&mut handle` is a valid out-pointer for FAISS to write into.
+        let return_code = unsafe { faiss_ParameterSpace_new(&mut handle) };
+        if !faiss_call_succeeded(return_code) || handle.is_null() {
+            return Err(
+                faiss_last_error().unwrap_or_else(|| "faiss_ParameterSpace_new: null handle, no FAISS error".into())
+            );
+        }
+        Ok(Self { handle })
+    }
+
+    /// Apply e.g. `"efConstruction=128 efSearch=64"` to `index`. Non-zero rc means unknown parameter or no
+    /// dispatcher for the index type; the captured last-error distinguishes.
+    fn set_index_parameters(&mut self, index: *mut std::ffi::c_void, parameters: &str) -> Result<(), String> {
+        let parameters_cstring =
+            std::ffi::CString::new(parameters).map_err(|e| format!("parameter string contained interior NUL: {e}"))?;
+        // SAFETY: `self.handle` non-null (enforced by `new`); `index` and `parameters_cstring` live through the call.
+        let return_code =
+            unsafe { faiss_ParameterSpace_set_index_parameters(self.handle, index, parameters_cstring.as_ptr()) };
+        if faiss_call_succeeded(return_code) {
+            Ok(())
+        } else {
+            Err(faiss_last_error().unwrap_or_else(|| {
+                format!("faiss_ParameterSpace_set_index_parameters: rc={return_code}, no FAISS error")
+            }))
+        }
+    }
+}
+
+impl Drop for FaissParameterSpace {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: `handle` came from `faiss_ParameterSpace_new` and was never freed while we held it.
+            unsafe { faiss_ParameterSpace_free(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -75,17 +145,17 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_value = "l2")]
     metric: Vec<String>,
 
-    /// HNSW connectivity parameter (M)
-    #[arg(long, default_value_t = 32)]
-    connectivity: usize,
+    /// HNSW connectivity parameter (M), comma-separated for sweep
+    #[arg(long, value_delimiter = ',', default_value = "32")]
+    connectivity: Vec<usize>,
 
-    /// HNSW expansion factor during indexing
-    #[arg(long, default_value_t = 128)]
-    expansion_add: usize,
+    /// HNSW expansion factor during indexing, comma-separated for sweep
+    #[arg(long, value_delimiter = ',', default_value = "128")]
+    expansion_add: Vec<usize>,
 
-    /// HNSW expansion factor during search
-    #[arg(long, default_value_t = 64)]
-    expansion_search: usize,
+    /// HNSW expansion factor during search, comma-separated for sweep
+    #[arg(long, value_delimiter = ',', default_value = "64")]
+    expansion_search: Vec<usize>,
 
     /// Number of threads (sets OMP_NUM_THREADS)
     #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
@@ -196,23 +266,47 @@ impl FaissBackend {
             (label, FaissIndex::Float(UnsafeCell::new(index)))
         };
 
-        // Set HNSW expansion factors via FAISS ParameterSpace API
-        let inner_ptr = match &index {
-            FaissIndex::Float(i) => unsafe { (*i.get()).inner_ptr() as *mut std::ffi::c_void },
-            FaissIndex::Binary(i) => unsafe { (*i.get()).inner_ptr() as *mut std::ffi::c_void },
+        // FAISS `ParameterSpace` is the only C-API entry point that can tune HNSW at runtime — upstream ships
+        // no `IndexHNSW_c.h` / `IndexBinaryHNSW_c.h`, and `ParameterSpace::set_index_parameter` in
+        // `faiss/AutoTune.cpp` dispatches on `dynamic_cast<IndexHNSW*>` with no binary branch. On binary
+        // indices the dispatch misses and the struct keeps its compile-time defaults.
+        let inner_index_ptr = match &index {
+            FaissIndex::Float(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
+            FaissIndex::Binary(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
         };
-        let params_str = format!("efConstruction={expansion_add} efSearch={expansion_search}");
-        unsafe {
-            let mut space: *mut std::ffi::c_void = std::ptr::null_mut();
-            if faiss_ParameterSpace_new(&mut space) == 0 && !space.is_null() {
-                let c_params = std::ffi::CString::new(params_str.as_str()).unwrap();
-                faiss_ParameterSpace_set_index_parameters(space, inner_ptr, c_params.as_ptr());
-                faiss_ParameterSpace_free(space);
+        let parameter_string = format!("efConstruction={expansion_add} efSearch={expansion_search}");
+        let mut parameter_space = FaissParameterSpace::new()?;
+        match parameter_space.set_index_parameters(inner_index_ptr, &parameter_string) {
+            Ok(()) => {}
+            Err(faiss_error) if binary => {
+                // Binary HNSW has no ParameterSpace dispatcher. If the requested values match the
+                // compile-time defaults, the failed dispatch is a no-op and we proceed; otherwise bail so the
+                // sweep skips this config.
+                let matches_defaults = expansion_add == BINARY_HNSW_DEFAULT_EF_CONSTRUCTION
+                    && expansion_search == BINARY_HNSW_DEFAULT_EF_SEARCH;
+                if !matches_defaults {
+                    return Err(format!(
+                        "FAISS binary HNSW rejects efConstruction={expansion_add} \
+                         efSearch={expansion_search} (FAISS: {faiss_error}). Only \
+                         {BINARY_HNSW_DEFAULT_EF_CONSTRUCTION}/{BINARY_HNSW_DEFAULT_EF_SEARCH} are \
+                         reachable via the C API; rerun with those or use --dtype other than b1."
+                    ));
+                }
+            }
+            Err(faiss_error) => {
+                // Float HNSW's ParameterSpace path is documented to succeed — propagate.
+                return Err(format!(
+                    "FAISS ParameterSpace rejected `{parameter_string}`: {faiss_error}"
+                ));
             }
         }
 
+        // Construction reached here only if the requested expansion values
+        // are actually in effect — either ParameterSpace set them, or we're
+        // on binary HNSW and they match the compile-time defaults.
         let description = format!(
-            "faiss · {dtype_name} · {metric_label} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads",
+            "faiss · {dtype_name} · {metric_label} · M={connectivity} · \
+             ef={expansion_add}/{expansion_search} · {threads} threads",
         );
 
         let mut metadata = HashMap::new();
@@ -334,26 +428,27 @@ fn main() {
     });
     let dimensions = state.dimensions();
 
-    for (dtype, metric) in iproduct!(&cli.dtype, &cli.metric) {
-        let mut index = FaissBackend::new(
+    let mut summary = SweepSummary::default();
+    for (dtype, metric, &connectivity, &expansion_add, &expansion_search) in iproduct!(
+        &cli.dtype,
+        &cli.metric,
+        &cli.connectivity,
+        &cli.expansion_add,
+        &cli.expansion_search
+    ) {
+        let description =
+            format!("faiss · {dtype} · {metric} · M={connectivity} · ef={expansion_add}/{expansion_search}");
+        let backend = FaissBackend::new(
             dimensions,
             dtype,
             metric,
-            cli.connectivity,
-            cli.expansion_add,
-            cli.expansion_search,
+            connectivity,
+            expansion_add,
+            expansion_search,
             cli.threads,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
-
-        run(&mut index, &mut state).unwrap_or_else(|e| {
-            eprintln!("Benchmark failed: {e}");
-            std::process::exit(1);
-        });
+        );
+        summary.record(try_run_config(&description, backend, &mut state));
     }
 
-    eprintln!("Benchmark complete.");
+    summary.print();
 }

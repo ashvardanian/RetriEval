@@ -514,7 +514,9 @@ fn run_search_phase(
 
     let approx = if is_final_step { "" } else { "~" };
     progress.finish_with_message(format!(
-        "{} search/s, {approx}recall@1={recall_at_1_norm:.4}, {approx}recall@10={recall_at_10_norm:.4}, {approx}NDCG@10={ndcg_at_10_norm:.4} ({} vectors)",
+        "{} search/s, {approx}recall@1={recall_at_1_norm:.4}, \
+         {approx}recall@10={recall_at_10_norm:.4}, \
+         {approx}NDCG@10={ndcg_at_10_norm:.4} ({} vectors)",
         format_thousands(throughput_per_sec),
         format_thousands(vectors_indexed as u64),
     ));
@@ -663,4 +665,69 @@ pub fn run(index: &mut dyn Backend, state: &mut BenchState) -> BenchResult<()> {
     eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / 1e9);
     eprintln!();
     Ok(())
+}
+
+// #region Sweep driver
+
+/// How one config in a sweep ended up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOutcome {
+    /// Backend constructed and `run()` returned `Ok(())`.
+    Ran,
+    /// Backend construction failed — config is invalid for this engine (e.g. non-default ef on
+    /// FAISS binary HNSW).
+    Skipped,
+    /// Backend ran but the benchmark loop errored mid-flight.
+    Failed,
+}
+
+/// Run one config of a sweep without aborting the whole process: any construction error is logged as
+/// "skipped", any runtime error as "failed", and the remaining configs still execute.
+///
+/// Binaries build the per-config pre-construction `description` themselves (we don't have a
+/// `Backend::description()` yet when construction fails), then pass in the backend `Result` and let this
+/// helper route the outcome.
+pub fn try_run_config<B, E>(description: &str, backend: Result<B, E>, state: &mut BenchState) -> ConfigOutcome
+where
+    B: Backend,
+    E: std::fmt::Display,
+{
+    match backend {
+        Ok(mut backend) => match run(&mut backend, state) {
+            Ok(()) => ConfigOutcome::Ran,
+            Err(err) => {
+                eprintln!("\n── {description} — failed ──\n  {err}");
+                ConfigOutcome::Failed
+            }
+        },
+        Err(err) => {
+            eprintln!("\n── {description} — skipped ──\n  {err}");
+            ConfigOutcome::Skipped
+        }
+    }
+}
+
+/// Aggregate outcome counter for a sweep — record per config, print once at the end.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SweepSummary {
+    pub ran: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+impl SweepSummary {
+    pub fn record(&mut self, outcome: ConfigOutcome) {
+        match outcome {
+            ConfigOutcome::Ran => self.ran += 1,
+            ConfigOutcome::Skipped => self.skipped += 1,
+            ConfigOutcome::Failed => self.failed += 1,
+        }
+    }
+
+    pub fn print(&self) {
+        eprintln!(
+            "Benchmark complete: {} config(s) ran, {} skipped, {} failed.",
+            self.ran, self.skipped, self.failed
+        );
+    }
 }
