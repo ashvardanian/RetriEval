@@ -175,8 +175,8 @@ fn index_factory_string(dtype: &str, connectivity: usize) -> Result<String, Stri
         "f32" => Ok(format!("HNSW{connectivity},Flat")),
         "f16" => Ok(format!("HNSW{connectivity},SQfp16")),
         "bf16" => Ok(format!("HNSW{connectivity},SQbf16")),
-        "u8" => Ok(format!("HNSW{connectivity},SQ8bit_direct")),
-        "i8" => Ok(format!("HNSW{connectivity},SQ8bit_direct_signed")),
+        "u8" => Ok(format!("HNSW{connectivity},SQ8_direct")),
+        "i8" => Ok(format!("HNSW{connectivity},SQ8_direct_signed")),
         "b1" => Ok(format!("BHNSW{connectivity}")),
         _ => Err(format!("unknown FAISS dtype: {dtype}")),
     }
