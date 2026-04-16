@@ -6,12 +6,22 @@ It works with the same plain input format standardized by the [BigANN benchmark]
 
 ## Quick Start
 
+Install the default `retri-eval-usearch` binary:
+
 ```sh
 cargo install --path .
 ```
 
-This installs all backend binaries to `~/.cargo/bin/`.
-Run USearch against a dataset:
+Fetch the Unum Wiki 1M dataset — ~400 MB of vectors, queries, and ground truth:
+
+```sh
+mkdir -p datasets/wiki_1M && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/base.1M.fbin -P datasets/wiki_1M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/query.public.100K.fbin -P datasets/wiki_1M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/groundtruth.public.100K.ibin -P datasets/wiki_1M/
+```
+
+Run a sweep over three quantizations and write JSON reports under `results/`:
 
 ```sh
 retri-eval-usearch \
@@ -54,15 +64,22 @@ retri-eval-cuvs --metric l2 ...
 
 ### Vector Databases
 
-Input vectors are converted to `f32` before sending to the database.
 Server-side quantization is managed by the database engine, not the benchmark.
+Binary quantization is deterministic `sign(x)` per dim, and scalar quantization is per-dim min/max — neither trains a codebook, so both stay inside the "no learned logic" constraint the rest of the benchmark holds for the native backends.
+Product quantization is deliberately excluded everywhere.
 
-| Backend      | Client                       | Docker Image                | Metrics                         |
-| ------------ | ---------------------------- | --------------------------- | ------------------------------- |
-| __Qdrant__   | `qdrant-client`, gRPC        | `qdrant/qdrant`             | ip, l2, cos, manhattan          |
-| __Redis__    | `redis`, RESP                | `redis/redis-stack`         | ip, l2, cos                     |
-| __Weaviate__ | `weaviate-community`, REST   | `semitechnologies/weaviate` | ip, l2, cos, hamming, manhattan |
-| __LanceDB__  | `lancedb`, in-process, Arrow | —                           | ip, l2, cos, hamming            |
+| Backend      | Client                       | Docker Image                        | Metrics                | Wire dtype sweep                        | Server-side quantization   |
+| ------------ | ---------------------------- | ----------------------------------- | ---------------------- | --------------------------------------- | -------------------------- |
+| __Qdrant__   | `qdrant-client`, gRPC        | `qdrant/qdrant:v1.17.1`             | ip, l2, cos, manhattan | `f32`, `f16`, `u8`                      | `none`, `binary`, `scalar` |
+| __Redis__    | `redis`, RESP                | `redis:8.6`                         | ip, l2, cos            | `f32`, `f64`, `f16`, `bf16`, `u8`, `i8` | —                          |
+| __Weaviate__ | `weaviate-community`, REST   | `semitechnologies/weaviate:1.36.10` | ip, l2, cos            | `f32` only                              | `none`, `binary`           |
+| __LanceDB__  | `lancedb`, in-process, Arrow | —                                   | ip, l2, cos            | `f32` only                              | — (IVF-bucketed only) ¹    |
+
+¹ LanceDB's Rust client — `lancedb 0.27` — exposes graph-based search only via `IvfHnswPq` / `IvfHnswSq`, both IVF-bucketed and PQ k-means-trained. No pure-HNSW variant is offered, so this benchmark leaves LanceDB on plain `f32` + L2/IP/Cos until upstream adds one. Hamming is only available on `IvfFlat`, outside our graph path.
+
+Redis 8.x is required for `i8`, `u8`, `f16`, and `bf16` — the older `redis/redis-stack` images on Redis 7.4 reject those four types at `FT.CREATE`.
+Qdrant server-side `Float16` and `Uint8` accept f32 upserts and convert on ingest, so the wire payload we send is unchanged.
+Weaviate stores only f32 internally; the wire dtype sweep there is intentionally a single-option list.
 
 ---
 
@@ -111,7 +128,7 @@ __retri-eval-usearch__ additionally supports comma-separated sweeps:
 --threads <LIST>           # Thread count (default: available cores)
 ```
 
-__retri-eval-cuvs__ (requires `--features cuvs-backend` and an NVIDIA GPU):
+__retri-eval-cuvs__ — requires `--features cuvs-backend` and an NVIDIA GPU:
 
 ```
 --metric <LIST>                    # l2, ip, cos (default: l2)
@@ -119,6 +136,129 @@ __retri-eval-cuvs__ (requires `--features cuvs-backend` and an NVIDIA GPU):
 --intermediate-graph-degree <LIST> # CAGRA intermediate graph degree (default: 64)
 --itopk-size <LIST>                # Search-time intermediate results (default: 64)
 ```
+
+__retri-eval-qdrant__ extends the common flags with:
+
+```
+--dtype <LIST>          # f32, f16, u8                  (default: f32)
+--quantization <LIST>   # none, binary, scalar          (default: none)
+--metric <LIST>         # ip, l2, cos, manhattan        (default: l2)
+```
+
+__retri-eval-redis__ extends the common flags with:
+
+```
+--dtype <LIST>          # f32, f64, f16, bf16, u8, i8   (default: f32)
+--metric <LIST>         # ip, l2, cos                   (default: l2)
+```
+
+__retri-eval-weaviate__ extends the common flags with:
+
+```
+--quantization <LIST>   # none, binary                  (default: none)
+--metric <LIST>         # ip, l2, cos                   (default: l2)
+```
+
+## Observability
+
+### Hardware counters on Linux
+
+Wall-clock throughput and peak RSS always land in the JSON report.
+For deeper attribution — "how many cycles did construction spend in cache misses vs searching?" — build with `--features perf-counters`.
+On Linux this pulls [`perf-event2`] and wraps the `index.add` and `index.search` loops inside `src/bench.rs::run` with system-wide hardware counters, populating eight new optional fields on each `StepEntry`:
+
+```
+cycles_add / instructions_add / cache_misses_add / branch_misses_add
+cycles_search / instructions_search / cache_misses_search / branch_misses_search
+```
+
+Fields are `Option<u64>` with `skip_serializing_if = "Option::is_none"`, so reports from runs without the feature are byte-identical to the pre-feature schema.
+
+```sh
+sudo sysctl -w kernel.perf_event_paranoid=-1   # once per host
+ulimit -n 65536                                 # see RLIMIT note below
+cargo build --release --features usearch-backend,perf-counters
+
+retri-eval-usearch \
+    --vectors datasets/pubchem_maccs/base.115627267.b1bin \
+    --queries datasets/pubchem_maccs/query.10000.b1bin \
+    --neighbors datasets/pubchem_maccs/groundtruth.10000.ibin \
+    --dtype b1 --metric hamming --output results/pubchem_maccs
+```
+
+__Scope__ is system-wide per-CPU — `pid == -1`, `cpu == i`, one counter group per online CPU, summed at read.
+This is the only way to cover every ForkUnion pool thread, because per-process `inherit(true)` would miss workers spawned before the counter was enabled.
+Trade-off: on shared hosts the numbers include other tenants' activity; on a dedicated box this is exactly what you want.
+
+__Permissions__ require `CAP_PERFMON` or `CAP_SYS_ADMIN`, or relaxed paranoia via `kernel.perf_event_paranoid ≤ 0`.
+Without either, `PerfCounters::new` returns `EACCES`, the bench prints `perf counters: unavailable …; running without` and completes normally with the counter fields absent.
+
+__RLIMIT_NOFILE__ matters: each CPU opens six file descriptors — a no-op leader fd plus five hardware counters.
+At 192 CPUs that's 1,152 fds, above the default `ulimit -n 1024` on most distros.
+Bump it per shell with `ulimit -n 65536` or system-wide via `/etc/security/limits.conf` before running.
+Without the bump you'll get `EMFILE` around the 170th CPU's group.
+
+__Cross-platform__ is Linux-only.
+On macOS, Windows, or BSD, Cargo simply does not pull `perf-event2` into the dep graph — the dep line is gated behind `[target.'cfg(target_os = "linux")']`.
+The module falls back to a stub whose `PerfCounters::new` returns `Unsupported`.
+Enabling the feature on a non-Linux target compiles cleanly and runs as if it were disabled — you still get the JSON, just without counter fields.
+
+### External perf stat sidecar
+
+When profiling an already-compiled binary, or when you want OS-level metrics alongside hardware counters, run `perf stat` and `mpstat` directly alongside the bench instead of rebuilding with `--features perf-counters`.
+
+```sh
+sudo apt install linux-tools-common linux-tools-generic sysstat
+sudo sysctl -w kernel.perf_event_paranoid=-1
+
+mpstat 1 > results/cohere_en/mpstat.txt &        # 1 Hz all-core utilization
+perf stat -a -e cycles,instructions,cache-references,cache-misses,\
+LLC-load-misses,branch-misses,context-switches,cpu-migrations,page-faults \
+    --output results/cohere_en/perf.txt -- \
+    retri-eval-usearch \
+        --vectors datasets/cohere_en/base.41488110.b1bin \
+        --queries datasets/cohere_en/query.10000.b1bin \
+        --neighbors datasets/cohere_en/groundtruth.10000.ibin \
+        --dtype b1 --metric hamming \
+        --output results/cohere_en
+kill %1
+```
+
+This covers the whole process lifetime including dataset-load and ground-truth I/O rather than just the add/search loops, useful for spotting cost outside the measured regions.
+
+### Memory consumption tracking
+
+`StepEntry.memory_bytes` is populated per step by asking the backend what it's currently using.
+The mechanism depends on the backend:
+
+| Backend                                 | How `memory_bytes` is measured                                                                                                                                                                                 |
+| :-------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| In-process — USearch, FAISS, cuVS       | The engine exposes its internal allocator or `index.size()` API, giving exact index footprint excluding dataset mmap. USearch: `index.memory_usage()`. FAISS: `index.stats().indexed_vectors * sizeof`.        |
+| Tier 2 Docker — Qdrant, Redis, Weaviate | `docker stats --no-stream --format '{{.MemUsage}}'` is sampled per step against the running container and parsed into bytes. This includes the whole engine process, not just the index, so it's an overcount. |
+| LanceDB — in-process, Arrow IPC         | Filesystem-backed; `memory_bytes` reports the table's on-disk size from `fs::metadata`, not RSS.                                                                                                               |
+
+The `peak memory` line printed at the end of a run is `steps.iter().map(|s| s.memory_bytes).max()`.
+Process-wide peak RSS — the kernel's accounting of everything including mmapped datasets — is available via `getrusage(RUSAGE_SELF)` but is not currently reported in the JSON.
+On the wishlist if you want mmap cost separated out.
+
+### Tier-2 backend Docker lifecycle
+
+Tier-2 backends — Qdrant, Redis, Weaviate — don't run in-process.
+They run as Docker containers the benchmark spawns and tears down automatically.
+`src/docker.rs` wraps `bollard`, the async Docker API client, and does:
+
+1. __Pull__ — runs `docker pull qdrant/qdrant:latest` or equivalent if the image isn't cached locally.
+2. __Run__ — creates the container with port bindings and environment variables from the compose file at `docker/<backend>.yml`, then starts it.
+3. __Wait for ready__ — polls an HTTP health endpoint such as `/healthz` or `/health` with 500 ms intervals until the backend accepts connections, or a configurable timeout fires.
+4. __Run the benchmark__ against the container.
+5. __Stop and remove__ the container regardless of success or failure — RAII-style via `ContainerHandle::Drop`.
+
+Per-step memory for these backends comes from the Docker stats API.
+`memory_bytes` reflects the container's resident set including the engine process, its heap, page cache attributed to it, and so on.
+Overcount compared to just-the-index, but it's the honest picture of what the engine costs to run.
+
+Requirements: Docker daemon accessible over Unix socket or TCP, images pullable by the current user.
+On systems where the Docker daemon runs as root, either add your user to the `docker` group or run the benchmark with `sudo`.
 
 ## Output Format
 
@@ -154,24 +294,28 @@ Files are auto-named `<backend>-<hash>.json`.
 ```
 Cargo.toml
 src/
-    bench.rs            # Library root: Backend trait, types, BenchState, benchmark loop
-    dataset.rs          # Memory-mapped .fbin/.ibin loading (zero-copy)
-    eval.rs             # Recall@K, NDCG@K
-    output.rs           # Report types, JSON writer, machine info
-    docker.rs           # Docker container lifecycle (Tier 2 backends)
-    usearch.rs          # retri-eval-usearch binary
-    faiss.rs            # retri-eval-faiss binary
-    cuvs.rs             # retri-eval-cuvs binary
-    qdrant.rs           # retri-eval-qdrant binary
-    redis.rs            # retri-eval-redis binary
-    lancedb.rs          # retri-eval-lancedb binary
-    weaviate.rs         # retri-eval-weaviate binary
+    bench.rs                # Library root: Backend trait, types, BenchState, benchmark loop
+    dataset.rs              # Memory-mapped .fbin/.ibin loading (zero-copy)
+    eval.rs                 # Recall@K, NDCG@K
+    output.rs               # Report types, JSON writer, machine info
+    docker.rs               # Docker container lifecycle (Tier 2 backends)
+    usearch.rs              # retri-eval-usearch binary
+    faiss.rs                # retri-eval-faiss binary
+    cuvs.rs                 # retri-eval-cuvs binary
+    qdrant.rs               # retri-eval-qdrant binary
+    redis.rs                # retri-eval-redis binary
+    lancedb.rs              # retri-eval-lancedb binary
+    weaviate.rs             # retri-eval-weaviate binary
+    generate.rs             # retri-generate — synthetic dataset generator with GT
+    perf_counters.rs        # Linux perf_event_open wrapper for hardware counters
 docker/
-    qdrant.yml          # Docker compose for Qdrant
-    redis.yml           # Docker compose for Redis Stack
-    weaviate.yml        # Docker compose for Weaviate
+    qdrant.yml              # Docker compose for Qdrant
+    redis.yml               # Docker compose for Redis Stack
+    weaviate.yml            # Docker compose for Weaviate
 scripts/
-    plot.py             # JSON results → PNG plots (Plotly, runnable via uv)
+    plot.py                 # JSON results → PNG plots (Plotly, runnable via uv)
+    download_molecules.rs   # retri-download-molecules binary (--features download)
+    download_cohere.rs      # retri-download-cohere binary (--features download)
 ```
 
 ## Datasets
@@ -182,41 +326,46 @@ Datasets below are grouped by scale; only configurations with matching ground tr
 
 ### ~1M Scale — Development & Testing
 
-| Dataset                                    | Scalar Type | Dimensions | Metric | Base Size |    Ground Truth     |
-| :----------------------------------------- | :---------: | :--------: | :----: | :-------: | :-----------------: |
-| [Unum UForm Wiki][unum-wiki-1m]            |    `f32`    |    256     |   IP   |   1 GB    |  100K queries, yes  |
-| [Unum UForm Creative Captions][unum-cc-3m] |    `f32`    |    256     |   IP   |   3 GB    | cross-modal pairing |
-| [Arxiv with E5][unum-arxiv-2m]             |    `f32`    |    768     |   IP   |   6 GB    | cross-modal pairing |
+| Dataset                                    | Scalar Type | Dimensions | Metric | Base Size | Ground Truth      |
+| :----------------------------------------- | ----------: | ---------: | -----: | --------: | :---------------- |
+| [Unum UForm Wiki][unum-wiki-1m]            |       `f32` |        256 |     IP |      1 GB | 100K queries, yes |
+| [Unum UForm Creative Captions][unum-cc-3m] |       `f32` |        256 |     IP |      3 GB | 3M queries, yes   |
+| [Arxiv with E5][unum-arxiv-2m]             |       `f32` |        768 |     IP |      6 GB | 2M queries, yes   |
 
 ### ~10M Scale
 
-| Dataset                              | Scalar Type | Dimensions | Metric | Base Size |   Ground Truth    |
-| :----------------------------------- | :---------: | :--------: | :----: | :-------: | :---------------: |
-| [Meta BIGANN (SIFT)][meta-bigann]    |    `u8`     |    128     |   L2   |  1.2 GB   | 10K queries, yes  |
-| [Microsoft Turing-ANNS][msft-turing] |    `f32`    |    100     |   L2   |  3.7 GB   | 100K queries, yes |
-| [Yandex Deep][yandex-deep]           |    `f32`    |     96     |   L2   |  3.6 GB   |  ¹ no subset GT   |
+| Dataset                              | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
+| :----------------------------------- | ----------: | ---------: | ------: | --------: | :---------------- |
+| [Meta BIGANN — SIFT][meta-bigann]    |        `u8` |        128 |      L2 |    1.2 GB | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing] |       `f32` |        100 |      L2 |    3.7 GB | 100K queries, yes |
+| [Cohere Wiki EN][cohere-wiki]        |        `b1` |       1024 | Hamming |    5.3 GB | self-sampled ¹    |
 
-> ¹ Yandex only publishes ground truth computed against the full 1B dataset. A `base.10M.fbin` exists for
-> download but using 1B ground truth with a subset will produce misleadingly low recall. Use it only for
-> throughput/latency testing, not recall evaluation.
+> ¹ Binary fingerprint and embedding sources ship vectors but no ground truth.
+> The `retri-download-molecules` and `retri-download-cohere` binaries behind `--features download` fetch the Parquet shards from S3 and Hugging Face, extract the bit-packed column straight into `.b1bin`, sample queries with a fixed seed, and compute exact brute-force Hamming top-K using NumKong's SIMD kernels.
 
 ### ~100M Scale
 
-| Dataset                              | Scalar Type | Dimensions | Metric | Base Size |   Ground Truth    |
-| :----------------------------------- | :---------: | :--------: | :----: | :-------: | :---------------: |
-| [Meta BIGANN (SIFT)][meta-bigann]    |    `u8`     |    128     |   L2   |   12 GB   | 10K queries, yes  |
-| [Microsoft Turing-ANNS][msft-turing] |    `f32`    |    100     |   L2   |   37 GB   | 100K queries, yes |
-| [Microsoft SpaceV][msft-spacev]      |    `i8`     |    100     |   L2   |  9.3 GB   | 30K queries, yes  |
+| Dataset                               | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
+| :------------------------------------ | ----------: | ---------: | ------: | --------: | :---------------- |
+| [Meta BIGANN — SIFT][meta-bigann]     |        `u8` |        128 |      L2 |     12 GB | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing]  |       `f32` |        100 |      L2 |     37 GB | 100K queries, yes |
+| [Microsoft SpaceV][msft-spacev]       |        `i8` |        100 |      L2 |    9.3 GB | 30K queries, yes  |
+| [USearchMolecules PubChem][usm] MACCS |        `b1` |        168 | Hamming |    2.4 GB | self-sampled ¹    |
+| [USearchMolecules PubChem][usm] ECFP4 |        `b1` |       2048 | Hamming |     29 GB | self-sampled ¹    |
 
 ### ~1B Scale
 
-| Dataset                              | Scalar Type | Dimensions | Metric | Base Size |   Ground Truth    |
-| :----------------------------------- | :---------: | :--------: | :----: | :-------: | :---------------: |
-| [Meta BIGANN (SIFT)][meta-bigann]    |    `u8`     |    128     |   L2   |  119 GB   | 10K queries, yes  |
-| [Microsoft Turing-ANNS][msft-turing] |    `f32`    |    100     |   L2   |  373 GB   | 100K queries, yes |
-| [Microsoft SpaceV][msft-spacev]      |    `i8`     |    100     |   L2   |   93 GB   | 30K queries, yes  |
-| [Yandex Text-to-Image][yandex-t2i]   |    `f32`    |    200     |  Cos   |  750 GB   | 100K queries, yes |
-| [Yandex Deep][yandex-deep]           |    `f32`    |     96     |   L2   |  358 GB   | 10K queries, yes  |
+| Dataset                                    | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
+| :----------------------------------------- | ----------: | ---------: | ------: | --------: | :---------------- |
+| [Meta BIGANN — SIFT][meta-bigann]          |        `u8` |        128 |      L2 |    119 GB | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing]       |       `f32` |        100 |      L2 |    373 GB | 100K queries, yes |
+| [Microsoft SpaceV][msft-spacev]            |        `i8` |        100 |      L2 |     93 GB | 30K queries, yes  |
+| [Yandex Text-to-Image][yandex-t2i]         |       `f32` |        200 |     Cos |    750 GB | 100K queries, yes |
+| [Yandex Deep][yandex-deep]                 |       `f32` |         96 |      L2 |    358 GB | 10K queries, yes  |
+| [USearchMolecules GDB-13][usm] MACCS       |        `b1` |        168 | Hamming |     21 GB | self-sampled ¹    |
+| [USearchMolecules GDB-13][usm] ECFP4       |        `b1` |       2048 | Hamming |    250 GB | self-sampled ¹    |
+| [USearchMolecules Enamine REAL][usm] MACCS |        `b1` |        168 | Hamming |    127 GB | self-sampled ¹    |
+| [USearchMolecules Enamine REAL][usm] ECFP4 |        `b1` |       2048 | Hamming |   1.55 TB | self-sampled ¹    |
 
 [unum-cc-3m]: https://huggingface.co/datasets/unum-cloud/ann-cc-3m
 [unum-wiki-1m]: https://huggingface.co/datasets/unum-cloud/ann-wiki-1m
@@ -226,10 +375,16 @@ Datasets below are grouped by scale; only configurations with matching ground tr
 [yandex-t2i]: https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search
 [yandex-deep]: https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search
 [meta-bigann]: https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/
+[usm]: https://github.com/ashvardanian/USearchMolecules
+[cohere-wiki]: https://huggingface.co/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary
 
-### Download Instructions
+### Unum UForm Wiki
 
-#### Unum UForm Wiki — 1M, f32, 256d, IP
+Image-and-text embeddings from the UForm small multimodal model, projected to a shared 256d space.
+Bench against IP since UForm is L2-normalised at training time.
+
+<details>
+<summary>1M — f32, 256d, IP, ~1 GB</summary>
 
 ```sh
 mkdir -p datasets/wiki_1M/ && \
@@ -243,17 +398,72 @@ retri-eval-usearch \
     --vectors datasets/wiki_1M/base.1M.fbin \
     --queries datasets/wiki_1M/query.public.100K.fbin \
     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-    --dtype f32,f16,i8 --metric ip --threads 16 \
+    --dtype f32,f16,i8 --metric ip \
     --output results/wiki_1M
 ```
 
+</details>
+
+### Unum UForm Creative Captions
+
+Conceptual Captions image embeddings from the same UForm model as Wiki.
+Ground truth was computed offline by shuffling the base set as queries and recording the top-100 IP neighbors per row — see `scripts/compute_unum_orphan_gt.py`.
+
+<details>
+<summary>3M — f32, 256d, IP, ~3 GB</summary>
+
+```sh
+mkdir -p datasets/cc_3M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/base.fbin -P datasets/cc_3M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/query.fbin -P datasets/cc_3M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/groundtruth.ibin -P datasets/cc_3M/
+```
+
+```sh
+retri-eval-usearch \
+    --vectors datasets/cc_3M/base.fbin \
+    --queries datasets/cc_3M/query.fbin \
+    --neighbors datasets/cc_3M/groundtruth.ibin \
+    --dtype f32,bf16,f16,i8 --metric ip \
+    --output results/cc_3M
+```
+
+</details>
+
+### Arxiv with E5
+
+Arxiv abstracts embedded with the `intfloat/e5-base` model.
+Same offline GT recipe as Creative Captions: shuffled base as queries, top-100 IP neighbors.
+
+<details>
+<summary>2M — f32, 768d, IP, ~6 GB</summary>
+
+```sh
+mkdir -p datasets/arxiv_2M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/base.fbin -P datasets/arxiv_2M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/query.fbin -P datasets/arxiv_2M/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/groundtruth.ibin -P datasets/arxiv_2M/
+```
+
+```sh
+retri-eval-usearch \
+    --vectors datasets/arxiv_2M/base.fbin \
+    --queries datasets/arxiv_2M/query.fbin \
+    --neighbors datasets/arxiv_2M/groundtruth.ibin \
+    --dtype f32,bf16,f16,i8 --metric ip \
+    --output results/arxiv_2M
+```
+
+</details>
+
 ### Meta BIGANN — SIFT
 
-The full 1B dataset is available from Meta. No pre-sliced subset base files exist, so range requests are
-used to download only the first N vectors, followed by a header patch to update the vector count.
+Billion-scale SIFT descriptors from Meta.
+No pre-sliced subset base files exist, so the recipes use range requests against the single 1B file followed by an in-place header patch to update the vector count.
 Pre-computed ground truth is available for 10M and 100M subsets.
 
-#### 10M subset, u8, 128d, L2, ~1.2 GB
+<details>
+<summary>10M — u8, 128d, L2, ~1.2 GB</summary>
 
 ```sh
 mkdir -p datasets/sift_10M/ && \
@@ -274,11 +484,14 @@ retri-eval-usearch \
     --vectors datasets/sift_10M/base.10M.u8bin \
     --queries datasets/sift_10M/query.public.10K.u8bin \
     --neighbors datasets/sift_10M/groundtruth.public.10K.ibin \
-    --dtype f32,f16,i8 --metric l2 --threads 16 \
+    --dtype f32,f16,i8 --metric l2 \
     --output results/sift_10M
 ```
 
-#### 100M subset, u8, 128d, L2, ~12 GB
+</details>
+
+<details>
+<summary>100M — u8, 128d, L2, ~12 GB</summary>
 
 ```sh
 mkdir -p datasets/sift_100M/ && \
@@ -299,17 +512,20 @@ retri-eval-usearch \
     --vectors datasets/sift_100M/base.100M.u8bin \
     --queries datasets/sift_100M/query.public.10K.u8bin \
     --neighbors datasets/sift_100M/groundtruth.public.10K.ibin \
-    --dtype f32,f16,i8 --metric l2 --threads 96 \
+    --dtype f32,f16,i8 --metric l2 \
     --epochs 20 --output results/sift_100M
 ```
 
+</details>
+
 ### Microsoft Turing-ANNS
 
-The full 1B dataset is ~373 GB of f32 vectors with 100 dimensions.
-Subsets can be obtained via range requests, followed by a header patch to update the vector count.
-Pre-computed ground truth is available for 1M, 10M, and 100M subsets.
+373 GB of f32 vectors with 100 dimensions at full 1B scale.
+Subsets follow the same range-request + header-patch recipe as BIGANN.
+Pre-computed ground truth is available for 1M, 10M, and 100M.
 
-#### 1M subset, f32, 100d, L2, ~400 MB
+<details>
+<summary>1M — f32, 100d, L2, ~400 MB</summary>
 
 ```sh
 mkdir -p datasets/turing_1M/ && \
@@ -332,11 +548,14 @@ retri-eval-usearch \
     --vectors datasets/turing_1M/base.1M.fbin \
     --queries datasets/turing_1M/query.public.100K.fbin \
     --neighbors datasets/turing_1M/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric l2 --threads 16 \
+    --dtype f32,bf16,f16,i8 --metric l2 \
     --output results/turing_1M
 ```
 
-#### 10M subset, f32, 100d, L2, ~3.7 GB
+</details>
+
+<details>
+<summary>10M — f32, 100d, L2, ~3.7 GB</summary>
 
 ```sh
 mkdir -p datasets/turing_10M/ && \
@@ -359,11 +578,14 @@ retri-eval-usearch \
     --vectors datasets/turing_10M/base.10M.fbin \
     --queries datasets/turing_10M/query.public.100K.fbin \
     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric l2 --threads 16 \
+    --dtype f32,bf16,f16,i8 --metric l2 \
     --output results/turing_10M
 ```
 
-#### 100M subset, f32, 100d, L2, ~37 GB
+</details>
+
+<details>
+<summary>100M — f32, 100d, L2, ~37 GB</summary>
 
 ```sh
 mkdir -p datasets/turing_100M/ && \
@@ -386,15 +608,19 @@ retri-eval-usearch \
     --vectors datasets/turing_100M/base.100M.fbin \
     --queries datasets/turing_100M/query.public.100K.fbin \
     --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric l2 --threads 96 \
+    --dtype f32,bf16,f16,i8 --metric l2 \
     --epochs 20 --output results/turing_100M
 ```
 
+</details>
+
 ### Microsoft SpaceV
 
-A 100M subset is available from Hugging Face. The original 1B dataset can be pulled from AWS S3.
+Web-search embeddings already quantised to int8 at the source.
+A 100M subset is mirrored on Hugging Face; the original 1B lives on AWS S3.
 
-#### 100M subset, i8, 100d, L2, ~9.3 GB
+<details>
+<summary>100M — i8, 100d, L2, ~9.3 GB</summary>
 
 ```sh
 mkdir -p datasets/spacev_100M/ && \
@@ -408,33 +634,19 @@ retri-eval-usearch \
     --vectors datasets/spacev_100M/base.100M.i8bin \
     --queries datasets/spacev_100M/query.30K.i8bin \
     --neighbors datasets/spacev_100M/groundtruth.30K.i32bin \
-    --dtype f32,f16,i8 --metric l2 --threads 96 \
+    --dtype f32,f16,i8 --metric l2 \
     --epochs 20 --output results/spacev_100M
 ```
 
+</details>
+
 ### Yandex Deep
 
-Pre-built 10M subset and full 1B available from Yandex.
+Image embeddings extracted from the GoogLeNet penultimate layer.
+Only the full 1B is included here — the smaller subsets duplicate the same distribution at scales already covered by other datasets.
 
-#### 10M subset, f32, 96d, L2, ~3.6 GB
-
-```sh
-mkdir -p datasets/deep_10M/ && \
-    wget -nc https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.10M.fbin -P datasets/deep_10M/ && \
-    wget -nc https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin -P datasets/deep_10M/ && \
-    wget -nc https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/groundtruth.public.10K.ibin -P datasets/deep_10M/
-```
-
-```sh
-retri-eval-usearch \
-    --vectors datasets/deep_10M/base.10M.fbin \
-    --queries datasets/deep_10M/query.public.10K.fbin \
-    --neighbors datasets/deep_10M/groundtruth.public.10K.ibin \
-    --dtype f32,bf16,f16,i8 --metric l2 --threads 16 \
-    --output results/deep_10M
-```
-
-#### 1B, f32, 96d, L2, ~358 GB
+<details>
+<summary>1B — f32, 96d, L2, ~358 GB</summary>
 
 ```sh
 mkdir -p datasets/deep_1B/ && \
@@ -443,11 +655,14 @@ mkdir -p datasets/deep_1B/ && \
     wget -nc https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/groundtruth.public.10K.ibin -P datasets/deep_1B/
 ```
 
+</details>
+
 ### Yandex Text-to-Image
 
-1M subset and full 1B available from Yandex.
+Cross-modal text-and-image embeddings benchmarked under cosine similarity.
 
-#### 1M subset, f32, 200d, Cos, ~750 MB
+<details>
+<summary>1M — f32, 200d, Cos, ~750 MB</summary>
 
 ```sh
 mkdir -p datasets/t2i/ && \
@@ -461,11 +676,14 @@ retri-eval-usearch \
     --vectors datasets/t2i/base.1M.fbin \
     --queries datasets/t2i/query.public.100K.fbin \
     --neighbors datasets/t2i/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric cos --threads 16 \
+    --dtype f32,bf16,f16,i8 --metric cos \
     --output results/t2i_1M
 ```
 
-#### 1B, f32, 200d, Cos, ~750 GB
+</details>
+
+<details>
+<summary>1B — f32, 200d, Cos, ~750 GB</summary>
 
 ```sh
 mkdir -p datasets/t2i_1B/ && \
@@ -474,3 +692,121 @@ mkdir -p datasets/t2i_1B/ && \
     wget -nc https://storage.yandexcloud.net/yandex-research/ann-datasets/T2I/groundtruth.public.100K.ibin -P datasets/t2i_1B/
 ```
 
+</details>
+
+### USearchMolecules
+
+A corpus of small molecules with pre-computed binary fingerprints at four widths: MACCS 166 bits, PubChem 881 bits, ECFP4 2048 bits, FCFP4 2048 bits.
+Three subsets are hosted on AWS Open Data as Parquet shards: PubChem at 115M molecules, GDB-13 at 977M, and Enamine REAL at 6.04B.
+Natural fit for Hamming and Jaccard benchmarks since the vectors are genuinely binary rather than quantised floats.
+
+The `retri-download-molecules` binary fetches the requested fingerprint column directly into `.b1bin`, samples queries with a fixed seed, and computes brute-force Hamming top-K ground truth.
+Use `--limit N` to take a subset and `--source {pubchem,gdb13,enamine}` to pick the scale.
+
+<details>
+<summary>PubChem 115M MACCS — b1, 168 bits, Hamming, ~2.4 GB</summary>
+
+```sh
+cargo install --path . --features download
+retri-download-molecules \
+    --source pubchem --fingerprint maccs \
+    --query-count 10000 --neighbors 10 \
+    --output datasets/pubchem_maccs/
+```
+
+```sh
+retri-eval-usearch \
+    --vectors datasets/pubchem_maccs/base.115627267.b1bin \
+    --queries datasets/pubchem_maccs/query.10000.b1bin \
+    --neighbors datasets/pubchem_maccs/groundtruth.10000.ibin \
+    --dtype b1 --metric hamming,jaccard \
+    --output results/pubchem_maccs
+```
+
+</details>
+
+<details>
+<summary>PubChem 115M ECFP4 — b1, 2048 bits, Hamming, ~29 GB</summary>
+
+```sh
+retri-download-molecules \
+    --source pubchem --fingerprint ecfp4 \
+    --query-count 10000 --neighbors 10 \
+    --output datasets/pubchem_ecfp4/
+```
+
+```sh
+retri-eval-usearch \
+    --vectors datasets/pubchem_ecfp4/base.115627267.b1bin \
+    --queries datasets/pubchem_ecfp4/query.10000.b1bin \
+    --neighbors datasets/pubchem_ecfp4/groundtruth.10000.ibin \
+    --dtype b1 --metric hamming \
+    --output results/pubchem_ecfp4
+```
+
+</details>
+
+<details>
+<summary>GDB-13 977M MACCS — b1, 168 bits, Hamming, ~21 GB</summary>
+
+```sh
+retri-download-molecules \
+    --source gdb13 --fingerprint maccs \
+    --query-count 10000 --neighbors 10 \
+    --output datasets/gdb13_maccs/
+```
+
+</details>
+
+<details>
+<summary>Enamine REAL 6.04B MACCS — b1, 168 bits, Hamming, ~127 GB</summary>
+
+```sh
+retri-download-molecules \
+    --source enamine --fingerprint maccs \
+    --query-count 10000 --neighbors 10 \
+    --output datasets/enamine_maccs/
+```
+
+</details>
+
+Substitute `--fingerprint ecfp4` for the 2048-bit variant, which multiplies the base-file size by roughly 12× at each scale.
+Ground-truth time dominates at billion scale; set `--batch-size` explicitly if you have a lot of RAM and want larger query batches.
+
+### Cohere Wikipedia Multilingual
+
+247M Wikipedia paragraphs embedded with Cohere Embed v3 and bit-packed into 1024-bit `emb_ubinary` columns at 128 bytes per vector.
+The dataset also ships text metadata — title, paragraph body, URL — alongside the vectors.
+`--with-text` extracts them into aligned newline-delimited files for downstream semantic-search demos.
+
+<details>
+<summary>English subset 41.5M — b1, 1024 bits, Hamming, ~5.3 GB</summary>
+
+```sh
+retri-download-cohere \
+    --language en \
+    --query-count 10000 --neighbors 10 \
+    --output datasets/cohere_en/
+```
+
+```sh
+retri-eval-usearch \
+    --vectors datasets/cohere_en/base.41488110.b1bin \
+    --queries datasets/cohere_en/query.10000.b1bin \
+    --neighbors datasets/cohere_en/groundtruth.10000.ibin \
+    --dtype b1 --metric hamming \
+    --output results/cohere_en
+```
+
+FAISS binary indexes via `IndexBinaryHNSW` also work — pass `--dtype b1`, and the metric is Hamming by construction.
+
+```sh
+retri-eval-faiss \
+    --vectors datasets/cohere_en/base.41488110.b1bin \
+    --queries datasets/cohere_en/query.10000.b1bin \
+    --neighbors datasets/cohere_en/groundtruth.10000.ibin \
+    --dtype b1 --metric hamming \
+    --output results/cohere_en_faiss
+```
+
+</details>
