@@ -69,7 +69,7 @@ rand = "0.9"
 thiserror = "2"
 
 # USearch backend
-usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", optional = true }
+usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main", optional = true }
 fork_union = { version = "2" }
 itertools = { version = "0.14", optional = true }
 
@@ -103,7 +103,7 @@ weaviate-community = { version = "0.2", optional = true }
 # cuVS
 cuvs = { version = "26.4", optional = true }
 cuvs-sys = { version = "26.4", optional = true }
-numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", features = ["parallel"] }
+numkong = { git = "https://github.com/unum-cloud/usearch.git", branch = "main", features = ["parallel"] }
 
 # Dataset download binaries (Parquet readers for USearchMolecules / Cohere Wikipedia)
 parquet = { version = "57", default-features = false, features = ["arrow", "snap", "lz4", "zstd", "brotli"], optional = true }

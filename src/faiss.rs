@@ -62,10 +62,6 @@ extern "C" {
     fn faiss_get_last_error() -> *const std::ffi::c_char;
 }
 
-/// Compile-time defaults in `faiss/IndexBinaryHNSW.h` — the only ef values reachable from the C API for binary HNSW.
-const BINARY_HNSW_DEFAULT_EF_CONSTRUCTION: usize = 40;
-const BINARY_HNSW_DEFAULT_EF_SEARCH: usize = 16;
-
 /// FAISS C-API convention: `0` means success, anything else means the thread-local error is populated.
 #[inline]
 fn faiss_call_succeeded(return_code: i32) -> bool {
@@ -266,44 +262,22 @@ impl FaissBackend {
             (label, FaissIndex::Float(UnsafeCell::new(index)))
         };
 
-        // FAISS `ParameterSpace` is the only C-API entry point that can tune HNSW at runtime — upstream ships
-        // no `IndexHNSW_c.h` / `IndexBinaryHNSW_c.h`, and `ParameterSpace::set_index_parameter` in
-        // `faiss/AutoTune.cpp` dispatches on `dynamic_cast<IndexHNSW*>` with no binary branch. On binary
-        // indices the dispatch misses and the struct keeps its compile-time defaults.
-        let inner_index_ptr = match &index {
-            FaissIndex::Float(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
-            FaissIndex::Binary(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
-        };
-        let parameter_string = format!("efConstruction={expansion_add} efSearch={expansion_search}");
-        let mut parameter_space = FaissParameterSpace::new()?;
-        match parameter_space.set_index_parameters(inner_index_ptr, &parameter_string) {
-            Ok(()) => {}
-            Err(faiss_error) if binary => {
-                // Binary HNSW has no ParameterSpace dispatcher. If the requested values match the
-                // compile-time defaults, the failed dispatch is a no-op and we proceed; otherwise bail so the
-                // sweep skips this config.
-                let matches_defaults = expansion_add == BINARY_HNSW_DEFAULT_EF_CONSTRUCTION
-                    && expansion_search == BINARY_HNSW_DEFAULT_EF_SEARCH;
-                if !matches_defaults {
-                    return Err(format!(
-                        "FAISS binary HNSW rejects efConstruction={expansion_add} \
-                         efSearch={expansion_search} (FAISS: {faiss_error}). Only \
-                         {BINARY_HNSW_DEFAULT_EF_CONSTRUCTION}/{BINARY_HNSW_DEFAULT_EF_SEARCH} are \
-                         reachable via the C API; rerun with those or use --dtype other than b1."
-                    ));
-                }
-            }
-            Err(faiss_error) => {
-                // Float HNSW's ParameterSpace path is documented to succeed — propagate.
-                return Err(format!(
-                    "FAISS ParameterSpace rejected `{parameter_string}`: {faiss_error}"
-                ));
-            }
+        // Apply efConstruction / efSearch via FAISS ParameterSpace. Binary HNSW has no dispatcher in
+        // `faiss/AutoTune.cpp` so the call is a no-op there: `IndexBinaryHNSW` keeps its compile-time
+        // defaults (40 / 16). The CLI still accepts any `--expansion-add` / `--expansion-search` values
+        // for `--dtype b1`, but only the float HNSW path actually tunes them.
+        if !binary {
+            let inner_index_ptr = match &index {
+                FaissIndex::Float(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
+                FaissIndex::Binary(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
+            };
+            let parameter_string = format!("efConstruction={expansion_add} efSearch={expansion_search}");
+            let mut parameter_space = FaissParameterSpace::new()?;
+            parameter_space
+                .set_index_parameters(inner_index_ptr, &parameter_string)
+                .map_err(|e| format!("FAISS ParameterSpace rejected `{parameter_string}`: {e}"))?;
         }
 
-        // Construction reached here only if the requested expansion values
-        // are actually in effect — either ParameterSpace set them, or we're
-        // on binary HNSW and they match the compile-time defaults.
         let description = format!(
             "faiss · {dtype_name} · {metric_label} · M={connectivity} · \
              ef={expansion_add}/{expansion_search} · {threads} threads",
