@@ -1,8 +1,30 @@
 ![RetriEval benchmarks thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/RetriEval.jpg?raw=true) 
 
-__RetriEval__ is a bencmarking suite designed for Billion-scale Vector Search workloads.
+__RetriEval__ is a benchmarking suite designed for Billion-scale Vector Search workloads.
 It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/rapidsai/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
-It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, & machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
+It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, and machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
+
+| Dataset & Engine                 | Config           | Recall @ 10 |  Add/s | Search/s |  Memory |     Duration |
+| :------------------------------- | :--------------- | ----------: | -----: | -------: | ------: | -----------: |
+| 10 M `b1` 168D vectors, PubChem  |                  |             |        |          |         |              |
+| USearch                          | M=32, ef=128/64  |      0.9696 | 36,347 |   35,767 |  4.7 GB |         5.0m |
+| FAISS                            | M=64, ef=40/16   |      0.9661 | 95,230 |  293,795 |  7.6 GB |         1.5m |
+| 100 M `b1` 168D vectors, PubChem |                  |             |        |          |         |              |
+| USearch                          | M=32, ef=128/64  |      0.8438 | 35,080 |   38,432 | 40.8 GB |        54.6m |
+| FAISS                            | M=64, ef=40/16   |           — |      — |        — | ≥ 63 GB | killed at 9h |
+| 10 M `u8` 128D vectors, SIFT     |                  |             |        |          |         |              |
+| USearch                          | M=16, ef=128/256 |      0.9938 | 35,405 |   80,729 |  4.4 GB |         4.8m |
+| FAISS                            | M=16, ef=128/256 |      0.9952 | 26,374 |   38,278 |  5.9 GB |         5.6m |
+| 100 M `u8` 128D vectors, SIFT    |                  |             |        |          |         |              |
+| USearch                          | M=16, ef=128/256 |      0.9833 | 39,831 |   75,808 | 53.7 GB |        48.7m |
+| FAISS                            | M=16, ef=128/256 |           — |      — |        — | ≥ 46 GB | killed at 9h |
+
+> Benchmarks were conducted on dual socket Intel Xeon6 with 192 logical threads.
+> USearch v2.25 was compared to FAISS v1.12.0 (static, via faiss-sys 0.7.0).
+> Both engines used the native input quantization type — no rescaling in either.
+
+The recommended methodology is to parameter-sweep different configuration options to achieve comparable recall between search backends on a given dataset.
+Once the behavior is confirmed on a small 1M–10M subset, 100M–1B and larger benchmarks can be run to validate scaling curves.
 
 ## Quick Start
 
@@ -52,7 +74,7 @@ uv run scripts/plot.py results/ --output-dir plots/
 - __USearch__: Input is passed directly in the specified type.
   `--dtype` selects both the input interpretation and the internal quantization.
 - __FAISS__: Input is always f32.
-  `--dtype` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8bit_direct, etc.).
+  `--dtype` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8_direct, etc.).
 - __cuVS__: Currently benchmarks with f32.
   CAGRA natively supports f32, f16, i8, u8 for build.
 
@@ -161,9 +183,9 @@ __retri-eval-weaviate__ extends the common flags with:
 
 ## Observability
 
-### Hardware counters on Linux
+### Hardware Counters on Linux
 
-Wall-clock throughput and peak RSS always land in the JSON report.
+Wall-clock throughput and peak RSS are always recorded in the JSON report.
 For deeper attribution — "how many cycles did construction spend in cache misses vs searching?" — build with `--features perf-counters`.
 On Linux this pulls [`perf-event2`] and wraps the `index.add` and `index.search` loops inside `src/bench.rs::run` with system-wide hardware counters, populating eight new optional fields on each `StepEntry`:
 
@@ -203,7 +225,7 @@ On macOS, Windows, or BSD, Cargo simply does not pull `perf-event2` into the dep
 The module falls back to a stub whose `PerfCounters::new` returns `Unsupported`.
 Enabling the feature on a non-Linux target compiles cleanly and runs as if it were disabled — you still get the JSON, just without counter fields.
 
-### External perf stat sidecar
+### External `perf stat` Sidecar
 
 When profiling an already-compiled binary, or when you want OS-level metrics alongside hardware counters, run `perf stat` and `mpstat` directly alongside the bench instead of rebuilding with `--features perf-counters`.
 
@@ -226,7 +248,7 @@ kill %1
 
 This covers the whole process lifetime including dataset-load and ground-truth I/O rather than just the add/search loops, useful for spotting cost outside the measured regions.
 
-### Memory consumption tracking
+### Memory Consumption Tracking
 
 `StepEntry.memory_bytes` is populated per step by asking the backend what it's currently using.
 The mechanism depends on the backend:
@@ -241,13 +263,13 @@ The `peak memory` line printed at the end of a run is `steps.iter().map(|s| s.me
 Process-wide peak RSS — the kernel's accounting of everything including mmapped datasets — is available via `getrusage(RUSAGE_SELF)` but is not currently reported in the JSON.
 On the wishlist if you want mmap cost separated out.
 
-### Tier-2 backend Docker lifecycle
+### Tier 2 Backend Docker Lifecycle
 
-Tier-2 backends — Qdrant, Redis, Weaviate — don't run in-process.
+Tier 2 backends — Qdrant, Redis, Weaviate — don't run in-process.
 They run as Docker containers the benchmark spawns and tears down automatically.
 `src/docker.rs` wraps `bollard`, the async Docker API client, and does:
 
-1. __Pull__ — runs `docker pull qdrant/qdrant:latest` or equivalent if the image isn't cached locally.
+1. __Pull__ — runs `docker pull qdrant/qdrant:vX.Y.Z` or equivalent if the image isn't cached locally.
 2. __Run__ — creates the container with port bindings and environment variables from the compose file at `docker/<backend>.yml`, then starts it.
 3. __Wait for ready__ — polls an HTTP health endpoint such as `/healthz` or `/health` with 500 ms intervals until the backend accepts connections, or a configurable timeout fires.
 4. __Run the benchmark__ against the container.
@@ -310,7 +332,7 @@ src/
     perf_counters.rs        # Linux perf_event_open wrapper for hardware counters
 docker/
     qdrant.yml              # Docker compose for Qdrant
-    redis.yml               # Docker compose for Redis Stack
+    redis.yml               # Docker compose for Redis
     weaviate.yml            # Docker compose for Weaviate
 scripts/
     plot.py                 # JSON results → PNG plots (Plotly, runnable via uv)
