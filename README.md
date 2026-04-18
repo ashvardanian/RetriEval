@@ -4,20 +4,65 @@ __RetriEval__ is a benchmarking suite designed for Billion-scale Vector Search w
 It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/rapidsai/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
 It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, and machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
 
-| Dataset & Engine                 | Config           | Recall @ 10 |  Add/s | Search/s |  Memory |     Duration |
-| :------------------------------- | :--------------- | ----------: | -----: | -------: | ------: | -----------: |
-| 10 M `b1` 168D vectors, PubChem  |                  |             |        |          |         |              |
-| USearch                          | M=32, ef=128/64  |      0.9696 | 36,347 |   35,767 |  4.7 GB |         5.0m |
-| FAISS                            | M=64, ef=40/16   |      0.9661 | 95,230 |  293,795 |  7.6 GB |         1.5m |
-| 100 M `b1` 168D vectors, PubChem |                  |             |        |          |         |              |
-| USearch                          | M=32, ef=128/64  |      0.8438 | 35,080 |   38,432 | 40.8 GB |        54.6m |
-| FAISS                            | M=64, ef=40/16   |           — |      — |        — | ≥ 63 GB | killed at 9h |
-| 10 M `u8` 128D vectors, SIFT     |                  |             |        |          |         |              |
-| USearch                          | M=16, ef=128/256 |      0.9938 | 35,405 |   80,729 |  4.4 GB |         4.8m |
-| FAISS                            | M=16, ef=128/256 |      0.9952 | 26,374 |   38,278 |  5.9 GB |         5.6m |
-| 100 M `u8` 128D vectors, SIFT    |                  |             |        |          |         |              |
-| USearch                          | M=16, ef=128/256 |      0.9833 | 39,831 |   75,808 | 53.7 GB |        48.7m |
-| FAISS                            | M=16, ef=128/256 |           — |      — |        — | ≥ 46 GB | killed at 9h |
+<table>
+  <thead>
+    <tr>
+      <th align="left">Engine</th>
+      <th align="left">Config</th>
+      <th align="right">Recall @ 10</th>
+      <th align="right">Add/s</th>
+      <th align="right">Search/s</th>
+      <th align="right">Memory</th>
+      <th align="right">Duration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><th colspan="7" align="left">PubChem MACCS — 10 M × 168-bit binary vectors, Hamming distance · calibrated baseline</th></tr>
+    <tr>
+      <td>USearch</td><td>M=32, ef=128/64</td>
+      <td align="right">0.9696</td><td align="right">36,347</td><td align="right">35,767</td>
+      <td align="right">4.7 GB</td><td align="right">5.0m</td>
+    </tr>
+    <tr>
+      <td>FAISS</td><td>M=64, ef=40/16</td>
+      <td align="right">0.9661</td><td align="right">95,230</td><td align="right">293,795</td>
+      <td align="right">7.6 GB</td><td align="right">1.5m</td>
+    </tr>
+    <tr><th colspan="7" align="left">PubChem MACCS — 100 M × 168-bit binary vectors, Hamming distance · 10× scale-up at the same config</th></tr>
+    <tr>
+      <td>USearch</td><td>M=32, ef=128/64</td>
+      <td align="right">0.8438</td><td align="right">35,080</td><td align="right">38,432</td>
+      <td align="right">40.8 GB</td><td align="right">54.6m</td>
+    </tr>
+    <tr>
+      <td>FAISS</td><td>M=64, ef=40/16</td>
+      <td align="right">—</td><td align="right">—</td><td align="right">—</td>
+      <td align="right">≥ 63 GB</td><td align="right">killed at 9h</td>
+    </tr>
+    <tr><th colspan="7" align="left">SIFT — 10 M × 128D <code>u8</code> vectors, L2 distance · iso-recall baseline at ≥ 99 % recall@10</th></tr>
+    <tr>
+      <td>USearch</td><td>M=16, ef=128/256</td>
+      <td align="right">0.9938</td><td align="right">35,405</td><td align="right">80,729</td>
+      <td align="right">4.4 GB</td><td align="right">4.8m</td>
+    </tr>
+    <tr>
+      <td>FAISS</td><td>M=16, ef=128/256</td>
+      <td align="right">0.9952</td><td align="right">26,374</td><td align="right">38,278</td>
+      <td align="right">5.9 GB</td><td align="right">5.6m</td>
+    </tr>
+    <tr><th colspan="7" align="left">SIFT — 100 M × 128D <code>u8</code> vectors, L2 distance · 10× scale-up at the same config</th></tr>
+    <tr>
+      <td>USearch</td><td>M=16, ef=128/256</td>
+      <td align="right">0.9833</td><td align="right">39,831</td><td align="right">75,808</td>
+      <td align="right">53.7 GB</td><td align="right">48.7m</td>
+    </tr>
+    <tr>
+      <td>FAISS</td><td>M=16, ef=128/256</td>
+      <td align="right">—</td><td align="right">—</td><td align="right">—</td>
+      <td align="right">≥ 46 GB</td><td align="right">killed at 9h</td>
+    </tr>
+  </tbody>
+</table>
 
 > Benchmarks were conducted on dual socket Intel Xeon6 with 192 logical threads.
 > USearch v2.25 was compared to FAISS v1.12.0 (static, via faiss-sys 0.7.0).
