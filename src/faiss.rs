@@ -285,6 +285,7 @@ impl FaissBackend {
 
         let mut metadata = HashMap::new();
         metadata.insert("backend".into(), json!("faiss"));
+        metadata.insert("library_version".into(), json!(faiss_version()));
         metadata.insert("dtype".into(), json!(dtype_name));
         metadata.insert("metric".into(), json!(metric_label));
         metadata.insert("connectivity".into(), json!(connectivity));
@@ -393,8 +394,28 @@ impl Backend for FaissBackend {
     }
 }
 
+/// FAISS version string. FAISS's C API only exposes `faiss_get_version()` — no
+/// ISA introspection (the Python `has_AVX512*` flags come from numpy's CPU
+/// probe, not from FAISS). We don't duplicate that guess here.
+fn faiss_version() -> String {
+    use std::ffi::CStr;
+    extern "C" {
+        fn faiss_get_version() -> *const std::os::raw::c_char;
+    }
+    unsafe {
+        let p = faiss_get_version();
+        if p.is_null() {
+            "unknown".to_string()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
+
+    eprintln!("faiss v{}", faiss_version());
 
     let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {
         eprintln!("{e}");

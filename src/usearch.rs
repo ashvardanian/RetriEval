@@ -207,6 +207,15 @@ impl USearchBackend {
 
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("backend".into(), json!("usearch"));
+        metadata.insert("library_version".into(), json!(usearch::version()));
+        metadata.insert(
+            "library_isa_compiled".into(),
+            json!(usearch::hardware_acceleration_compiled()),
+        );
+        metadata.insert(
+            "library_isa_available".into(),
+            json!(usearch::hardware_acceleration_available()),
+        );
         metadata.insert("dtype".into(), json!(dtype_name));
         metadata.insert("metric".into(), json!(metric_name));
         metadata.insert("connectivity".into(), json!(connectivity));
@@ -409,6 +418,11 @@ impl Backend for USearchBackend {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Banner mirrors USearch Python (python/scripts/bench_index.py:289).
+    eprintln!("usearch v{}", usearch::version());
+    eprintln!("  Compiled ISA: {}", usearch::hardware_acceleration_compiled());
+    eprintln!("  Available ISA: {}", usearch::hardware_acceleration_available());
 
     let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {
         eprintln!("{e}");
