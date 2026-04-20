@@ -9,6 +9,7 @@ It works with the same plain input format standardized by the [BigANN benchmark]
     <tr>
       <th align="left">Engine</th>
       <th align="left">Config</th>
+      <th align="right">N</th>
       <th align="right">Recall @ 10</th>
       <th align="right">Add/s</th>
       <th align="right">Search/s</th>
@@ -17,49 +18,138 @@ It works with the same plain input format standardized by the [BigANN benchmark]
     </tr>
   </thead>
   <tbody>
-    <tr><th colspan="7" align="left">PubChem MACCS — 10 M × 168-bit binary vectors, Hamming distance · calibrated baseline</th></tr>
+    <tr><th colspan="8" align="left">PubChem MACCS — 168-bit binary, Hamming · calibrated at 10M, same config at 100M</th></tr>
     <tr>
-      <td>USearch</td><td>M=32, ef=128/64</td>
+      <td rowspan="2">USearch</td>
+      <td rowspan="2">M=32, ef=128/64</td>
+      <td align="right">10M</td>
       <td align="right">0.9696</td><td align="right">36,347</td><td align="right">35,767</td>
       <td align="right">4.7 GB</td><td align="right">5.0m</td>
     </tr>
     <tr>
-      <td>FAISS</td><td>M=64, ef=40/16</td>
-      <td align="right">0.9661</td><td align="right">95,230</td><td align="right">293,795</td>
-      <td align="right">7.6 GB</td><td align="right">1.5m</td>
-    </tr>
-    <tr><th colspan="7" align="left">PubChem MACCS — 100 M × 168-bit binary vectors, Hamming distance · 10× scale-up at the same config</th></tr>
-    <tr>
-      <td>USearch</td><td>M=32, ef=128/64</td>
+      <td align="right">100M</td>
       <td align="right">0.8438</td><td align="right">35,080</td><td align="right">38,432</td>
       <td align="right">40.8 GB</td><td align="right">54.6m</td>
     </tr>
     <tr>
-      <td>FAISS</td><td>M=64, ef=40/16</td>
+      <td rowspan="2">FAISS</td>
+      <td rowspan="2">M=64, ef=40/16</td>
+      <td align="right">10M</td>
+      <td align="right">0.9661</td><td align="right">95,230</td><td align="right">293,795</td>
+      <td align="right">7.6 GB</td><td align="right">1.5m</td>
+    </tr>
+    <tr>
+      <td align="right">100M</td>
       <td align="right">—</td><td align="right">—</td><td align="right">—</td>
       <td align="right">≥ 63 GB</td><td align="right">killed at 9h</td>
     </tr>
-    <tr><th colspan="7" align="left">SIFT — 10 M × 128D <code>u8</code> vectors, L2 distance · iso-recall baseline at ≥ 99 % recall@10</th></tr>
+    <tr><th colspan="8" align="left">SIFT — 128D <code>u8</code>, L2 · iso-recall baseline at ≥ 99 % recall@10</th></tr>
     <tr>
-      <td>USearch</td><td>M=16, ef=128/256</td>
+      <td rowspan="2">USearch</td>
+      <td rowspan="2">M=16, ef=128/256</td>
+      <td align="right">10M</td>
       <td align="right">0.9938</td><td align="right">35,405</td><td align="right">80,729</td>
       <td align="right">4.4 GB</td><td align="right">4.8m</td>
     </tr>
     <tr>
-      <td>FAISS</td><td>M=16, ef=128/256</td>
-      <td align="right">0.9952</td><td align="right">26,374</td><td align="right">38,278</td>
-      <td align="right">5.9 GB</td><td align="right">5.6m</td>
-    </tr>
-    <tr><th colspan="7" align="left">SIFT — 100 M × 128D <code>u8</code> vectors, L2 distance · 10× scale-up at the same config</th></tr>
-    <tr>
-      <td>USearch</td><td>M=16, ef=128/256</td>
+      <td align="right">100M</td>
       <td align="right">0.9833</td><td align="right">39,831</td><td align="right">75,808</td>
       <td align="right">53.7 GB</td><td align="right">48.7m</td>
     </tr>
     <tr>
-      <td>FAISS</td><td>M=16, ef=128/256</td>
+      <td rowspan="2">FAISS</td>
+      <td rowspan="2">M=16, ef=128/256</td>
+      <td align="right">10M</td>
+      <td align="right">0.9952</td><td align="right">26,374</td><td align="right">38,278</td>
+      <td align="right">5.9 GB</td><td align="right">5.6m</td>
+    </tr>
+    <tr>
+      <td align="right">100M</td>
       <td align="right">—</td><td align="right">—</td><td align="right">—</td>
       <td align="right">≥ 46 GB</td><td align="right">killed at 9h</td>
+    </tr>
+    <tr><th colspan="8" align="left">Microsoft Turing-ANNS — 100D <code>f32</code>, L2 · iso-recall baseline at ≥ 99 % recall@10</th></tr>
+    <tr>
+      <td rowspan="11">USearch</td>
+      <td rowspan="2">M=48, ef=768/384, <code>f32</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9929</td><td align="right">8,532</td><td align="right">12,331</td>
+      <td align="right">13.0 GB</td><td align="right">18.3m</td>
+    </tr>
+    <tr>
+      <td align="right">100M</td>
+      <td align="right">0.9929</td><td align="right">6,646</td><td align="right">10,398</td>
+      <td align="right">139.6 GB</td><td align="right">4h 1m</td>
+    </tr>
+    <tr>
+      <td rowspan="2">M=48, ef=768/384, <code>bf16</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9929</td><td align="right">10,496</td><td align="right">16,940</td>
+      <td align="right">10.9 GB</td><td align="right">14.1m</td>
+    </tr>
+    <tr>
+      <td align="right">100M</td>
+      <td align="right">0.9931</td><td align="right">8,564</td><td align="right">14,772</td>
+      <td align="right">105.2 GB</td><td align="right">3h 1m</td>
+    </tr>
+    <tr>
+      <td rowspan="2">M=48, ef=768/384, <code>f16</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9929</td><td align="right">10,969</td><td align="right">20,246</td>
+      <td align="right">10.9 GB</td><td align="right">13.5m</td>
+    </tr>
+    <tr>
+      <td align="right">100M</td>
+      <td align="right">0.9930</td><td align="right">8,807</td><td align="right">15,412</td>
+      <td align="right">105.2 GB</td><td align="right">2h 54m</td>
+    </tr>
+    <tr>
+      <td rowspan="2">M=48, ef=768/384, <code>e5m2</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9919</td><td align="right">10,526</td><td align="right">20,534</td>
+      <td align="right">9.8 GB</td><td align="right">13.5m</td>
+    </tr>
+    <tr>
+      <td align="right">100M</td>
+      <td align="right">0.9924</td><td align="right">7,368</td><td align="right">13,227</td>
+      <td align="right">88.0 GB</td><td align="right">3h 15m</td>
+    </tr>
+    <tr>
+      <td>M=48, ef=768/384, <code>e4m3</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9930</td><td align="right">7,353</td><td align="right">12,106</td>
+      <td align="right">9.8 GB</td><td align="right">19.4m</td>
+    </tr>
+    <tr>
+      <td>M=48, ef=768/384, <code>e3m2</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9728</td><td align="right">10,398</td><td align="right">18,022</td>
+      <td align="right">9.8 GB</td><td align="right">13.3m</td>
+    </tr>
+    <tr>
+      <td>M=48, ef=768/384, <code>e2m3</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.7941</td><td align="right">10,935</td><td align="right">21,313</td>
+      <td align="right">9.8 GB</td><td align="right">13.2m</td>
+    </tr>
+    <tr>
+      <td rowspan="3">FAISS</td>
+      <td>M=48, ef=768/384, <code>f32</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9944</td><td align="right">7,491</td><td align="right">16,486</td>
+      <td align="right">14.1 GB</td><td align="right">20.6m</td>
+    </tr>
+    <tr>
+      <td>M=48, ef=768/384, <code>bf16</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9944</td><td align="right">3,800</td><td align="right">10,391</td>
+      <td align="right">12.1 GB</td><td align="right">39.4m</td>
+    </tr>
+    <tr>
+      <td>M=48, ef=768/384, <code>f16</code></td>
+      <td align="right">10M</td>
+      <td align="right">0.9944</td><td align="right">2,545</td><td align="right">10,032</td>
+      <td align="right">12.1 GB</td><td align="right">1h 1m</td>
     </tr>
   </tbody>
 </table>

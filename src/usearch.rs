@@ -186,6 +186,13 @@ impl USearchBackend {
             shard_vec.push(::usearch::Index::new(&opts).map_err(|e| format!("failed to create USearch index: {e}"))?);
         }
 
+        if let Some(idx) = shard_vec.first() {
+            eprintln!(
+                "  dispatch[{dtype_name}/{metric_name}]: {}",
+                idx.hardware_acceleration()
+            );
+        }
+
         let pool = ThreadPool::try_spawn(threads).map_err(|e| format!("failed to create thread pool: {e}"))?;
 
         let fmt_param = |v: usize| {
