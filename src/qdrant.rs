@@ -57,12 +57,12 @@ fn parse_qdrant_datatype(s: &str) -> Result<Datatype, String> {
         "f32" => Ok(Datatype::Float32),
         "f16" => Ok(Datatype::Float16),
         "u8" => Ok(Datatype::Uint8),
-        _ => Err(format!("unknown Qdrant dtype: {s} (supported: f32, f16, u8)")),
+        _ => Err(format!("unknown Qdrant data_type: {s} (supported: f32, f16, u8)")),
     }
 }
 
-/// Server-side quantization — `binary` is deterministic `sign(x)` per dim;
-/// `scalar` is one-pass per-dim min/max mapping to int8. Both stay inside the
+/// Server-side quantization — `binary` is deterministic `sign(x)` per dimensions;
+/// `scalar` is one-pass per-dimensions min/max mapping to int8. Both stay inside the
 /// "no learned codebook" constraint. `product` (k-means) is deliberately not
 /// offered here.
 fn parse_qdrant_quantization(s: &str) -> Result<Option<Quantization>, String> {
@@ -96,9 +96,9 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_value = "l2")]
     metric: Vec<String>,
 
-    /// Storage dtype (comma-separated for sweep): f32, f16, u8
+    /// Storage data_type (comma-separated for sweep): f32, f16, u8
     #[arg(long, value_delimiter = ',', default_value = "f32")]
-    dtype: Vec<String>,
+    data_type: Vec<String>,
 
     /// Quantization (comma-separated for sweep): none, binary, scalar
     #[arg(long, value_delimiter = ',', default_value = "none")]
@@ -184,35 +184,35 @@ impl Backend for QdrantBackend {
         let num_vectors = data.len() / dimensions;
 
         self.runtime.block_on(async {
-            for q in 0..num_vectors {
-                let query = data[q * dimensions..(q + 1) * dimensions].to_vec();
+            for query_index in 0..num_vectors {
+                let query = data[query_index * dimensions..(query_index + 1) * dimensions].to_vec();
                 let response = self
                     .client
                     .search_points(SearchPointsBuilder::new(COLLECTION, query, count as u64))
                     .await
                     .map_err(|e| format!("Qdrant search failed: {e}"))?;
 
-                let offset = q * count;
+                let offset = query_index * count;
                 let mut found = 0;
-                for (j, point) in response.result.iter().enumerate().take(count) {
+                for (rank, point) in response.result.iter().enumerate().take(count) {
                     let id = match &point.id {
                         Some(id) => match &id.point_id_options {
-                            Some(point_id::PointIdOptions::Num(n)) => *n as Key,
+                            Some(point_id::PointIdOptions::Num(numeric_id)) => *numeric_id as Key,
                             _ => Key::MAX,
                         },
                         None => Key::MAX,
                     };
-                    out_keys[offset + j] = id;
-                    out_distances[offset + j] = point.score;
+                    out_keys[offset + rank] = id;
+                    out_distances[offset + rank] = point.score;
                     if id != Key::MAX {
                         found += 1;
                     }
                 }
-                for j in response.result.len()..count {
-                    out_keys[offset + j] = Key::MAX;
-                    out_distances[offset + j] = Distance::INFINITY;
+                for rank in response.result.len()..count {
+                    out_keys[offset + rank] = Key::MAX;
+                    out_distances[offset + rank] = Distance::INFINITY;
                 }
-                out_counts[q] = found;
+                out_counts[query_index] = found;
             }
             Ok::<(), String>(())
         })
@@ -241,12 +241,12 @@ fn main() {
 
     // Validate sweep axes up front so we fail fast on bad CLI input.
     let sweeps: Vec<(String, Datatype, Option<Quantization>, QdrantDistance)> =
-        iproduct!(&cli.metric, &cli.dtype, &cli.quantization)
-            .map(|(metric, dtype, quant)| {
-                let m = parse_qdrant_distance(metric).unwrap_or_else(|e| bail(&e));
-                let d = parse_qdrant_datatype(dtype).unwrap_or_else(|e| bail(&e));
-                let q = parse_qdrant_quantization(quant).unwrap_or_else(|e| bail(&e));
-                (quant.clone(), d, q, m)
+        iproduct!(&cli.metric, &cli.data_type, &cli.quantization)
+            .map(|(metric, data_type, quantization)| {
+                let parsed_metric = parse_qdrant_distance(metric).unwrap_or_else(|e| bail(&e));
+                let parsed_data_type = parse_qdrant_datatype(data_type).unwrap_or_else(|e| bail(&e));
+                let parsed_quantization = parse_qdrant_quantization(quantization).unwrap_or_else(|e| bail(&e));
+                (quantization.clone(), parsed_data_type, parsed_quantization, parsed_metric)
             })
             .enumerate()
             .map(|(_, v)| v)
@@ -283,12 +283,18 @@ fn main() {
         eprintln!("Failed to load benchmark state: {e}");
         std::process::exit(1);
     });
-    let dimensions = state.dimensions();
+    if cli.common.dimensions.len() > 1 {
+        retrieval::bail("--dimensions sweep with >1 value isn't supported on Qdrant; rerun the binary per dimensions");
+    }
+    let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
 
     let mut container_slot = Some(handle);
-    let num_configs = cli.metric.len() * cli.dtype.len() * cli.quantization.len();
+    let num_configs = cli.metric.len() * cli.data_type.len() * cli.quantization.len();
     for (idx, ((metric_str, dtype_str, quant_str), (_raw_q, dtype_enum, quant_opt, metric_enum))) in
-        iproduct!(&cli.metric, &cli.dtype, &cli.quantization)
+        iproduct!(&cli.metric, &cli.data_type, &cli.quantization)
             .zip(sweeps.into_iter())
             .enumerate()
     {
@@ -317,7 +323,7 @@ fn main() {
         let container_for_this_run = if is_last { container_slot.take() } else { None };
 
         let description = format!(
-            "qdrant · {metric_str} · dtype={dtype_str} · quant={quant_str} · M={} · ef={} · {dimensions}d",
+            "qdrant · {metric_str} · data_type={dtype_str} · quant={quant_str} · M={} · ef={} · {dimensions}d",
             cli.connectivity, cli.expansion_add
         );
 
@@ -331,15 +337,16 @@ fn main() {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("backend".into(), json!("qdrant"));
                 metadata.insert("metric".into(), json!(metric_str));
-                metadata.insert("dtype".into(), json!(dtype_str));
+                metadata.insert("data_type".into(), json!(dtype_str));
                 metadata.insert("quantization".into(), json!(quant_str));
+                metadata.insert("dimensions".into(), json!(dimensions));
                 metadata.insert("connectivity".into(), json!(cli.connectivity));
                 metadata.insert("expansion_add".into(), json!(cli.expansion_add));
                 metadata
             },
         };
 
-        run(&mut backend, &mut state).unwrap_or_else(|e| {
+        run(&mut backend, &mut state, dimensions).unwrap_or_else(|e| {
             eprintln!("Benchmark failed: {e}");
             std::process::exit(1);
         });

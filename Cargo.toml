@@ -63,6 +63,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memmap2 = "0.9"
+glob = "0.3"
 sysinfo = "0.38"
 indicatif = "0.18"
 rand = "0.9"
@@ -119,7 +120,7 @@ perf-event2 = { version = "0.7", optional = true }
 [features]
 default = ["usearch-backend"]
 usearch-backend = ["usearch", "itertools"]
-faiss-backend = ["faiss"]
+faiss-backend = ["faiss", "itertools"]
 faiss-static = ["faiss-backend", "faiss/static"]
 tier2 = ["bollard", "futures-util", "tokio", "reqwest", "reqwest/json"]
 qdrant-backend = ["tier2", "qdrant-client"]

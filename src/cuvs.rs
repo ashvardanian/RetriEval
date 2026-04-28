@@ -40,13 +40,13 @@
 //! cargo install --path . --features cuvs-backend
 //! ```
 //!
-//! Quick dtype sweep:
+//! Quick data_type sweep:
 //! ```sh
 //! retri-eval-cuvs \
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-//!     --dtype f32,f16 --metric ip \
+//!     --data_type f32,f16 --metric ip \
 //!     --output results/
 //! ```
 //!
@@ -56,7 +56,7 @@
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --dtype f32,f16 --metric l2 \
+//!     --data_type f32,f16 --metric l2 \
 //!     --graph-degree 64 \
 //!     --intermediate-graph-degree 128 \
 //!     --itopk-size 256 \
@@ -72,7 +72,7 @@ use std::ptr::NonNull;
 use clap::Parser;
 use cuvs::distance_type::DistanceType;
 use itertools::iproduct;
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{bail, run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, Vectors};
 use serde_json::json;
 
 // #region CudaAllocator
@@ -119,7 +119,7 @@ unsafe fn dl_tensor(
     data: *mut std::ffi::c_void,
     shape: *mut i64,
     ndim: i32,
-    dtype: cuvs_sys::DLDataType,
+    data_type: cuvs_sys::DLDataType,
     on_gpu: bool,
 ) -> cuvs_sys::DLManagedTensor {
     let device_type = if on_gpu {
@@ -135,7 +135,7 @@ unsafe fn dl_tensor(
                 device_id: 0,
             },
             ndim,
-            dtype,
+            data_type,
             shape,
             strides: std::ptr::null_mut(),
             byte_offset: 0,
@@ -143,14 +143,6 @@ unsafe fn dl_tensor(
         manager_ctx: std::ptr::null_mut(),
         deleter: None,
     }
-}
-
-/// Transmute a stack-local `DLManagedTensor` into a `cuvs::ManagedTensor`.
-///
-/// `ManagedTensor` is a transparent newtype around `DLManagedTensor`.
-/// Our descriptors have `deleter = None`, so their `Drop` is a no-op.
-unsafe fn as_managed(raw: cuvs_sys::DLManagedTensor) -> cuvs::ManagedTensor {
-    std::mem::transmute(raw)
 }
 
 // #region Dtype
@@ -171,7 +163,7 @@ impl CuvsDtype {
             "f16" => Ok(Self::F16),
             "i8" => Ok(Self::I8),
             "u8" => Ok(Self::U8),
-            _ => Err(format!("unknown CAGRA dtype: {s}. supported: f32, f16, i8, u8")),
+            _ => Err(format!("unknown CAGRA data_type: {s}. supported: f32, f16, i8, u8")),
         }
     }
 
@@ -206,7 +198,7 @@ impl CuvsDtype {
         }
     }
 
-    /// Convert f32 values to the target dtype, appending raw bytes to `output`.
+    /// Convert f32 values to the target data_type, appending raw bytes to `output`.
     fn convert_from_f32(self, source: &[f32], output: &mut Vec<u8>) {
         match self {
             Self::F32 => {
@@ -251,6 +243,144 @@ fn dl_distance() -> cuvs_sys::DLDataType {
     }
 }
 
+// #region CagraIndex
+//
+// Local thin wrapper around `cuvs_sys::cuvsCagraIndex_t`. We can't use
+// `cuvs::cagra::Index` because its inner pointer field is private and the
+// crate exposes no `serialize` / `deserialize` methods (CAGRA save/load
+// landed in the C API but the Rust 26.4 wrapper hasn't surfaced it yet).
+// Building on cuvs-sys directly lets us reach `cuvsCagraSerialize` /
+// `cuvsCagraDeserialize` while keeping `IndexParams` / `SearchParams` from
+// the high-level crate (their `.0` fields are public).
+
+struct CagraIndex(cuvs_sys::cuvsCagraIndex_t);
+
+fn cuvs_check(err: cuvs_sys::cuvsError_t, ctx: &str) -> Result<(), String> {
+    if err == cuvs_sys::cuvsError_t::CUVS_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("{ctx}: cuvsError_t = {err:?}"))
+    }
+}
+
+impl CagraIndex {
+    fn new() -> Result<Self, String> {
+        let mut handle = std::mem::MaybeUninit::<cuvs_sys::cuvsCagraIndex_t>::uninit();
+        unsafe {
+            cuvs_check(cuvs_sys::cuvsCagraIndexCreate(handle.as_mut_ptr()), "cuvsCagraIndexCreate")?;
+            Ok(Self(handle.assume_init()))
+        }
+    }
+
+    /// Build the index from a host- or device-resident DLPack tensor. Caller
+    /// keeps `dataset_dl` alive for the duration of the call.
+    fn build(
+        &self,
+        res: &cuvs::Resources,
+        params: cuvs_sys::cuvsCagraIndexParams_t,
+        dataset_dl: *mut cuvs_sys::DLManagedTensor,
+    ) -> Result<(), String> {
+        unsafe {
+            cuvs_check(
+                cuvs_sys::cuvsCagraBuild(res.0, params, dataset_dl, self.0),
+                "cuvsCagraBuild",
+            )
+        }
+    }
+
+    /// Search the index. All three tensors must reference live memory
+    /// (typically GPU buffers wrapped in `DLManagedTensor` views).
+    fn search(
+        &self,
+        res: &cuvs::Resources,
+        params: cuvs_sys::cuvsCagraSearchParams_t,
+        queries: *mut cuvs_sys::DLManagedTensor,
+        neighbors: *mut cuvs_sys::DLManagedTensor,
+        distances: *mut cuvs_sys::DLManagedTensor,
+    ) -> Result<(), String> {
+        let prefilter = cuvs_sys::cuvsFilter {
+            addr: 0,
+            type_: cuvs_sys::cuvsFilterType::NO_FILTER,
+        };
+        unsafe {
+            cuvs_check(
+                cuvs_sys::cuvsCagraSearch(res.0, params, self.0, queries, neighbors, distances, prefilter),
+                "cuvsCagraSearch",
+            )
+        }
+    }
+
+    fn serialize(&self, res: &cuvs::Resources, path: &str, include_dataset: bool) -> Result<(), String> {
+        let c_path = std::ffi::CString::new(path).map_err(|e| format!("path contains NUL: {e}"))?;
+        unsafe {
+            cuvs_check(
+                cuvs_sys::cuvsCagraSerialize(res.0, c_path.as_ptr(), self.0, include_dataset),
+                "cuvsCagraSerialize",
+            )
+        }
+    }
+
+    fn deserialize(&self, res: &cuvs::Resources, path: &str) -> Result<(), String> {
+        let c_path = std::ffi::CString::new(path).map_err(|e| format!("path contains NUL: {e}"))?;
+        unsafe {
+            cuvs_check(
+                cuvs_sys::cuvsCagraDeserialize(res.0, c_path.as_ptr(), self.0),
+                "cuvsCagraDeserialize",
+            )
+        }
+    }
+}
+
+impl Drop for CagraIndex {
+    fn drop(&mut self) {
+        unsafe {
+            // Ignore destroy errors during drop — there's nothing useful to do
+            // and the Rust crate does the same dance.
+            let _ = cuvs_sys::cuvsCagraIndexDestroy(self.0);
+        }
+    }
+}
+
+// SAFETY: cuvsCagraIndex_t is a thin pointer to a cuVS-managed struct;
+// the existing CuvsBackend already declares Send/Sync via its res/cuda_alloc.
+unsafe impl Send for CagraIndex {}
+unsafe impl Sync for CagraIndex {}
+
+/// Path of the host-keys sidecar. CAGRA's serializer persists the device-side
+/// dataset and graph but knows nothing about our row-index → user-key mapping
+/// (it uses sequential IDs internally), so we write the keys ourselves next
+/// to the index file.
+fn keys_sidecar_path(handle: &str) -> String {
+    format!("{handle}.keys")
+}
+
+fn write_host_keys(path: &str, keys: &[Key]) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(8 + keys.len() * std::mem::size_of::<Key>());
+    bytes.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+    for &k in keys {
+        bytes.extend_from_slice(&k.to_le_bytes());
+    }
+    std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))
+}
+
+fn read_host_keys(path: &str) -> Result<Vec<Key>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    if bytes.len() < 8 {
+        return Err(format!("{path}: too short for key-count header"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let expected = 8 + count * std::mem::size_of::<Key>();
+    if bytes.len() < expected {
+        return Err(format!("{path}: expected {expected} bytes, got {}", bytes.len()));
+    }
+    let mut keys = Vec::with_capacity(count);
+    for key_index in 0..count {
+        let offset = 8 + key_index * std::mem::size_of::<Key>();
+        keys.push(Key::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()));
+    }
+    Ok(keys)
+}
+
 // #region GpuQueries
 
 /// Typed GPU query buffer, matching the `VectorSlice` enum pattern.
@@ -262,10 +392,10 @@ enum GpuQueries {
 }
 
 impl GpuQueries {
-    fn allocate(dtype: CuvsDtype, shape: &[usize], allocator: CudaAllocator) -> Result<Self, String> {
+    fn allocate(data_type: CuvsDtype, shape: &[usize], allocator: CudaAllocator) -> Result<Self, String> {
         let error = |e| format!("GPU query alloc failed: {e}");
         unsafe {
-            Ok(match dtype {
+            Ok(match data_type {
                 CuvsDtype::F32 => Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
                 CuvsDtype::F16 => Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
                 CuvsDtype::I8 => Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
@@ -299,7 +429,7 @@ struct SearchBuffers {
     neighbors_host: Vec<Key>,
     distances_host: Vec<Distance>,
 
-    /// Reusable host-side buffer for dtype conversion before H2D copy.
+    /// Reusable host-side buffer for data_type conversion before H2D copy.
     query_staging: Vec<u8>,
 
     /// Cached search params — never change between calls.
@@ -312,11 +442,11 @@ impl SearchBuffers {
         num_queries: usize,
         dimensions: usize,
         neighbor_count: usize,
-        dtype: CuvsDtype,
+        data_type: CuvsDtype,
         search_params: cuvs::cagra::SearchParams,
     ) -> Result<Self, String> {
         let error = |e| format!("GPU alloc failed: {e}");
-        let queries = GpuQueries::allocate(dtype, &[num_queries, dimensions], allocator.clone())?;
+        let queries = GpuQueries::allocate(data_type, &[num_queries, dimensions], allocator.clone())?;
         let neighbors = unsafe {
             GpuTensor::<Key>::try_empty_in(&[num_queries, neighbor_count], allocator.clone()).map_err(error)?
         };
@@ -347,7 +477,7 @@ struct Cli {
 
     /// Quantization types (comma-separated): f32, f16, i8, u8
     #[arg(long, value_delimiter = ',', default_value = "f32")]
-    dtype: Vec<String>,
+    data_type: Vec<String>,
 
     /// Distance metric: l2, ip, cos
     #[arg(long, value_delimiter = ',', default_value = "l2")]
@@ -421,13 +551,13 @@ pub struct CuvsBackend {
     // GPU resources that depend on `res` are declared BEFORE `res`
     // so they drop first (Rust drops fields in declaration order).
     search_buffers: UnsafeCell<Option<SearchBuffers>>,
-    index: UnsafeCell<Option<cuvs::cagra::Index>>,
+    index: UnsafeCell<Option<CagraIndex>>,
 
     res: cuvs::Resources,
     cuda_alloc: CudaAllocator,
     dimensions: usize,
     metric: DistanceType,
-    dtype: CuvsDtype,
+    data_type: CuvsDtype,
     graph_degree: usize,
     intermediate_graph_degree: usize,
     build_algo: cuvs_sys::cuvsCagraGraphBuildAlgo,
@@ -463,7 +593,7 @@ impl CuvsBackend {
         num_random_samplings: u32,
     ) -> Result<Self, String> {
         let metric = parse_metric(metric_name)?;
-        let dtype = CuvsDtype::from_str(dtype_name)?;
+        let data_type = CuvsDtype::from_str(dtype_name)?;
         let build_algo = parse_build_algo(build_algo_name)?;
         let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
         let cuda_alloc = CudaAllocator(res.0);
@@ -471,13 +601,14 @@ impl CuvsBackend {
         let description = format!(
             "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} gd={graph_degree} \u{b7} \
              igd={intermediate_graph_degree} \u{b7} itopk={itopk_size} \u{b7} sw={search_width}",
-            dtype.as_str(),
+            data_type.as_str(),
         );
 
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("backend".into(), json!("cuvs-cagra"));
-        metadata.insert("dtype".into(), json!(dtype.as_str()));
+        metadata.insert("data_type".into(), json!(data_type.as_str()));
         metadata.insert("metric".into(), json!(metric_label(metric_name)));
+        metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("graph_degree".into(), json!(graph_degree));
         metadata.insert("intermediate_graph_degree".into(), json!(intermediate_graph_degree));
         metadata.insert("itopk_size".into(), json!(itopk_size));
@@ -490,7 +621,7 @@ impl CuvsBackend {
             cuda_alloc,
             dimensions,
             metric,
-            dtype,
+            data_type,
             graph_degree,
             intermediate_graph_degree,
             build_algo,
@@ -501,6 +632,70 @@ impl CuvsBackend {
             num_random_samplings,
             host_vectors: Vec::new(),
             host_keys: Vec::new(),
+            dirty: Cell::new(false),
+            description,
+            metadata,
+        })
+    }
+
+    /// Sibling of `new` for opening a previously-saved CAGRA index. Build-time
+    /// params (`graph_degree`, `intermediate_graph_degree`, `build_algo`) are
+    /// baked into the saved file and ignored on load — they're omitted from
+    /// the call. Search-time knobs (`itopk_size`, `search_width`, etc.) are
+    /// runtime-tunable and pass through to `SearchParams`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        handle: &str,
+        dimensions: usize,
+        dtype_name: &str,
+        metric_name: &str,
+        itopk_size: usize,
+        search_width: usize,
+        min_iterations: usize,
+        max_iterations: usize,
+        num_random_samplings: u32,
+    ) -> Result<Self, String> {
+        let metric = parse_metric(metric_name)?;
+        let data_type = CuvsDtype::from_str(dtype_name)?;
+        let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
+        let cuda_alloc = CudaAllocator(res.0);
+
+        let index = CagraIndex::new()?;
+        index.deserialize(&res, handle)?;
+        let host_keys = read_host_keys(&keys_sidecar_path(handle))?;
+
+        let description = format!(
+            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} itopk={itopk_size} \u{b7} sw={search_width} \u{b7} loaded[{handle}]",
+            data_type.as_str(),
+        );
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("backend".into(), json!("cuvs-cagra"));
+        metadata.insert("data_type".into(), json!(data_type.as_str()));
+        metadata.insert("metric".into(), json!(metric_label(metric_name)));
+        metadata.insert("dimensions".into(), json!(dimensions));
+        metadata.insert("itopk_size".into(), json!(itopk_size));
+        metadata.insert("search_width".into(), json!(search_width));
+        metadata.insert("loaded_from".into(), json!(handle));
+
+        Ok(Self {
+            search_buffers: UnsafeCell::new(None),
+            index: UnsafeCell::new(Some(index)),
+            res,
+            cuda_alloc,
+            dimensions,
+            metric,
+            data_type,
+            graph_degree: 0,
+            intermediate_graph_degree: 0,
+            build_algo: cuvs_sys::cuvsCagraGraphBuildAlgo::AUTO_SELECT,
+            itopk_size,
+            search_width,
+            min_iterations,
+            max_iterations,
+            num_random_samplings,
+            host_vectors: Vec::new(),
+            host_keys,
             dirty: Cell::new(false),
             description,
             metadata,
@@ -537,12 +732,12 @@ impl CuvsBackend {
         let dimensions = self.dimensions;
         let mut shape = [num_vectors as i64, dimensions as i64];
 
-        let host_dl = unsafe {
+        let mut host_dl = unsafe {
             dl_tensor(
                 self.host_vectors.as_ptr() as *mut _,
                 shape.as_mut_ptr(),
                 2,
-                self.dtype.dl_type(),
+                self.data_type.dl_type(),
                 false,
             )
         };
@@ -554,9 +749,8 @@ impl CuvsBackend {
             .set_build_algo(self.build_algo);
         unsafe { (*build_params.0).metric = self.metric };
 
-        let managed = unsafe { as_managed(host_dl) };
-        let index = cuvs::cagra::Index::build(&self.res, &build_params, managed)
-            .map_err(|e| format!("cuVS CAGRA build failed: {e}"))?;
+        let index = CagraIndex::new()?;
+        index.build(&self.res, build_params.0, &mut host_dl)?;
 
         unsafe { *self.index.get() = Some(index) };
         self.dirty.set(false);
@@ -608,7 +802,7 @@ impl Backend for CuvsBackend {
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let f32_data = vectors.data.to_f32();
-        self.dtype.convert_from_f32(&f32_data, &mut self.host_vectors);
+        self.data_type.convert_from_f32(&f32_data, &mut self.host_vectors);
         self.host_keys.extend_from_slice(keys);
         self.dirty.set(true);
         Ok(())
@@ -637,16 +831,16 @@ impl Backend for CuvsBackend {
                 num_queries,
                 queries.dimensions,
                 count,
-                self.dtype,
+                self.data_type,
                 search_params,
             )?);
         }
         let buffers = buffers.as_mut().unwrap();
 
-        // Upload queries to GPU. For f32 dtype, copy directly from the source
+        // Upload queries to GPU. For f32 data_type, copy directly from the source
         // data without an intermediate staging buffer.
         let query_f32 = queries.data.to_f32();
-        if matches!(self.dtype, CuvsDtype::F32) {
+        if matches!(self.data_type, CuvsDtype::F32) {
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     query_f32.as_ptr() as *const u8,
@@ -656,56 +850,50 @@ impl Backend for CuvsBackend {
             unsafe { self.host_to_device(bytes, buffers.queries.as_mut_ptr())? };
         } else {
             buffers.query_staging.clear();
-            self.dtype.convert_from_f32(&query_f32, &mut buffers.query_staging);
+            self.data_type.convert_from_f32(&query_f32, &mut buffers.query_staging);
             unsafe { self.host_to_device(&buffers.query_staging, buffers.queries.as_mut_ptr())? };
         }
 
         // Non-owning DLPack views over the pre-allocated GpuTensor memory.
-        // Transmuted to ManagedTensor for the safe API; forgotten after use
-        // so Drop doesn't touch the GpuTensor-owned allocations.
-        let queries_managed = unsafe {
-            as_managed(dl_tensor(
+        // We pass raw `*mut DLManagedTensor` pointers into cuvs-sys directly,
+        // so there's no `cuvs::ManagedTensor` wrapper to mem::forget afterward.
+        let mut queries_dl = unsafe {
+            dl_tensor(
                 buffers.queries.as_mut_ptr(),
                 buffers.queries_shape.as_mut_ptr(),
                 2,
-                self.dtype.dl_type(),
+                self.data_type.dl_type(),
                 true,
-            ))
+            )
         };
-        let neighbors_managed = unsafe {
-            as_managed(dl_tensor(
+        let mut neighbors_dl = unsafe {
+            dl_tensor(
                 buffers.neighbors.as_mut_ptr() as _,
                 buffers.neighbors_shape.as_mut_ptr(),
                 2,
                 dl_key(),
                 true,
-            ))
+            )
         };
-        let distances_managed = unsafe {
-            as_managed(dl_tensor(
+        let mut distances_dl = unsafe {
+            dl_tensor(
                 buffers.distances.as_mut_ptr() as _,
                 buffers.distances_shape.as_mut_ptr(),
                 2,
                 dl_distance(),
                 true,
-            ))
+            )
         };
 
         let index = unsafe { &*self.index.get() }.as_ref().ok_or("index not built")?;
 
-        index
-            .search(
-                &self.res,
-                &buffers.search_params,
-                &queries_managed,
-                &neighbors_managed,
-                &distances_managed,
-            )
-            .map_err(|e| format!("cuVS CAGRA search failed: {e}"))?;
-
-        std::mem::forget(queries_managed);
-        std::mem::forget(neighbors_managed);
-        std::mem::forget(distances_managed);
+        index.search(
+            &self.res,
+            buffers.search_params.0,
+            &mut queries_dl,
+            &mut neighbors_dl,
+            &mut distances_dl,
+        )?;
 
         // D2H copy results.
         unsafe {
@@ -738,9 +926,19 @@ impl Backend for CuvsBackend {
     fn memory_bytes(&self) -> usize {
         let num_vectors = self.host_keys.len();
         let host_bytes = self.host_vectors.len() + num_vectors * std::mem::size_of::<Key>();
-        let gpu_bytes = num_vectors * self.dimensions * self.dtype.bytes_per_element()
+        let gpu_bytes = num_vectors * self.dimensions * self.data_type.bytes_per_element()
             + num_vectors * self.graph_degree * std::mem::size_of::<u32>();
         host_bytes + gpu_bytes
+    }
+
+    fn save(&self, handle: &str) -> Result<(), String> {
+        // Serialize even if the index hasn't been built yet (no-op for an
+        // empty index would be an error from CAGRA — caller must call save
+        // after at least one search/build cycle).
+        let index_ref = unsafe { &*self.index.get() };
+        let index = index_ref.as_ref().ok_or("CAGRA index not built — nothing to save")?;
+        index.serialize(&self.res, handle, /*include_dataset=*/ true)?;
+        write_host_keys(&keys_sidecar_path(handle), &self.host_keys)
     }
 }
 
@@ -749,43 +947,72 @@ impl Backend for CuvsBackend {
 fn main() {
     let cli = Cli::parse();
 
-    let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1);
-    });
-    let dimensions = state.dimensions();
+    let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| bail(&format!("{e}")));
+    let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
-    for (dtype, metric, graph_degree, intermediate_graph_degree, itopk_size, search_width) in iproduct!(
-        &cli.dtype,
+    cli.common.ensure_single_config(&[
+        dimensions_sweep.len(),
+        cli.data_type.len(),
+        cli.metric.len(),
+        cli.graph_degree.len(),
+        cli.intermediate_graph_degree.len(),
+        cli.itopk_size.len(),
+        cli.search_width.len(),
+    ]);
+
+    let mut summary = SweepSummary::default();
+    for (&dimensions, data_type, metric, graph_degree, intermediate_graph_degree, itopk_size, search_width) in iproduct!(
+        &dimensions_sweep,
+        &cli.data_type,
         &cli.metric,
         &cli.graph_degree,
         &cli.intermediate_graph_degree,
         &cli.itopk_size,
         &cli.search_width
     ) {
-        let mut backend = CuvsBackend::new(
-            dimensions,
-            dtype,
-            metric,
-            *graph_degree,
-            *intermediate_graph_degree,
-            &cli.build_algo,
-            *itopk_size,
-            *search_width,
-            cli.min_iterations,
-            cli.max_iterations,
-            cli.num_random_samplings,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        state
+            .check_dimensions(dimensions)
+            .unwrap_or_else(|e| bail(&format!("invalid --dimensions: {e}")));
 
-        run(&mut backend, &mut state).unwrap_or_else(|e| {
-            eprintln!("Benchmark failed: {e}");
-            std::process::exit(1);
-        });
+        let description = format!(
+            "cuvs-cagra · {data_type} · {metric} · d={dimensions} · gd={graph_degree} · igd={intermediate_graph_degree} · itopk={itopk_size} · sw={search_width}"
+        );
+
+        summary.record(run_config(
+            &description,
+            cli.common.index.as_deref(),
+            || {
+                CuvsBackend::new(
+                    dimensions,
+                    data_type,
+                    metric,
+                    *graph_degree,
+                    *intermediate_graph_degree,
+                    &cli.build_algo,
+                    *itopk_size,
+                    *search_width,
+                    cli.min_iterations,
+                    cli.max_iterations,
+                    cli.num_random_samplings,
+                )
+            },
+            |h| {
+                CuvsBackend::load(
+                    h,
+                    dimensions,
+                    data_type,
+                    metric,
+                    *itopk_size,
+                    *search_width,
+                    cli.min_iterations,
+                    cli.max_iterations,
+                    cli.num_random_samplings,
+                )
+            },
+            &mut state,
+            dimensions,
+        ));
     }
 
-    eprintln!("Benchmark complete.");
+    summary.print();
 }

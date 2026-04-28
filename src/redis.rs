@@ -82,7 +82,7 @@ fn parse_redis_dtype(s: &str) -> Result<RedisDtype, String> {
             bytes_per_element: 1,
         }),
         _ => Err(format!(
-            "unknown Redis dtype: {s} (supported on Redis 8+: f32, f64, f16, bf16, u8, i8)"
+            "unknown Redis data_type: {s} (supported on Redis 8+: f32, f64, f16, bf16, u8, i8)"
         )),
     }
 }
@@ -92,8 +92,8 @@ fn parse_redis_dtype(s: &str) -> Result<RedisDtype, String> {
 /// `numkong::cast` from the source to the target type. Row bytes are served by indexing into the
 /// stored buffer — `Cmd::write_arg` already memcpys into its own data buffer, so we hand it a
 /// borrowed `&[u8]` and skip the per-row `Vec<u8>` the earlier design allocated.
-enum EncodedBatch<'src> {
-    Identity(&'src [u8]),
+enum EncodedBatch<'source> {
+    Identity(&'source [u8]),
     CastF32(Vec<f32>),
     CastF64(Vec<f64>),
     CastF16(Vec<numkong::f16>),
@@ -126,20 +126,20 @@ impl EncodedBatch<'_> {
 /// for the whole batch and hand it to `numkong::cast` once; every row is then a borrow into the
 /// owned buffer. Replaces the earlier per-row shape that allocated `2 × num_rows` vectors per
 /// pipeline and round-tripped through `f32` even when source and target matched.
-fn encode_batch<'src>(
-    dtype: RedisDtype,
-    source: &'src VectorSlice<'_>,
+fn encode_batch<'source>(
+    data_type: RedisDtype,
+    source: &'source VectorSlice<'_>,
     start_row: usize,
     num_rows: usize,
     dimensions: usize,
-) -> EncodedBatch<'src> {
+) -> EncodedBatch<'source> {
     let elements = num_rows * dimensions;
     let start = start_row * dimensions;
     let end = start + elements;
 
     // Zero-copy identity paths: the source slice is already in the wire format Redis wants.
     // SAFETY: element types are POD, dense-packed row-major.
-    match (source, dtype.token) {
+    match (source, data_type.token) {
         (VectorSlice::F32(data), "FLOAT32") => {
             return EncodedBatch::Identity(unsafe { pod_slice_as_bytes(&data[start..end]) })
         }
@@ -152,15 +152,15 @@ fn encode_batch<'src>(
     }
 
     // Cast path: one `numkong::cast` from source element type straight to target type. No f32 hop
-    // even when source ≠ f32 (i.e. `.u8bin` + `--dtype f16` goes u8 → f16 directly).
-    match dtype.token {
+    // even when source ≠ f32 (i.e. `.u8bin` + `--data_type f16` goes u8 → f16 directly).
+    match data_type.token {
         "FLOAT32" => EncodedBatch::CastF32(cast_batch(source, start, end, elements)),
         "FLOAT64" => EncodedBatch::CastF64(cast_batch(source, start, end, elements)),
         "FLOAT16" => EncodedBatch::CastF16(cast_batch(source, start, end, elements)),
         "BFLOAT16" => EncodedBatch::CastBF16(cast_batch(source, start, end, elements)),
         "UINT8" => EncodedBatch::CastU8(cast_batch(source, start, end, elements)),
         "INT8" => EncodedBatch::CastI8(cast_batch(source, start, end, elements)),
-        token => unreachable!("unknown Redis dtype token {token}"),
+        token => unreachable!("unknown Redis data_type token {token}"),
     }
 }
 
@@ -205,7 +205,7 @@ struct Cli {
     /// FT.CREATE VECTOR TYPE (comma-separated for sweep): f32, f64, f16, bf16, u8, i8
     /// (requires Redis 8+ for anything other than f32/f64/f16/bf16)
     #[arg(long, value_delimiter = ',', default_value = "f32")]
-    dtype: Vec<String>,
+    data_type: Vec<String>,
 
     #[arg(long, default_value_t = 16)]
     connectivity: usize,
@@ -232,7 +232,7 @@ struct RedisBackend {
     container: Option<ContainerHandle>,
     runtime: tokio::runtime::Handle,
     batch_size: usize,
-    dtype: RedisDtype,
+    data_type: RedisDtype,
     description: String,
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -251,12 +251,12 @@ impl Backend for RedisBackend {
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
         let dimensions = vectors.dimensions;
         let num_vectors = vectors.len();
-        let bytes_per_row = dimensions * self.dtype.bytes_per_element;
+        let bytes_per_row = dimensions * self.data_type.bytes_per_element;
 
         for batch_start in (0..num_vectors).step_by(self.batch_size) {
             let batch_end = (batch_start + self.batch_size).min(num_vectors);
             let batch_rows = batch_end - batch_start;
-            let encoded = encode_batch(self.dtype, &vectors.data, batch_start, batch_rows, dimensions);
+            let encoded = encode_batch(self.data_type, &vectors.data, batch_start, batch_rows, dimensions);
 
             let mut pipe = redis::pipe();
             for row_within_batch in 0..batch_rows {
@@ -284,15 +284,15 @@ impl Backend for RedisBackend {
     ) -> Result<(), String> {
         let dimensions = queries.dimensions;
         let num_vectors = queries.len();
-        let bytes_per_row = dimensions * self.dtype.bytes_per_element;
+        let bytes_per_row = dimensions * self.data_type.bytes_per_element;
         let query_str = format!("*=>[KNN {count} @vector $BLOB]");
 
         // FT.SEARCH is one request per query (no pipelining for vector search), so encode the whole
         // query batch once and index into it per iteration — single allocation for num_vectors rows.
-        let encoded = encode_batch(self.dtype, &queries.data, 0, num_vectors, dimensions);
+        let encoded = encode_batch(self.data_type, &queries.data, 0, num_vectors, dimensions);
 
-        for q in 0..num_vectors {
-            let query_bytes = encoded.row_bytes(q, bytes_per_row);
+        for query_index in 0..num_vectors {
+            let query_bytes = encoded.row_bytes(query_index, bytes_per_row);
 
             let raw: redis::Value = redis::cmd("FT.SEARCH")
                 .arg(INDEX_NAME)
@@ -312,18 +312,18 @@ impl Backend for RedisBackend {
                 .query(&mut *self.connection.borrow_mut())
                 .map_err(|e| format!("FT.SEARCH failed: {e}"))?;
 
-            let offset = q * count;
+            let offset = query_index * count;
             let pairs = parse_ft_search(&raw);
             let found = pairs.len().min(count);
-            for (j, (id, score)) in pairs.iter().enumerate().take(count) {
-                out_keys[offset + j] = *id;
-                out_distances[offset + j] = *score;
+            for (rank, (id, score)) in pairs.iter().enumerate().take(count) {
+                out_keys[offset + rank] = *id;
+                out_distances[offset + rank] = *score;
             }
-            for j in found..count {
-                out_keys[offset + j] = Key::MAX;
-                out_distances[offset + j] = Distance::INFINITY;
+            for rank in found..count {
+                out_keys[offset + rank] = Key::MAX;
+                out_distances[offset + rank] = Distance::INFINITY;
             }
-            out_counts[q] = found;
+            out_counts[query_index] = found;
         }
         Ok(())
     }
@@ -393,7 +393,7 @@ fn main() {
     for m in &cli.metric {
         parse_redis_metric(m).unwrap_or_else(|e| bail(&e));
     }
-    for d in &cli.dtype {
+    for d in &cli.data_type {
         parse_redis_dtype(d).unwrap_or_else(|e| bail(&e));
     }
 
@@ -418,17 +418,23 @@ fn main() {
         eprintln!("Failed to load benchmark state: {e}");
         std::process::exit(1);
     });
-    let dimensions = state.dimensions();
+    if cli.common.dimensions.len() > 1 {
+        retrieval::bail("--dimensions sweep with >1 value isn't supported on Redis; rerun the binary per dimensions");
+    }
+    let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
 
     let redis_url = format!("redis://localhost:{}/", cli.port);
     let client = redis::Client::open(redis_url.as_str()).expect("redis client");
 
     let mut container_slot = Some(handle);
-    let num_configs = cli.metric.len() * cli.dtype.len();
-    for (idx, (metric_str, dtype_str)) in iproduct!(&cli.metric, &cli.dtype).enumerate() {
+    let num_configs = cli.metric.len() * cli.data_type.len();
+    for (idx, (metric_str, dtype_str)) in iproduct!(&cli.metric, &cli.data_type).enumerate() {
         let is_last = idx + 1 == num_configs;
         let metric = parse_redis_metric(metric_str).expect("metric validated above");
-        let dtype = parse_redis_dtype(dtype_str).expect("dtype validated above");
+        let data_type = parse_redis_dtype(dtype_str).expect("data_type validated above");
 
         let mut conn = client.get_connection().expect("redis connection");
         let _: () = redis::cmd("FLUSHALL").query(&mut conn).expect("FLUSHALL");
@@ -445,7 +451,7 @@ fn main() {
             .arg("HNSW")
             .arg("10")
             .arg("TYPE")
-            .arg(dtype.token)
+            .arg(data_type.token)
             .arg("DIM")
             .arg(dimensions)
             .arg("DISTANCE_METRIC")
@@ -464,24 +470,24 @@ fn main() {
             container: container_for_this_run,
             runtime: runtime.handle().clone(),
             batch_size: cli.batch_size,
-            dtype,
+            data_type,
             description: format!(
-                "redis · {metric_str} · dtype={dtype_str} · M={} · ef={} · {dimensions}d",
+                "redis · {metric_str} · data_type={dtype_str} · M={} · ef={} · {dimensions}d",
                 cli.connectivity, cli.expansion_add,
             ),
             metadata: {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("backend".into(), json!("redis"));
                 metadata.insert("metric".into(), json!(metric_str));
-                metadata.insert("dtype".into(), json!(dtype_str));
-                metadata.insert("bytes_per_element".into(), json!(dtype.bytes_per_element));
+                metadata.insert("data_type".into(), json!(dtype_str));
+                metadata.insert("bytes_per_element".into(), json!(data_type.bytes_per_element));
                 metadata.insert("connectivity".into(), json!(cli.connectivity));
                 metadata.insert("expansion_add".into(), json!(cli.expansion_add));
                 metadata
             },
         };
 
-        run(&mut backend, &mut state).unwrap_or_else(|e| {
+        run(&mut backend, &mut state, dimensions).unwrap_or_else(|e| {
             eprintln!("Benchmark failed: {e}");
             std::process::exit(1);
         });

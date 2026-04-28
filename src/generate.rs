@@ -438,9 +438,9 @@ struct Cli {
 /// format produced by Meta / Microsoft / Yandex for `.fbin`, `.u8bin`,
 /// `.i8bin`, `.b1bin`, and `.ibin` files.
 #[allow(dead_code)]
-fn write_bin_header(file: &mut std::fs::File, rows: u32, dims: u32) -> std::io::Result<()> {
+fn write_bin_header(file: &mut std::fs::File, rows: u32, dimensions: u32) -> std::io::Result<()> {
     file.write_all(&rows.to_le_bytes())?;
-    file.write_all(&dims.to_le_bytes())
+    file.write_all(&dimensions.to_le_bytes())
 }
 
 /// Generate `count` clustered binary vectors row-major in `[count, bytes_per_vector]` layout.
@@ -483,7 +483,7 @@ fn generate_clustered_binary(
     base_bytes
 }
 
-/// Generate `count` row-major Gaussian f32 vectors of dimension `dims`,
+/// Generate `count` row-major Gaussian f32 vectors of dimension `dimensions`,
 /// drawn from the standard normal distribution (mean 0, variance 1).
 ///
 /// # Algorithm
@@ -501,17 +501,17 @@ fn generate_clustered_binary(
 ///
 /// # Output shape
 ///
-/// `Vec<f32>` of length `count * dims`, row-major: row `i` occupies
-/// `data[i * dims .. (i + 1) * dims]`. Matches the `.fbin` file layout that
+/// `Vec<f32>` of length `count * dimensions`, row-major: row `i` occupies
+/// `data[i * dimensions .. (i + 1) * dimensions]`. Matches the `.fbin` file layout that
 /// follows this function's output.
 ///
 /// # Odd-length tail
 ///
-/// If `count * dims` is odd, one extra Box–Muller pair is generated and
+/// If `count * dimensions` is odd, one extra Box–Muller pair is generated and
 /// the second sample is discarded. Costs one surplus `ln/sqrt/cos`.
 #[allow(dead_code)]
-fn generate_gaussian_f32(rng: &mut StdRng, count: usize, dims: usize) -> Vec<f32> {
-    let scalar_count = count * dims;
+fn generate_gaussian_f32(rng: &mut StdRng, count: usize, dimensions: usize) -> Vec<f32> {
+    let scalar_count = count * dimensions;
     let mut base_bytes = vec![0f32; scalar_count];
     let mut cursor = 0;
     while cursor + 1 < scalar_count {
@@ -621,7 +621,7 @@ fn run_fbin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = StdRng::seed_from_u64(cli.seed);
 
     eprintln!(
-        "Generating {} base vectors (f32, {} dims)...",
+        "Generating {} base vectors (f32, {} dimensions)...",
         cli.base_count, cli.dimensions
     );
     let base = generate_gaussian_f32(&mut rng, cli.base_count, cli.dimensions);

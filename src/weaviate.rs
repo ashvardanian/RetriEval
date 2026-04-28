@@ -128,14 +128,14 @@ impl Backend for WeaviateBackend {
         let dimensions = vectors.dimensions;
         let num_vectors = data.len() / dimensions;
         self.runtime.block_on(async {
-            for i in 0..num_vectors {
+            for vector_index in 0..num_vectors {
                 // Weaviate community crate requires Vec<f64> by ownership — allocation unavoidable
-                let vec: Vec<f64> = data[i * dimensions..(i + 1) * dimensions]
+                let row: Vec<f64> = data[vector_index * dimensions..(vector_index + 1) * dimensions]
                     .iter()
-                    .map(|&x| x as f64)
+                    .map(|&value| value as f64)
                     .collect();
-                let obj = Object::builder(CLASS_NAME, serde_json::json!({ "idx": keys[i] as i64 }))
-                    .with_vector(vec)
+                let obj = Object::builder(CLASS_NAME, serde_json::json!({ "idx": keys[vector_index] as i64 }))
+                    .with_vector(row)
                     .build();
                 self.client
                     .objects
@@ -160,10 +160,10 @@ impl Backend for WeaviateBackend {
         let num_vectors = data.len() / dimensions;
 
         self.runtime.block_on(async {
-            for q in 0..num_vectors {
-                let query: Vec<f64> = data[q * dimensions..(q + 1) * dimensions]
+            for query_index in 0..num_vectors {
+                let query: Vec<f64> = data[query_index * dimensions..(query_index + 1) * dimensions]
                     .iter()
-                    .map(|&x| x as f64)
+                    .map(|&value| value as f64)
                     .collect();
                 let gql = format!(
                     "{{ Get {{ {CLASS_NAME}(nearVector: {{ vector: {query:?} }} limit: {count}) \
@@ -176,30 +176,30 @@ impl Backend for WeaviateBackend {
                     .await
                     .map_err(|e| format!("Weaviate query failed: {e}"))?;
 
-                let offset = q * count;
+                let offset = query_index * count;
                 let mut found = 0;
                 if let Some(items) = response
                     .pointer(&format!("/data/Get/{CLASS_NAME}"))
                     .and_then(|v| v.as_array())
                 {
-                    for (j, item) in items.iter().enumerate().take(count) {
-                        let idx = item.get("idx").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    for (rank, item) in items.iter().enumerate().take(count) {
+                        let stored_index = item.get("idx").and_then(|v| v.as_i64()).unwrap_or(-1);
                         let distance_value = item
                             .pointer("/_additional/distance")
                             .and_then(|d| d.as_f64())
                             .unwrap_or(f64::INFINITY) as f32;
-                        out_keys[offset + j] = if idx >= 0 { idx as Key } else { Key::MAX };
-                        out_distances[offset + j] = distance_value;
-                        if idx >= 0 {
+                        out_keys[offset + rank] = if stored_index >= 0 { stored_index as Key } else { Key::MAX };
+                        out_distances[offset + rank] = distance_value;
+                        if stored_index >= 0 {
                             found += 1;
                         }
                     }
                 }
-                for j in found..count {
-                    out_keys[offset + j] = Key::MAX;
-                    out_distances[offset + j] = Distance::INFINITY;
+                for rank in found..count {
+                    out_keys[offset + rank] = Key::MAX;
+                    out_distances[offset + rank] = Distance::INFINITY;
                 }
-                out_counts[q] = found;
+                out_counts[query_index] = found;
             }
             Ok::<(), String>(())
         })
@@ -297,8 +297,8 @@ fn main() {
     for m in &cli.metric {
         parse_weaviate_distance(m).unwrap_or_else(|e| bail(&e));
     }
-    for q in &cli.quantization {
-        parse_weaviate_quantization(q).unwrap_or_else(|e| bail(&e));
+    for quantization in &cli.quantization {
+        parse_weaviate_quantization(quantization).unwrap_or_else(|e| bail(&e));
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -337,7 +337,13 @@ fn main() {
         eprintln!("Failed to load benchmark state: {e}");
         std::process::exit(1);
     });
-    let dimensions = state.dimensions();
+    if cli.common.dimensions.len() > 1 {
+        retrieval::bail("--dimensions sweep with >1 value isn't supported on Weaviate; rerun the binary per dimensions");
+    }
+    let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
 
     let mut container_slot = Some(handle);
     let num_configs = cli.metric.len() * cli.quantization.len();
@@ -382,7 +388,7 @@ fn main() {
             },
         };
 
-        run(&mut backend, &mut state).unwrap_or_else(|e| {
+        run(&mut backend, &mut state, dimensions).unwrap_or_else(|e| {
             eprintln!("Benchmark failed: {e}");
             std::process::exit(1);
         });

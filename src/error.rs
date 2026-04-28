@@ -11,7 +11,7 @@
 //! - [`GroundTruthError`] — brute-force top-K computation (shape, stride,
 //!   thread-pool spawn, NumKong tensor errors).
 //! - [`BackendError`] — USearch, FAISS, Qdrant, Redis, Weaviate, LanceDB,
-//!   cuVS engine-level failures (unknown metric/dtype/op).
+//!   cuVS engine-level failures (unknown metric/data_type/op).
 //! - [`PerfCountersError`] — Linux `perf_event_open` permission /
 //!   unsupported-target paths.
 //! - [`DownloadError`] — Parquet shard fetch, HTTP status, schema mismatch.
@@ -30,7 +30,7 @@ use std::path::PathBuf;
 /// file failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DatasetError {
-    /// File shorter than the 8-byte `<rows: u32 LE><dims: u32 LE>` header.
+    /// File shorter than the 8-byte `<rows: u32 LE><dimensions: u32 LE>` header.
     #[error("{path:?}: {kind} header too small (got {got} bytes, need at least 8)")]
     HeaderTooSmall {
         path: PathBuf,
@@ -42,15 +42,29 @@ pub enum DatasetError {
     #[error("{path:?}: unsupported file extension `.{extension}` (expected fbin/u8bin/i8bin/b1bin)")]
     UnsupportedExtension { path: PathBuf, extension: String },
 
-    /// File body shorter than the `rows * dims * scalar_size` declared in
+    /// File body shorter than the `rows * dimensions * scalar_size` declared in
     /// the header.
-    #[error("{path:?}: body too small — expected {expected} bytes for {rows}x{dims}, got {got}")]
+    #[error("{path:?}: body too small — expected {expected} bytes for {rows}x{dimensions}, got {got}")]
     BodyTooSmall {
         path: PathBuf,
         expected: u64,
         rows: u32,
-        dims: u32,
+        dimensions: u32,
         got: u64,
+    },
+
+    /// Matryoshka truncation request invalid: 0, larger than the file's
+    /// native dimensionality, or — for `b1bin` — not a multiple of 8.
+    #[error("invalid truncation: requested {requested} dimensions (native {native}; B1x8 must be 8-aligned)")]
+    InvalidTruncation { requested: usize, native: usize },
+
+    /// A glob expansion produced shards with mismatched dimensionality or
+    /// scalar format. All shards in one logical dataset must agree.
+    #[error("{path:?}: shard dimensions {got_dims} doesn't match earlier shards' dimensions {expected_dims}")]
+    ShardMismatch {
+        path: PathBuf,
+        expected_dims: u32,
+        got_dims: u32,
     },
 
     #[error(transparent)]
@@ -119,8 +133,8 @@ pub enum BackendError {
     #[error("{backend}: unknown metric `{value}`")]
     UnknownMetric { backend: &'static str, value: String },
 
-    /// Unknown scalar-type string (e.g. `--dtype foo`).
-    #[error("{backend}: unknown dtype `{value}`")]
+    /// Unknown scalar-type string (e.g. `--data_type foo`).
+    #[error("{backend}: unknown data_type `{value}`")]
     UnknownDtype { backend: &'static str, value: String },
 
     /// Engine-internal operation failure — `add`, `search`, `create`, etc.
@@ -162,10 +176,7 @@ pub enum PerfCountersError {
 pub enum DownloadError {
     /// HTTP GET returned a non-success status.
     #[error("GET {url} → {status}")]
-    HttpStatus {
-        url: String,
-        status: reqwest::StatusCode,
-    },
+    HttpStatus { url: String, status: reqwest::StatusCode },
 
     /// Parquet column we need isn't in the shard's schema.
     #[error("parquet schema missing column `{column}` — wrong source?")]

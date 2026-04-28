@@ -5011,6 +5011,7 @@ dependencies = [
  "fork_union",
  "futures",
  "futures-util",
+ "glob",
  "indicatif",
  "itertools 0.14.0",
  "lancedb",
@@ -6330,8 +6331,8 @@ dependencies = [
 
 [[package]]
 name = "usearch"
-version = "2.25.1"
-source = "git+https://github.com/unum-cloud/usearch.git?branch=main-dev#16681be080bb203270d8f8e1562f90897b06a08e"
+version = "2.25.2"
+source = "git+https://github.com/unum-cloud/usearch.git?branch=main-dev#29e527731957b4bcbb490634d838fa4dcde07e58"
 dependencies = [
  "cxx",
  "cxx-build",

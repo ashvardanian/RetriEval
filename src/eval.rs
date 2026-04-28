@@ -17,14 +17,14 @@ pub fn recall_at_k(
 
     let mut hits = 0usize;
 
-    for (query_idx, &found_count) in out_counts[..num_queries].iter().enumerate() {
-        let ground_truth_neighbors = ground_truth.neighbors(query_idx);
+    for (query_index, &found_count) in out_counts[..num_queries].iter().enumerate() {
+        let ground_truth_neighbors = ground_truth.neighbors(query_index);
         if ground_truth_neighbors.is_empty() {
             continue;
         }
         let true_nearest = ground_truth_neighbors[0];
 
-        let offset = query_idx * max_count;
+        let offset = query_index * max_count;
         let found = found_count.min(k);
         if out_keys[offset..offset + found].contains(&true_nearest) {
             hits += 1;
@@ -59,10 +59,10 @@ pub fn ndcg_at_k(
     let discount = discount_table(k);
     let mut total_ndcg = 0.0;
 
-    for (query_idx, &found_count) in out_counts[..num_queries].iter().enumerate() {
-        let ground_truth_neighbors = ground_truth.neighbors(query_idx);
+    for (query_index, &found_count) in out_counts[..num_queries].iter().enumerate() {
+        let ground_truth_neighbors = ground_truth.neighbors(query_index);
         let ground_truth_count = ground_truth_neighbors.len().min(k);
-        let offset = query_idx * max_count;
+        let offset = query_index * max_count;
         let found = found_count.min(k);
         let results = &out_keys[offset..offset + found];
 

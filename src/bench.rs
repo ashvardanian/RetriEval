@@ -112,6 +112,13 @@ pub trait Backend: Send {
         out_counts: &mut [usize],
     ) -> Result<(), String>;
     fn memory_bytes(&self) -> usize;
+
+    /// Persist the index under `handle`. For embedded backends `handle` is a
+    /// filesystem path; for server-style backends it's a collection / table /
+    /// index name. Default returns Err so backends opt in by overriding.
+    fn save(&self, _handle: &str) -> Result<(), String> {
+        Err("--index: save not yet implemented for this backend".into())
+    }
 }
 
 // #region Utilities
@@ -135,11 +142,11 @@ pub unsafe fn pod_slice_as_bytes<T: Copy>(slice: &[T]) -> &[u8] {
 pub fn format_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
+    for (char_index, character) in s.chars().enumerate() {
+        if char_index > 0 && (s.len() - char_index).is_multiple_of(3) {
             result.push(',');
         }
-        result.push(c);
+        result.push(character);
     }
     result
 }
@@ -189,6 +196,51 @@ pub struct CommonArgs {
     /// Queries and ground truth are unaffected; only the add/permutation range shrinks.
     #[arg(long)]
     pub max_base_vectors: Option<usize>,
+
+    /// Persisted-index handle. For embedded backends (USearch, FAISS, cuVS): a
+    /// filesystem path — if it exists the backend loads it and skips the add
+    /// phase, otherwise the backend builds and saves to it. For server-style
+    /// backends: a collection / table / index name (not yet implemented).
+    /// Requires a single-config sweep — multi-valued sweep axes are rejected
+    /// at startup when `--index` is set.
+    #[arg(long)]
+    pub index: Option<String>,
+
+    /// Matryoshka-style embedding-dimension truncations to evaluate
+    /// (comma-separated). Empty → use the file's native dimensions. Each value must
+    /// be ≤ the native dimensions; for `.b1bin` files each must be a multiple of 8.
+    #[arg(long, value_delimiter = ',')]
+    pub dimensions: Vec<usize>,
+}
+
+impl CommonArgs {
+    /// Resolve `--dimensions` into a sweep list. Empty CLI input expands to a
+    /// single-element list at the file's native dimensions, so binaries can iterate
+    /// uniformly without special-casing the no-truncation path.
+    pub fn dimensions_sweep(&self, native: usize) -> Vec<usize> {
+        if self.dimensions.is_empty() {
+            vec![native]
+        } else {
+            self.dimensions.clone()
+        }
+    }
+
+    /// When `--index` is set, the sweep must collapse to a single config —
+    /// otherwise multiple builds would write to (or load from) the same file.
+    /// Pass the cardinality of every sweep axis (`dimensions_sweep.len()`,
+    /// `cli.data_type.len()`, …) and this exits with a clear message if their
+    /// product exceeds one. No-op when `--index` is absent.
+    pub fn ensure_single_config(&self, axis_lengths: &[usize]) {
+        if self.index.is_none() {
+            return;
+        }
+        let cardinality: usize = axis_lengths.iter().product();
+        if cardinality > 1 {
+            bail(&format!(
+                "--index requires a single config; got {cardinality} configs from the sweep"
+            ));
+        }
+    }
 }
 
 // #region BenchState
@@ -212,7 +264,12 @@ pub struct BenchState {
     out_distances: Vec<Distance>,
     out_counts: Vec<usize>,
     key_scratch: Vec<Key>,
-    gather_buf: Vec<u8>,
+    /// Shared scratch for `Dataset::gather` (during add) and `Dataset::slice`
+    /// (during search). Add and search are sequential within a step, so a
+    /// single buffer sized at the upper bound is enough. Sized to fit
+    /// `max(batch_size_add, batch_size_search) * native_vector_bytes` —
+    /// covers any truncation since truncated bytes ≤ native.
+    scratch_buf: Vec<u8>,
 }
 
 impl BenchState {
@@ -321,7 +378,11 @@ impl BenchState {
             out_distances: vec![0.0 as Distance; num_queries * search_count],
             out_counts: vec![0usize; num_queries],
             key_scratch: vec![0 as Key; add_chunk_size],
-            gather_buf: vec![0u8; add_chunk_size * dataset.vector_bytes()],
+            scratch_buf: {
+                let max_batch = add_chunk_size.max(args.batch_size_search);
+                let max_row_bytes = dataset.vector_bytes().max(query_dataset.vector_bytes());
+                vec![0u8; max_batch * max_row_bytes]
+            },
             dataset,
             keys,
             query_dataset,
@@ -329,8 +390,18 @@ impl BenchState {
         })
     }
 
+    /// Native dimensions of the base dataset. Truncation is per-call: see
+    /// `run` / `run_search_only`'s `dimensions` argument.
     pub fn dimensions(&self) -> usize {
         self.dataset.dimensions()
+    }
+
+    /// Validate that `dimensions` is a legal exposure for both base and query
+    /// datasets. Used by binaries before kicking off a per-config run.
+    pub fn check_dimensions(&self, dimensions: usize) -> Result<(), DatasetError> {
+        self.dataset.check_dimensions(dimensions)?;
+        self.query_dataset.check_dimensions(dimensions)?;
+        Ok(())
     }
 }
 
@@ -384,7 +455,8 @@ fn stop_and_read_counters(
 
 /// Run the add-phase of one step: insert `step_count` vectors in batches of
 /// `add_chunk_size`, capturing perf counters across the whole phase.
-/// Mutates `vectors_indexed` to the new cumulative count.
+/// Mutates `vectors_indexed` to the new cumulative count. `dimensions` is the
+/// per-vector dimensionality exposed to the backend (≤ native).
 #[allow(clippy::too_many_arguments)]
 fn run_add_phase(
     index: &mut dyn Backend,
@@ -395,6 +467,7 @@ fn run_add_phase(
     step_count: usize,
     total_vectors: usize,
     add_chunk_size: usize,
+    dimensions: usize,
     vectors_indexed: &mut usize,
 ) -> BenchResult<AddPhaseOutcome> {
     let progress = ProgressBar::new(total_vectors as u64);
@@ -409,11 +482,11 @@ fn run_add_phase(
         let logical_offset = step_start + added;
         let indices = state.perm.range(logical_offset, batch);
 
-        for (j, &idx) in indices.iter().enumerate() {
-            state.key_scratch[j] = state.keys.get(idx);
+        for (slot, &row_index) in indices.iter().enumerate() {
+            state.key_scratch[slot] = state.keys.get(row_index);
         }
         let batch_keys = &state.key_scratch[..batch];
-        let vectors = state.dataset.gather(indices, &mut state.gather_buf);
+        let vectors = state.dataset.gather(indices, dimensions, &mut state.scratch_buf);
 
         index.add(batch_keys, vectors)?;
         added += batch;
@@ -456,6 +529,7 @@ fn run_add_phase(
 
 /// Run the search-phase of one step: execute all queries against the current
 /// index, compute recall/NDCG against the ground truth, emit a progress bar.
+/// `dimensions` is the per-vector dimensionality exposed to the backend.
 #[allow(clippy::too_many_arguments)]
 fn run_search_phase(
     index: &dyn Backend,
@@ -466,6 +540,7 @@ fn run_search_phase(
     search_count: usize,
     vectors_indexed: usize,
     total_vectors: usize,
+    dimensions: usize,
     is_final_step: bool,
 ) -> BenchResult<SearchPhaseOutcome> {
     let progress = ProgressBar::new(num_queries as u64);
@@ -477,7 +552,9 @@ fn run_search_phase(
     let mut searched = 0usize;
     while searched < num_queries {
         let batch_count = state.batch_size_search.min(num_queries - searched);
-        let batch_queries = state.query_dataset.slice(searched, batch_count);
+        let batch_queries = state
+            .query_dataset
+            .slice(searched, batch_count, dimensions, &mut state.scratch_buf);
         let key_offset = searched * search_count;
         let key_end = key_offset + batch_count * search_count;
 
@@ -582,8 +659,10 @@ fn save_report(state: &BenchState, metadata: HashMap<String, Value>, steps: Vec<
     Ok(())
 }
 
-/// Run one benchmark configuration. Accumulates steps, writes JSON report at the end.
-pub fn run(index: &mut dyn Backend, state: &mut BenchState) -> BenchResult<()> {
+/// Run one benchmark configuration. Accumulates steps, writes JSON report at
+/// the end. `dimensions` is the per-vector dimensionality this config exposes to
+/// the backend (≤ native dimensions of the underlying datasets).
+pub fn run(index: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
     let total_vectors = state.total_vectors;
     let num_queries = state.query_dataset.rows();
     let search_count = state.ground_truth.neighbors_per_query();
@@ -636,6 +715,7 @@ pub fn run(index: &mut dyn Backend, state: &mut BenchState) -> BenchResult<()> {
             step_count,
             total_vectors,
             add_chunk_size,
+            dimensions,
             &mut vectors_indexed,
         )?;
 
@@ -648,6 +728,7 @@ pub fn run(index: &mut dyn Backend, state: &mut BenchState) -> BenchResult<()> {
             search_count,
             vectors_indexed,
             total_vectors,
+            dimensions,
             is_final_step,
         )?;
 
@@ -687,6 +768,86 @@ pub fn run(index: &mut dyn Backend, state: &mut BenchState) -> BenchResult<()> {
     Ok(())
 }
 
+/// Run one benchmark configuration against a pre-built / loaded index — no
+/// add phase. Emits a single `StepEntry` whose `add_*` fields are zero /
+/// `None`. `dimensions` is the per-vector dimensionality the loaded index expects
+/// (queries are sliced at this dimensions before being handed to `search`).
+pub fn run_search_only(index: &dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
+    let total_vectors = state.total_vectors;
+    let num_queries = state.query_dataset.rows();
+    let search_count = state.ground_truth.neighbors_per_query();
+
+    let description = index.description();
+    let metadata = index.metadata();
+    eprintln!("\n── {description} (search-only) ──");
+
+    let search_style = ProgressStyle::default_bar()
+        .template("  search [{elapsed_precise}] {bar:40.green/blue} {msg}")
+        .unwrap()
+        .progress_chars("##-");
+
+    let mut perf = match perf_counters::PerfCounters::new() {
+        Ok(pc) => {
+            eprintln!("  perf counters: system-wide per-CPU capture enabled");
+            Some(pc)
+        }
+        Err(err) => {
+            eprintln!("  perf counters: unavailable ({err}); running without");
+            None
+        }
+    };
+
+    let search = run_search_phase(
+        index,
+        state,
+        &mut perf,
+        &search_style,
+        num_queries,
+        search_count,
+        total_vectors,
+        total_vectors,
+        dimensions,
+        true,
+    )?;
+
+    // Recall normalization assumes the index covers the whole base; for
+    // search-only we always pass `vectors_indexed == total_vectors`, so the
+    // raw and normalized values coincide.
+    let recall_at_1_norm = eval::normalize_metric(search.recall_at_1, total_vectors, total_vectors);
+    let recall_at_10_norm = eval::normalize_metric(search.recall_at_10, total_vectors, total_vectors);
+    let ndcg_at_10_norm = eval::normalize_metric(search.ndcg_at_10, total_vectors, total_vectors);
+
+    let step = StepEntry {
+        vectors_indexed: total_vectors,
+        add_elapsed: 0.0,
+        add_throughput: 0,
+        memory_bytes: index.memory_bytes() as u64,
+        search_elapsed: search.elapsed_secs,
+        search_throughput: search.throughput_per_sec,
+        recall_at_1: search.recall_at_1,
+        recall_at_10: search.recall_at_10,
+        ndcg_at_10: search.ndcg_at_10,
+        recall_at_1_normalized: recall_at_1_norm,
+        recall_at_10_normalized: recall_at_10_norm,
+        ndcg_at_10_normalized: ndcg_at_10_norm,
+        cycles_add: None,
+        instructions_add: None,
+        cache_misses_add: None,
+        branch_misses_add: None,
+        cycles_search: search.counter_sample.map(|s| s.cycles),
+        instructions_search: search.counter_sample.map(|s| s.instructions),
+        cache_misses_search: search.counter_sample.map(|s| s.cache_misses),
+        branch_misses_search: search.counter_sample.map(|s| s.branch_misses),
+    };
+
+    let peak_memory = step.memory_bytes;
+    save_report(state, metadata, vec![step])?;
+
+    eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / 1e9);
+    eprintln!();
+    Ok(())
+}
+
 // #region Sweep driver
 
 /// How one config in a sweep ended up.
@@ -707,13 +868,18 @@ pub enum ConfigOutcome {
 /// Binaries build the per-config pre-construction `description` themselves (we don't have a
 /// `Backend::description()` yet when construction fails), then pass in the backend `Result` and let this
 /// helper route the outcome.
-pub fn try_run_config<B, E>(description: &str, backend: Result<B, E>, state: &mut BenchState) -> ConfigOutcome
+pub fn try_run_config<Index, ConstructError>(
+    description: &str,
+    backend: Result<Index, ConstructError>,
+    state: &mut BenchState,
+    dimensions: usize,
+) -> ConfigOutcome
 where
-    B: Backend,
-    E: std::fmt::Display,
+    Index: Backend,
+    ConstructError: std::fmt::Display,
 {
     match backend {
-        Ok(mut backend) => match run(&mut backend, state) {
+        Ok(mut backend) => match run(&mut backend, state, dimensions) {
             Ok(()) => ConfigOutcome::Ran,
             Err(err) => {
                 eprintln!("\n── {description} — failed ──\n  {err}");
@@ -723,6 +889,78 @@ where
         Err(err) => {
             eprintln!("\n── {description} — skipped ──\n  {err}");
             ConfigOutcome::Skipped
+        }
+    }
+}
+
+/// `try_run_config`-style graceful-skip wrapper that also handles the
+/// `--index` load-vs-build branch.
+///
+/// - `handle = None` → behaves like `try_run_config` against a freshly-built
+///   backend.
+/// - `handle = Some(h)` and the path **exists** → calls `load(h)` and runs
+///   `run_search_only`. No add phase.
+/// - `handle = Some(h)` and the path **does not exist** → calls `build()`,
+///   runs the full `run`, then `idx.save(h)` once it returns.
+///
+/// Build / load / run / save errors are routed to `Skipped` / `Failed` and
+/// do not abort the surrounding sweep — the caller records the outcome
+/// against a `SweepSummary`.
+pub fn run_config<Index, BuildFn, LoadFn>(
+    description: &str,
+    handle: Option<&str>,
+    build: BuildFn,
+    load: LoadFn,
+    state: &mut BenchState,
+    dimensions: usize,
+) -> ConfigOutcome
+where
+    Index: Backend,
+    BuildFn: FnOnce() -> Result<Index, String>,
+    LoadFn: FnOnce(&str) -> Result<Index, String>,
+{
+    let load_existing = handle.is_some_and(|h| std::path::Path::new(h).exists());
+
+    if load_existing {
+        let h = handle.unwrap();
+        match load(h) {
+            Ok(idx) => match run_search_only(&idx, state, dimensions) {
+                Ok(()) => ConfigOutcome::Ran,
+                Err(err) => {
+                    eprintln!("\n── {description} (loaded) — failed ──\n  {err}");
+                    ConfigOutcome::Failed
+                }
+            },
+            Err(err) => {
+                eprintln!("\n── {description} (load[{h}]) — skipped ──\n  {err}");
+                ConfigOutcome::Skipped
+            }
+        }
+    } else {
+        match build() {
+            Ok(mut idx) => match run(&mut idx, state, dimensions) {
+                Ok(()) => match handle {
+                    Some(h) => match idx.save(h) {
+                        Ok(()) => {
+                            eprintln!("  saved index → {h}");
+                            ConfigOutcome::Ran
+                        }
+                        Err(err) => {
+                            eprintln!("\n── {description} (save[{h}]) — failed ──\n  {err}");
+                            ConfigOutcome::Failed
+                        }
+                    },
+                    None => ConfigOutcome::Ran,
+                },
+                Err(err) => {
+                    eprintln!("\n── {description} — failed ──\n  {err}");
+                    ConfigOutcome::Failed
+                }
+            },
+            Err(err) => {
+                eprintln!("\n── {description} — skipped ──\n  {err}");
+                ConfigOutcome::Skipped
+            }
         }
     }
 }
@@ -753,7 +991,7 @@ impl SweepSummary {
 }
 
 /// Print a CLI validation error and exit with status 1. Backend binaries call this from their `main()`
-/// when `--metric`/`--dtype`/etc. parsing fails — at that point we haven't started the sweep yet, so an
+/// when `--metric`/`--data_type`/etc. parsing fails — at that point we haven't started the sweep yet, so an
 /// early exit is the right shape (vs. a per-config skip).
 pub fn bail(message: &str) -> ! {
     eprintln!("{message}");

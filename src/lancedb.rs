@@ -90,13 +90,9 @@ impl LanceDbBackend {
         let ids = UInt64Array::from(keys.iter().map(|&k| k as u64).collect::<Vec<_>>());
         let values = Float32Array::from(data.to_vec());
         let list_field = Arc::new(Field::new("item", DataType::Float32, true));
-        let vectors = arrow_array::FixedSizeListArray::try_new(
-            list_field,
-            self.dimensions as i32,
-            Arc::new(values),
-            None,
-        )
-        .expect("vector array");
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new(list_field, self.dimensions as i32, Arc::new(values), None)
+                .expect("vector array");
         RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(vectors)]).expect("batch")
     }
 }
@@ -150,12 +146,12 @@ impl Backend for LanceDbBackend {
         let num_vectors = data.len() / dimensions;
         let table = self.table.as_ref().ok_or("no table created")?;
 
-        let lance_metric = parse_lancedb_metric(&self.metric)
-            .map_err(|e| format!("unsupported metric for LanceDB: {e}"))?;
+        let lance_metric =
+            parse_lancedb_metric(&self.metric).map_err(|e| format!("unsupported metric for LanceDB: {e}"))?;
 
         self.runtime.block_on(async {
-            for q in 0..num_vectors {
-                let query = data[q * dimensions..(q + 1) * dimensions].to_vec();
+            for query_index in 0..num_vectors {
+                let query = data[query_index * dimensions..(query_index + 1) * dimensions].to_vec();
                 let results = table
                     .vector_search(query)
                     .map_err(|e| format!("LanceDB query build: {e}"))?
@@ -170,28 +166,27 @@ impl Backend for LanceDbBackend {
                     .await
                     .map_err(|e| format!("LanceDB collect: {e}"))?;
 
-                let offset = q * count;
+                let offset = query_index * count;
                 let mut found = 0;
                 for batch in &batches {
-                    let id_col: Option<&UInt64Array> = batch
-                        .column_by_name("id")
-                        .and_then(|c| c.as_any().downcast_ref());
+                    let id_col: Option<&UInt64Array> =
+                        batch.column_by_name("id").and_then(|c| c.as_any().downcast_ref());
                     let dist_col: Option<&Float32Array> = batch
                         .column_by_name("_distance")
                         .and_then(|c| c.as_any().downcast_ref());
-                    if let (Some(ids), Some(dists)) = (id_col, dist_col) {
-                        for i in 0..ids.len().min(count - found) {
-                            out_keys[offset + found] = ids.value(i) as Key;
-                            out_distances[offset + found] = dists.value(i);
+                    if let (Some(ids), Some(distances)) = (id_col, dist_col) {
+                        for rank in 0..ids.len().min(count - found) {
+                            out_keys[offset + found] = ids.value(rank) as Key;
+                            out_distances[offset + found] = distances.value(rank);
                             found += 1;
                         }
                     }
                 }
-                for j in found..count {
-                    out_keys[offset + j] = Key::MAX;
-                    out_distances[offset + j] = Distance::INFINITY;
+                for rank in found..count {
+                    out_keys[offset + rank] = Key::MAX;
+                    out_distances[offset + rank] = Distance::INFINITY;
                 }
-                out_counts[q] = found;
+                out_counts[query_index] = found;
             }
             Ok::<(), String>(())
         })
@@ -217,19 +212,25 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio");
-    let db = runtime.block_on(async {
-        lancedb::connect(&cli.db_path)
-            .execute()
-            .await
-            .expect("lancedb connect")
-    });
+    let db = runtime.block_on(async { lancedb::connect(&cli.db_path).execute().await.expect("lancedb connect") });
     let _ = runtime.block_on(db.drop_table(TABLE_NAME, &[]));
 
     let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {
         eprintln!("Failed to load benchmark state: {e}");
         std::process::exit(1);
     });
-    let dimensions = state.dimensions();
+    if cli.common.dimensions.len() > 1 {
+        retrieval::bail("--dimensions sweep with >1 value isn't supported on LanceDB; rerun the binary per dimensions");
+    }
+    let dimensions = cli
+        .common
+        .dimensions
+        .first()
+        .copied()
+        .unwrap_or_else(|| state.dimensions());
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
 
     let mut backend = LanceDbBackend {
         db,
@@ -242,11 +243,12 @@ fn main() {
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("backend".into(), json!("lancedb"));
             metadata.insert("metric".into(), json!(&cli.metric));
+            metadata.insert("dimensions".into(), json!(dimensions));
             metadata
         },
     };
 
-    run(&mut backend, &mut state).unwrap_or_else(|e| {
+    run(&mut backend, &mut state, dimensions).unwrap_or_else(|e| {
         eprintln!("Benchmark failed: {e}");
         std::process::exit(1);
     });
