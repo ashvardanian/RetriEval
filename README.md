@@ -185,7 +185,7 @@ retri-eval-usearch \
     --vectors datasets/wiki_1M/base.1M.fbin \
     --queries datasets/wiki_1M/query.public.100K.fbin \
     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-    --dtype f32,f16,i8 \
+    --data-type f32,f16,i8 \
     --metric ip \
     --output results/
 ```
@@ -207,15 +207,15 @@ uv run scripts/plot.py results/ --output-dir plots/
 | __cuVS__    | CUDA        | f32, f16, i8, u8                                        | l2, ip, cos               |
 
 - __USearch__: Input is passed directly in the specified type.
-  `--dtype` selects both the input interpretation and the internal quantization.
+  `--data-type` selects both the input interpretation and the internal quantization.
 - __FAISS__: Input is always f32.
-  `--dtype` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8_direct, etc.).
+  `--data-type` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8_direct, etc.).
 - __cuVS__: Currently benchmarks with f32.
   CAGRA natively supports f32, f16, i8, u8 for build.
 
 ```sh
-retri-eval-usearch --dtype bf16 --metric l2 ...
-retri-eval-faiss --dtype f16 --metric l2 ...
+retri-eval-usearch --data-type bf16 --metric l2 ...
+retri-eval-faiss --data-type f16 --metric l2 ...
 retri-eval-cuvs --metric l2 ...
 ```
 
@@ -264,19 +264,31 @@ cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
 Each backend is a separate binary. Common flags shared by all:
 
 ```
---vectors <PATH>           # Base vectors (.fbin, .u8bin, .i8bin)
---queries <PATH>           # Query vectors
---neighbors <PATH>         # Ground-truth neighbors (.ibin)
---keys <PATH>              # Optional keys file (.i32bin)
+--vectors <PATH|GLOB>      # Base vectors (.fbin, .u8bin, .i8bin, .b1bin)
+--queries <PATH|GLOB>      # Query vectors
+--neighbors <PATH|GLOB>    # Ground-truth neighbors (.ibin)
+--keys <PATH|GLOB>         # Optional keys file (.i32bin)
 --epochs <N>               # Measurement steps (dataset split into N parts, default: 10)
 --no-shuffle               # Disable random insertion order (shuffle is on by default)
 --output <DIR>             # Output directory for JSON result files (omit for progress-only)
+--index <PATH>             # Persisted index handle. If the path exists, the run skips the
+                           # add phase, loads, and search-only-runs; otherwise the run
+                           # builds, then saves to that path. Requires a single-config sweep.
+                           # USearch / FAISS / cuVS only.
+--dimensions <LIST>        # Matryoshka truncations to evaluate (e.g. 128,256,512,1024).
+                           # Empty → use the file's native dim. Each value must be ≤ native;
+                           # for `.b1bin` files each must be a multiple of 8.
 ```
+
+`--vectors` / `--queries` / `--neighbors` / `--keys` accept shell glob patterns
+(`*`, `?`, `[…]`). Matched shards are natural-sorted (`shard_2.fbin` before
+`shard_10.fbin`) and validated for matching dim and scalar format — useful for
+multi-shard datasets like USearchWiki.
 
 __retri-eval-usearch__ additionally supports comma-separated sweeps:
 
 ```
---dtype <LIST>             # f32,f16,bf16,e5m2,e4m3,e3m2,e2m3,i8,u8,b1
+--data-type <LIST>         # f32, f16, bf16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1
 --metric <LIST>            # ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence
 --connectivity <LIST>      # HNSW M parameter (default: 0 = auto)
 --expansion-add <LIST>     # expansion factor during indexing (default: 0 = auto)
@@ -288,6 +300,7 @@ __retri-eval-usearch__ additionally supports comma-separated sweeps:
 __retri-eval-cuvs__ — requires `--features cuvs-backend` and an NVIDIA GPU:
 
 ```
+--data-type <LIST>                 # f32, f16, u8                  (default: f32)
 --metric <LIST>                    # l2, ip, cos (default: l2)
 --graph-degree <LIST>              # CAGRA output graph degree (default: 32)
 --intermediate-graph-degree <LIST> # CAGRA intermediate graph degree (default: 64)
@@ -297,7 +310,7 @@ __retri-eval-cuvs__ — requires `--features cuvs-backend` and an NVIDIA GPU:
 __retri-eval-qdrant__ extends the common flags with:
 
 ```
---dtype <LIST>          # f32, f16, u8                  (default: f32)
+--data-type <LIST>      # f32, f16, u8                  (default: f32)
 --quantization <LIST>   # none, binary, scalar          (default: none)
 --metric <LIST>         # ip, l2, cos, manhattan        (default: l2)
 ```
@@ -305,7 +318,7 @@ __retri-eval-qdrant__ extends the common flags with:
 __retri-eval-redis__ extends the common flags with:
 
 ```
---dtype <LIST>          # f32, f64, f16, bf16, u8, i8   (default: f32)
+--data-type <LIST>      # f32, f64, f16, bf16, u8, i8   (default: f32)
 --metric <LIST>         # ip, l2, cos                   (default: l2)
 ```
 
@@ -340,7 +353,7 @@ retri-eval-usearch \
     --vectors datasets/pubchem_maccs/base.115627267.b1bin \
     --queries datasets/pubchem_maccs/query.10000.b1bin \
     --neighbors datasets/pubchem_maccs/groundtruth.10000.ibin \
-    --dtype b1 --metric hamming --output results/pubchem_maccs
+    --data-type b1 --metric hamming --output results/pubchem_maccs
 ```
 
 __Scope__ is system-wide per-CPU — `pid == -1`, `cpu == i`, one counter group per online CPU, summed at read.
@@ -376,7 +389,7 @@ LLC-load-misses,branch-misses,context-switches,cpu-migrations,page-faults \
         --vectors datasets/cohere_en/base.41488110.b1bin \
         --queries datasets/cohere_en/query.10000.b1bin \
         --neighbors datasets/cohere_en/groundtruth.10000.ibin \
-        --dtype b1 --metric hamming \
+        --data-type b1 --metric hamming \
         --output results/cohere_en
 kill %1
 ```
@@ -426,7 +439,7 @@ Files are auto-named `<backend>-<hash>.json`.
 {
   "machine": { "cpu_model": "Intel Xeon 6776P", "physical_cores": 96, ... },
   "dataset": { "vectors_path": "...", "vectors_count": 10000000, "dimensions": 100, ... },
-  "config": { "backend": "usearch", "dtype": "f32", "metric": "l2", "connectivity": 16, ... },
+  "config": { "backend": "usearch", "data_type": "f32", "metric": "l2", "connectivity": 16, ... },
   "steps": [
     {
       "vectors_indexed": 1000000,
@@ -481,6 +494,10 @@ BigANN benchmark is a good starting point, if you are searching for large collec
 Those often come with precomputed ground-truth neighbors, which is handy for recall evaluation.
 Datasets below are grouped by scale; only configurations with matching ground truth support recall evaluation.
 
+Most datasets ship as one file per role (base / queries / ground-truth), but larger ones — like [USearchWiki][usearch-wiki] — are split across many `.fbin` shards.
+RetriEval accepts shell glob patterns on `--vectors` / `--queries` / `--neighbors` / `--keys`, so a sharded dataset reads exactly like a single-file one: pass `--vectors 'base.shard_*.fbin'`, quoted so the shell doesn't expand it.
+Matched shards are natural-sorted (`shard_2.fbin` before `shard_10.fbin`) and validated for consistent dimensionality and scalar format; per-row stride and recall metrics are unchanged versus the single-file path.
+
 ### ~1M Scale — Development & Testing
 
 | Dataset                                    | Scalar Type | Dimensions | Metric | Base Size | Ground Truth      |
@@ -507,8 +524,12 @@ Datasets below are grouped by scale; only configurations with matching ground tr
 | [Meta BIGANN — SIFT][meta-bigann]     |        `u8` |        128 |      L2 |     12 GB | 10K queries, yes  |
 | [Microsoft Turing-ANNS][msft-turing]  |       `f32` |        100 |      L2 |     37 GB | 100K queries, yes |
 | [Microsoft SpaceV][msft-spacev]       |        `i8` |        100 |      L2 |    9.3 GB | 30K queries, yes  |
+| [Unum WikiVerse][wikiverse] ²         |       `f16` |  128–4096³ |  Cos/IP |  95-505GB | pipeline pending  |
 | [USearchMolecules PubChem][usm] MACCS |        `b1` |        168 | Hamming |    2.4 GB | self-sampled ¹    |
 | [USearchMolecules PubChem][usm] ECFP4 |        `b1` |       2048 | Hamming |     29 GB | self-sampled ¹    |
+
+> ² WikiVerse uses `.f16bin` (`u32` rows + `u32` cols + `f16` values), which RetriEval does not yet read — adding `f16` to `Dataset::load`'s extension match is a small follow-up.
+> ³ Per-model: nomic-embed 768, arctic-embed/Qwen3 1024, e5-mistral 4096; ColBERT-style multi-vector (128d/token) needs the deferred multi-vector plan.
 
 ### ~1B Scale
 
@@ -534,6 +555,8 @@ Datasets below are grouped by scale; only configurations with matching ground tr
 [meta-bigann]: https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/
 [usm]: https://github.com/ashvardanian/USearchMolecules
 [cohere-wiki]: https://huggingface.co/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary
+[wikiverse]: https://huggingface.co/datasets/unum-cloud/WikiVerse
+[usearch-wiki]: https://github.com/unum-cloud/USearchWiki
 
 ### Unum UForm Wiki
 
@@ -555,7 +578,7 @@ retri-eval-usearch \
     --vectors datasets/wiki_1M/base.1M.fbin \
     --queries datasets/wiki_1M/query.public.100K.fbin \
     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-    --dtype f32,f16,i8 --metric ip \
+    --data-type f32,f16,i8 --metric ip \
     --output results/wiki_1M
 ```
 
@@ -581,7 +604,7 @@ retri-eval-usearch \
     --vectors datasets/cc_3M/base.fbin \
     --queries datasets/cc_3M/query.fbin \
     --neighbors datasets/cc_3M/groundtruth.ibin \
-    --dtype f32,bf16,f16,i8 --metric ip \
+    --data-type f32,bf16,f16,i8 --metric ip \
     --output results/cc_3M
 ```
 
@@ -607,7 +630,7 @@ retri-eval-usearch \
     --vectors datasets/arxiv_2M/base.fbin \
     --queries datasets/arxiv_2M/query.fbin \
     --neighbors datasets/arxiv_2M/groundtruth.ibin \
-    --dtype f32,bf16,f16,i8 --metric ip \
+    --data-type f32,bf16,f16,i8 --metric ip \
     --output results/arxiv_2M
 ```
 
@@ -641,7 +664,7 @@ retri-eval-usearch \
     --vectors datasets/sift_10M/base.10M.u8bin \
     --queries datasets/sift_10M/query.public.10K.u8bin \
     --neighbors datasets/sift_10M/groundtruth.public.10K.ibin \
-    --dtype f32,f16,i8 --metric l2 \
+    --data-type f32,f16,i8 --metric l2 \
     --output results/sift_10M
 ```
 
@@ -669,7 +692,7 @@ retri-eval-usearch \
     --vectors datasets/sift_100M/base.100M.u8bin \
     --queries datasets/sift_100M/query.public.10K.u8bin \
     --neighbors datasets/sift_100M/groundtruth.public.10K.ibin \
-    --dtype f32,f16,i8 --metric l2 \
+    --data-type f32,f16,i8 --metric l2 \
     --epochs 20 --output results/sift_100M
 ```
 
@@ -705,7 +728,7 @@ retri-eval-usearch \
     --vectors datasets/turing_1M/base.1M.fbin \
     --queries datasets/turing_1M/query.public.100K.fbin \
     --neighbors datasets/turing_1M/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric l2 \
+    --data-type f32,bf16,f16,i8 --metric l2 \
     --output results/turing_1M
 ```
 
@@ -735,7 +758,7 @@ retri-eval-usearch \
     --vectors datasets/turing_10M/base.10M.fbin \
     --queries datasets/turing_10M/query.public.100K.fbin \
     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric l2 \
+    --data-type f32,bf16,f16,i8 --metric l2 \
     --output results/turing_10M
 ```
 
@@ -765,7 +788,7 @@ retri-eval-usearch \
     --vectors datasets/turing_100M/base.100M.fbin \
     --queries datasets/turing_100M/query.public.100K.fbin \
     --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric l2 \
+    --data-type f32,bf16,f16,i8 --metric l2 \
     --epochs 20 --output results/turing_100M
 ```
 
@@ -791,7 +814,7 @@ retri-eval-usearch \
     --vectors datasets/spacev_100M/base.100M.i8bin \
     --queries datasets/spacev_100M/query.30K.i8bin \
     --neighbors datasets/spacev_100M/groundtruth.30K.i32bin \
-    --dtype f32,f16,i8 --metric l2 \
+    --data-type f32,f16,i8 --metric l2 \
     --epochs 20 --output results/spacev_100M
 ```
 
@@ -833,7 +856,7 @@ retri-eval-usearch \
     --vectors datasets/t2i/base.1M.fbin \
     --queries datasets/t2i/query.public.100K.fbin \
     --neighbors datasets/t2i/groundtruth.public.100K.ibin \
-    --dtype f32,bf16,f16,i8 --metric cos \
+    --data-type f32,bf16,f16,i8 --metric cos \
     --output results/t2i_1M
 ```
 
@@ -876,7 +899,7 @@ retri-eval-usearch \
     --vectors datasets/pubchem_maccs/base.115627267.b1bin \
     --queries datasets/pubchem_maccs/query.10000.b1bin \
     --neighbors datasets/pubchem_maccs/groundtruth.10000.ibin \
-    --dtype b1 --metric hamming,jaccard \
+    --data-type b1 --metric hamming,jaccard \
     --output results/pubchem_maccs
 ```
 
@@ -897,7 +920,7 @@ retri-eval-usearch \
     --vectors datasets/pubchem_ecfp4/base.115627267.b1bin \
     --queries datasets/pubchem_ecfp4/query.10000.b1bin \
     --neighbors datasets/pubchem_ecfp4/groundtruth.10000.ibin \
-    --dtype b1 --metric hamming \
+    --data-type b1 --metric hamming \
     --output results/pubchem_ecfp4
 ```
 
@@ -951,19 +974,54 @@ retri-eval-usearch \
     --vectors datasets/cohere_en/base.41488110.b1bin \
     --queries datasets/cohere_en/query.10000.b1bin \
     --neighbors datasets/cohere_en/groundtruth.10000.ibin \
-    --dtype b1 --metric hamming \
+    --data-type b1 --metric hamming \
     --output results/cohere_en
 ```
 
-FAISS binary indexes via `IndexBinaryHNSW` also work — pass `--dtype b1`, and the metric is Hamming by construction.
+FAISS binary indexes via `IndexBinaryHNSW` also work — pass `--data-type b1`, and the metric is Hamming by construction.
 
 ```sh
 retri-eval-faiss \
     --vectors datasets/cohere_en/base.41488110.b1bin \
     --queries datasets/cohere_en/query.10000.b1bin \
     --neighbors datasets/cohere_en/groundtruth.10000.ibin \
-    --dtype b1 --metric hamming \
+    --data-type b1 --metric hamming \
     --output results/cohere_en_faiss
 ```
 
 </details>
+
+### Unum WikiVerse
+
+Multi-model embedding dataset built on [HuggingFaceFW/finewiki][finewiki] — 61.5M articles across 325 languages, embedded by five models (Qwen3-Embedding-0.6B 1024d, GTE-ModernColBERT-v1 128d/token, Snowflake arctic-embed-l-v2.0 1024d, nomic-embed-text-v1.5 768d, e5-mistral-7b-instruct 4096d).
+Each `.f16bin` shard is row-aligned with the source FineWiki parquet — directory layout is `<model>/<lang>wiki/<group>_<shard>.{body,title}.f16bin`, mirroring FineWiki 1:1.
+The full corpus is 95-505 GB depending on the model; ColBERT-style embeddings reach 6.2 TB at one vector per token.
+
+Two prerequisites are still pending on the RetriEval side: `Dataset::load` doesn't yet recognize the `.f16bin` extension (a small follow-up — same header layout as `.fbin`, swap `f32` for `f16` in `ScalarFormat`), and the ColBERT model needs the deferred multi-vector plan.
+The dense models will work as soon as `f16` lands; the example below assumes that, plus the existing GLOB support for sharded inputs.
+
+<details>
+<summary>English subset, Qwen3-Embedding-0.6B — f16, 1024d, ~13 GB</summary>
+
+```sh
+GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/unum-cloud/WikiVerse datasets/wikiverse/
+cd datasets/wikiverse
+hf download unum-cloud/WikiVerse \
+    --repo-type dataset \
+    --include "qwen3-embedding-0.6b/enwiki/*.body.f16bin"
+cd ../..
+```
+
+```sh
+retri-eval-usearch \
+    --vectors 'datasets/wikiverse/qwen3-embedding-0.6b/enwiki/*.body.f16bin' \
+    --queries datasets/wikiverse/qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin \
+    --data-type f16 --metric cos \
+    --output results/wikiverse_en_qwen3
+```
+
+The `--vectors` glob picks up every English shard in natural-sort order; queries reuse one shard until the official query/GT split lands upstream.
+
+</details>
+
+[finewiki]: https://huggingface.co/datasets/HuggingFaceFW/finewiki
