@@ -27,7 +27,9 @@ use std::time::Duration;
 use clap::Parser;
 use itertools::iproduct;
 use retrieval::docker::ContainerHandle;
-use retrieval::{bail, pod_slice_as_bytes, run, Backend, BenchState, CommonArgs, Distance, Key, VectorSlice, Vectors};
+use retrieval::{
+    bail, pod_slice_as_bytes, run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, VectorSlice, Vectors,
+};
 use serde_json::json;
 
 const INDEX_NAME: &str = "bench_idx";
@@ -50,34 +52,34 @@ fn parse_redis_metric(s: &str) -> Result<&'static str, String> {
 /// images only accept the four float formats. Bytes-per-element is fixed by
 /// the type and used to size the RESP payload.
 #[derive(Clone, Copy)]
-struct RedisDtype {
+struct RedisDataType {
     token: &'static str,
     bytes_per_element: usize,
 }
 
-fn parse_redis_dtype(s: &str) -> Result<RedisDtype, String> {
+fn parse_redis_data_type(s: &str) -> Result<RedisDataType, String> {
     match s {
-        "f32" => Ok(RedisDtype {
+        "f32" => Ok(RedisDataType {
             token: "FLOAT32",
             bytes_per_element: 4,
         }),
-        "f64" => Ok(RedisDtype {
+        "f64" => Ok(RedisDataType {
             token: "FLOAT64",
             bytes_per_element: 8,
         }),
-        "f16" => Ok(RedisDtype {
+        "f16" => Ok(RedisDataType {
             token: "FLOAT16",
             bytes_per_element: 2,
         }),
-        "bf16" => Ok(RedisDtype {
+        "bf16" => Ok(RedisDataType {
             token: "BFLOAT16",
             bytes_per_element: 2,
         }),
-        "u8" => Ok(RedisDtype {
+        "u8" => Ok(RedisDataType {
             token: "UINT8",
             bytes_per_element: 1,
         }),
-        "i8" => Ok(RedisDtype {
+        "i8" => Ok(RedisDataType {
             token: "INT8",
             bytes_per_element: 1,
         }),
@@ -127,7 +129,7 @@ impl EncodedBatch<'_> {
 /// owned buffer. Replaces the earlier per-row shape that allocated `2 × num_rows` vectors per
 /// pipeline and round-tripped through `f32` even when source and target matched.
 fn encode_batch<'source>(
-    data_type: RedisDtype,
+    data_type: RedisDataType,
     source: &'source VectorSlice<'_>,
     start_row: usize,
     num_rows: usize,
@@ -152,7 +154,7 @@ fn encode_batch<'source>(
     }
 
     // Cast path: one `numkong::cast` from source element type straight to target type. No f32 hop
-    // even when source ≠ f32 (i.e. `.u8bin` + `--data_type f16` goes u8 → f16 directly).
+    // even when source ≠ f32 (i.e. `.u8bin` + `--data-type f16` goes u8 → f16 directly).
     match data_type.token {
         "FLOAT32" => EncodedBatch::CastF32(cast_batch(source, start, end, elements)),
         "FLOAT64" => EncodedBatch::CastF64(cast_batch(source, start, end, elements)),
@@ -232,7 +234,7 @@ struct RedisBackend {
     container: Option<ContainerHandle>,
     runtime: tokio::runtime::Handle,
     batch_size: usize,
-    data_type: RedisDtype,
+    data_type: RedisDataType,
     description: String,
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -391,10 +393,10 @@ fn main() {
     let cli = Cli::parse();
 
     for m in &cli.metric {
-        parse_redis_metric(m).unwrap_or_else(|e| bail(&e));
+        parse_redis_metric(m).unwrap_or_bail("metric");
     }
     for d in &cli.data_type {
-        parse_redis_dtype(d).unwrap_or_else(|e| bail(&e));
+        parse_redis_data_type(d).unwrap_or_bail("data type");
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -422,9 +424,7 @@ fn main() {
         retrieval::bail("--dimensions sweep with >1 value isn't supported on Redis; rerun the binary per dimensions");
     }
     let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
-    state
-        .check_dimensions(dimensions)
-        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
+    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
 
     let redis_url = format!("redis://localhost:{}/", cli.port);
     let client = redis::Client::open(redis_url.as_str()).expect("redis client");
@@ -434,7 +434,7 @@ fn main() {
     for (idx, (metric_str, dtype_str)) in iproduct!(&cli.metric, &cli.data_type).enumerate() {
         let is_last = idx + 1 == num_configs;
         let metric = parse_redis_metric(metric_str).expect("metric validated above");
-        let data_type = parse_redis_dtype(dtype_str).expect("data_type validated above");
+        let data_type = parse_redis_data_type(dtype_str).expect("data_type validated above");
 
         let mut conn = client.get_connection().expect("redis connection");
         let _: () = redis::cmd("FLUSHALL").query(&mut conn).expect("FLUSHALL");

@@ -46,7 +46,7 @@
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-//!     --data_type f32,f16 --metric ip \
+//!     --data-type f32,f16 --metric ip \
 //!     --output results/
 //! ```
 //!
@@ -56,7 +56,7 @@
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --data_type f32,f16 --metric l2 \
+//!     --data-type f32,f16 --metric l2 \
 //!     --graph-degree 64 \
 //!     --intermediate-graph-degree 128 \
 //!     --itopk-size 256 \
@@ -72,7 +72,9 @@ use std::ptr::NonNull;
 use clap::Parser;
 use cuvs::distance_type::DistanceType;
 use itertools::iproduct;
-use retrieval::{bail, run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, Vectors};
+use retrieval::{
+    bail, run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, UnwrapOrBail, Vectors,
+};
 use serde_json::json;
 
 // #region CudaAllocator
@@ -149,14 +151,14 @@ unsafe fn dl_tensor(
 
 /// Supported CAGRA scalar quantization types (matches the C API).
 #[derive(Debug, Clone, Copy)]
-enum CuvsDtype {
+enum CuvsDataType {
     F32,
     F16,
     I8,
     U8,
 }
 
-impl CuvsDtype {
+impl CuvsDataType {
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "f32" => Ok(Self::F32),
@@ -392,14 +394,14 @@ enum GpuQueries {
 }
 
 impl GpuQueries {
-    fn allocate(data_type: CuvsDtype, shape: &[usize], allocator: CudaAllocator) -> Result<Self, String> {
+    fn allocate(data_type: CuvsDataType, shape: &[usize], allocator: CudaAllocator) -> Result<Self, String> {
         let error = |e| format!("GPU query alloc failed: {e}");
         unsafe {
             Ok(match data_type {
-                CuvsDtype::F32 => Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDtype::F16 => Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDtype::I8 => Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDtype::U8 => Self::U8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDataType::F32 => Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDataType::F16 => Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDataType::I8 => Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDataType::U8 => Self::U8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
             })
         }
     }
@@ -442,7 +444,7 @@ impl SearchBuffers {
         num_queries: usize,
         dimensions: usize,
         neighbor_count: usize,
-        data_type: CuvsDtype,
+        data_type: CuvsDataType,
         search_params: cuvs::cagra::SearchParams,
     ) -> Result<Self, String> {
         let error = |e| format!("GPU alloc failed: {e}");
@@ -557,7 +559,7 @@ pub struct CuvsBackend {
     cuda_alloc: CudaAllocator,
     dimensions: usize,
     metric: DistanceType,
-    data_type: CuvsDtype,
+    data_type: CuvsDataType,
     graph_degree: usize,
     intermediate_graph_degree: usize,
     build_algo: cuvs_sys::cuvsCagraGraphBuildAlgo,
@@ -581,7 +583,7 @@ unsafe impl Sync for CuvsBackend {}
 impl CuvsBackend {
     pub fn new(
         dimensions: usize,
-        dtype_name: &str,
+        data_type_name: &str,
         metric_name: &str,
         graph_degree: usize,
         intermediate_graph_degree: usize,
@@ -593,7 +595,7 @@ impl CuvsBackend {
         num_random_samplings: u32,
     ) -> Result<Self, String> {
         let metric = parse_metric(metric_name)?;
-        let data_type = CuvsDtype::from_str(dtype_name)?;
+        let data_type = CuvsDataType::from_str(data_type_name)?;
         let build_algo = parse_build_algo(build_algo_name)?;
         let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
         let cuda_alloc = CudaAllocator(res.0);
@@ -647,7 +649,7 @@ impl CuvsBackend {
     pub fn load(
         handle: &str,
         dimensions: usize,
-        dtype_name: &str,
+        data_type_name: &str,
         metric_name: &str,
         itopk_size: usize,
         search_width: usize,
@@ -656,7 +658,7 @@ impl CuvsBackend {
         num_random_samplings: u32,
     ) -> Result<Self, String> {
         let metric = parse_metric(metric_name)?;
-        let data_type = CuvsDtype::from_str(dtype_name)?;
+        let data_type = CuvsDataType::from_str(data_type_name)?;
         let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
         let cuda_alloc = CudaAllocator(res.0);
 
@@ -840,7 +842,7 @@ impl Backend for CuvsBackend {
         // Upload queries to GPU. For f32 data_type, copy directly from the source
         // data without an intermediate staging buffer.
         let query_f32 = queries.data.to_f32();
-        if matches!(self.data_type, CuvsDtype::F32) {
+        if matches!(self.data_type, CuvsDataType::F32) {
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     query_f32.as_ptr() as *const u8,
@@ -947,7 +949,7 @@ impl Backend for CuvsBackend {
 fn main() {
     let cli = Cli::parse();
 
-    let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| bail(&format!("{e}")));
+    let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     cli.common.ensure_single_config(&[
@@ -970,9 +972,7 @@ fn main() {
         &cli.itopk_size,
         &cli.search_width
     ) {
-        state
-            .check_dimensions(dimensions)
-            .unwrap_or_else(|e| bail(&format!("invalid --dimensions: {e}")));
+        state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
 
         let description = format!(
             "cuvs-cagra · {data_type} · {metric} · d={dimensions} · gd={graph_degree} · igd={intermediate_graph_degree} · itopk={itopk_size} · sw={search_width}"

@@ -26,7 +26,7 @@ use arrow_schema::{DataType, Field, Schema};
 use clap::Parser;
 use futures_util::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, Vectors};
 use serde_json::json;
 
 const TABLE_NAME: &str = "bench";
@@ -228,9 +228,7 @@ fn main() {
         .first()
         .copied()
         .unwrap_or_else(|| state.dimensions());
-    state
-        .check_dimensions(dimensions)
-        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
+    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
 
     let mut backend = LanceDbBackend {
         db,

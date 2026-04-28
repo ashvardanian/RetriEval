@@ -25,7 +25,7 @@
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --data_type f32,bf16,f16,i8 \
+//!     --data-type f32,bf16,f16,i8 \
 //!     --metric l2 \
 //!     --output results/
 //! ```
@@ -36,7 +36,7 @@
 //!     --vectors datasets/binary_1M/base.1M.b1bin \
 //!     --queries datasets/binary_1M/query.10K.b1bin \
 //!     --neighbors datasets/binary_1M/groundtruth.10K.ibin \
-//!     --data_type b1 \
+//!     --data-type b1 \
 //!     --metric hamming \
 //!     --output results/binary_1M
 //! ```
@@ -48,7 +48,9 @@ use clap::Parser;
 use faiss::index::io::{read_index, write_index};
 use faiss::Index as _;
 use itertools::iproduct;
-use retrieval::{bail, run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, Vectors};
+use retrieval::{
+    run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, UnwrapOrBail, Vectors,
+};
 use serde_json::{json, Value};
 
 extern "C" {
@@ -248,7 +250,7 @@ unsafe impl Sync for FaissBackend {}
 impl FaissBackend {
     fn new(
         dimensions: usize,
-        dtype_name: &str,
+        data_type_name: &str,
         metric_name: &str,
         connectivity: usize,
         expansion_add: usize,
@@ -259,8 +261,8 @@ impl FaissBackend {
             omp_set_num_threads(threads as i32);
         }
 
-        let factory = index_factory_string(dtype_name, connectivity)?;
-        let binary = is_binary(dtype_name);
+        let factory = index_factory_string(data_type_name, connectivity)?;
+        let binary = is_binary(data_type_name);
 
         // For binary indices, dimensions is already in bits (from .b1bin header).
         // For float indices, dimensions is the scalar count.
@@ -280,7 +282,7 @@ impl FaissBackend {
         // Apply efConstruction / efSearch via FAISS ParameterSpace. Binary HNSW has no dispatcher in
         // `faiss/AutoTune.cpp` so the call is a no-op there: `IndexBinaryHNSW` keeps its compile-time
         // defaults (40 / 16). The CLI still accepts any `--expansion-add` / `--expansion-search` values
-        // for `--data_type b1`, but only the float HNSW path actually tunes them.
+        // for `--data-type b1`, but only the float HNSW path actually tunes them.
         if !binary {
             let inner_index_ptr = match &index {
                 FaissIndex::Float(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
@@ -294,14 +296,14 @@ impl FaissBackend {
         }
 
         let description = format!(
-            "faiss · {dtype_name} · {metric_label} · M={connectivity} · \
+            "faiss · {data_type_name} · {metric_label} · M={connectivity} · \
              ef={expansion_add}/{expansion_search} · {threads} threads",
         );
 
         let mut metadata = HashMap::new();
         metadata.insert("backend".into(), json!("faiss"));
         metadata.insert("library_version".into(), json!(faiss_version()));
-        metadata.insert("data_type".into(), json!(dtype_name));
+        metadata.insert("data_type".into(), json!(data_type_name));
         metadata.insert("metric".into(), json!(metric_label));
         metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("connectivity".into(), json!(connectivity));
@@ -331,7 +333,7 @@ impl FaissBackend {
         let idx = read_index(handle).map_err(|e| {
             format!(
                 "FAISS read_index({handle}): {e}\n  \
-                 (binary `--data_type b1` indexes can't be loaded yet — \
+                 (binary `--data-type b1` indexes can't be loaded yet — \
                  faiss-sys 0.7 doesn't bind IndexBinaryIDMap)"
             )
         })?;
@@ -518,7 +520,7 @@ fn main() {
 
     eprintln!("faiss v{}", faiss_version());
 
-    let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| bail(&format!("{e}")));
+    let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     cli.common.ensure_single_config(&[
@@ -539,9 +541,7 @@ fn main() {
         &cli.expansion_add,
         &cli.expansion_search
     ) {
-        state
-            .check_dimensions(dimensions)
-            .unwrap_or_else(|e| bail(&format!("invalid --dimensions: {e}")));
+        state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
 
         let description =
             format!("faiss · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search}");

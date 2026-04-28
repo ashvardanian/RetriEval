@@ -33,7 +33,7 @@ use qdrant_client::qdrant::{
 };
 use qdrant_client::Qdrant;
 use retrieval::docker::ContainerHandle;
-use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, Vectors};
 use serde_json::json;
 
 const COLLECTION: &str = "bench";
@@ -243,9 +243,9 @@ fn main() {
     let sweeps: Vec<(String, Datatype, Option<Quantization>, QdrantDistance)> =
         iproduct!(&cli.metric, &cli.data_type, &cli.quantization)
             .map(|(metric, data_type, quantization)| {
-                let parsed_metric = parse_qdrant_distance(metric).unwrap_or_else(|e| bail(&e));
-                let parsed_data_type = parse_qdrant_datatype(data_type).unwrap_or_else(|e| bail(&e));
-                let parsed_quantization = parse_qdrant_quantization(quantization).unwrap_or_else(|e| bail(&e));
+                let parsed_metric = parse_qdrant_distance(metric).unwrap_or_bail("metric");
+                let parsed_data_type = parse_qdrant_datatype(data_type).unwrap_or_bail("data type");
+                let parsed_quantization = parse_qdrant_quantization(quantization).unwrap_or_bail("quantization");
                 (quantization.clone(), parsed_data_type, parsed_quantization, parsed_metric)
             })
             .enumerate()
@@ -287,9 +287,7 @@ fn main() {
         retrieval::bail("--dimensions sweep with >1 value isn't supported on Qdrant; rerun the binary per dimensions");
     }
     let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
-    state
-        .check_dimensions(dimensions)
-        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
+    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
 
     let mut container_slot = Some(handle);
     let num_configs = cli.metric.len() * cli.data_type.len() * cli.quantization.len();

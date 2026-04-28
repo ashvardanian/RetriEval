@@ -991,9 +991,27 @@ impl SweepSummary {
 }
 
 /// Print a CLI validation error and exit with status 1. Backend binaries call this from their `main()`
-/// when `--metric`/`--data_type`/etc. parsing fails — at that point we haven't started the sweep yet, so an
+/// when `--metric`/`--data-type`/etc. parsing fails — at that point we haven't started the sweep yet, so an
 /// early exit is the right shape (vs. a per-config skip).
 pub fn bail(message: &str) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
+}
+
+/// Sugar for the recurring `result.unwrap_or_else(|e| bail(&format!("{prefix}: {e}")))`
+/// pattern that flows up out of `BenchState::load`, `state.check_dimensions(...)`,
+/// and the various backend constructors. The error variant is rendered with
+/// `Display` so anything that satisfies the trait works without ceremony.
+pub trait UnwrapOrBail<T> {
+    /// Unwrap the success variant or bail with `<prefix>: <error>`.
+    fn unwrap_or_bail(self, prefix: &str) -> T;
+}
+
+impl<T, E: std::fmt::Display> UnwrapOrBail<T> for Result<T, E> {
+    fn unwrap_or_bail(self, prefix: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => bail(&format!("{prefix}: {error}")),
+        }
+    }
 }

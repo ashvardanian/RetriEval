@@ -16,7 +16,7 @@
 //!     --vectors datasets/wiki_1M/base.1M.fbin \
 //!     --queries datasets/wiki_1M/query.public.100K.fbin \
 //!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-//!     --data_type f32,bf16,e5m2 \
+//!     --data-type f32,bf16,e5m2 \
 //!     --metric ip,cos,l2 \
 //!     --output results/
 //! ```
@@ -27,7 +27,7 @@
 //!     --vectors datasets/turing_10M/base.10M.fbin \
 //!     --queries datasets/turing_10M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --data_type f32,bf16,e5m2,e4m3,e3m2,e2m3,i8 \
+//!     --data-type f32,bf16,e5m2,e4m3,e3m2,e2m3,i8 \
 //!     --metric l2 \
 //!     --connectivity 48 \
 //!     --expansion-add 768 \
@@ -41,7 +41,7 @@
 //!     --vectors datasets/turing_100M/base.100M.fbin \
 //!     --queries datasets/turing_100M/query.public.100K.fbin \
 //!     --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
-//!     --data_type f32,bf16 \
+//!     --data-type f32,bf16 \
 //!     --shards 2 \
 //!     --metric l2 \
 //!     --connectivity 32 \
@@ -57,7 +57,7 @@
 //!     --vectors datasets/binary_1M/base.1M.b1bin \
 //!     --queries datasets/binary_1M/query.10K.b1bin \
 //!     --neighbors datasets/binary_1M/groundtruth.10K.ibin \
-//!     --data_type b1 \
+//!     --data-type b1 \
 //!     --metric hamming \
 //!     --output results/binary_1M
 //! ```
@@ -67,7 +67,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use fork_union::{IndexedSplit, SyncMutPtr, ThreadPool};
-use retrieval::{bail, *};
+use retrieval::{UnwrapOrBail, *};
 use serde_json::json;
 
 #[derive(Parser, Debug)]
@@ -126,7 +126,7 @@ fn parse_metric(s: &str) -> Result<::usearch::MetricKind, String> {
     }
 }
 
-fn parse_dtype(s: &str) -> Result<::usearch::ScalarKind, String> {
+fn parse_data_type(s: &str) -> Result<::usearch::ScalarKind, String> {
     match s {
         "f64" => Ok(::usearch::ScalarKind::F64),
         "f32" => Ok(::usearch::ScalarKind::F32),
@@ -191,7 +191,7 @@ impl USearchBackend {
     pub fn new(
         dimensions: usize,
         metric_name: &str,
-        dtype_name: &str,
+        data_type_name: &str,
         connectivity: usize,
         expansion_add: usize,
         expansion_search: usize,
@@ -199,7 +199,7 @@ impl USearchBackend {
         shards: usize,
     ) -> Result<Self, String> {
         let metric = parse_metric(metric_name)?;
-        let data_type = parse_dtype(dtype_name)?;
+        let data_type = parse_data_type(data_type_name)?;
         let opts = ::usearch::IndexOptions {
             dimensions,
             metric,
@@ -220,7 +220,7 @@ impl USearchBackend {
 
         if let Some(idx) = shard_vec.first() {
             eprintln!(
-                "  dispatch[{dtype_name}/{metric_name}]: {}",
+                "  dispatch[{data_type_name}/{metric_name}]: {}",
                 idx.hardware_acceleration()
             );
         }
@@ -235,7 +235,7 @@ impl USearchBackend {
             }
         };
         let mut description = format!(
-            "usearch · {dtype_name} · {metric_name} · M={} · ef={}/{} · {threads} threads",
+            "usearch · {data_type_name} · {metric_name} · M={} · ef={}/{} · {threads} threads",
             fmt_param(connectivity),
             fmt_param(expansion_add),
             fmt_param(expansion_search),
@@ -255,7 +255,7 @@ impl USearchBackend {
             "library_isa_available".into(),
             json!(usearch::hardware_acceleration_available()),
         );
-        metadata.insert("data_type".into(), json!(dtype_name));
+        metadata.insert("data_type".into(), json!(data_type_name));
         metadata.insert("metric".into(), json!(metric_name));
         metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("connectivity".into(), json!(connectivity));
@@ -331,15 +331,15 @@ impl USearchBackend {
         let exp_add = head.expansion_add();
         let exp_search = head.expansion_search();
         let metric_name = metric_kind_name(head.metric_kind());
-        let dtype_name = scalar_kind_name(head.scalar_kind());
+        let data_type_name = scalar_kind_name(head.scalar_kind());
 
         eprintln!(
-            "  dispatch[{dtype_name}/{metric_name}]: {}",
+            "  dispatch[{data_type_name}/{metric_name}]: {}",
             head.hardware_acceleration()
         );
 
         let mut description = format!(
-            "usearch · {dtype_name} · {metric_name} · M={connectivity} · ef={exp_add}/{exp_search} · {threads} threads · loaded[{handle}]",
+            "usearch · {data_type_name} · {metric_name} · M={connectivity} · ef={exp_add}/{exp_search} · {threads} threads · loaded[{handle}]",
         );
         if shards > 1 {
             description.push_str(&format!(" · {shards} shards"));
@@ -356,7 +356,7 @@ impl USearchBackend {
             "library_isa_available".into(),
             json!(usearch::hardware_acceleration_available()),
         );
-        metadata.insert("data_type".into(), json!(dtype_name));
+        metadata.insert("data_type".into(), json!(data_type_name));
         metadata.insert("metric".into(), json!(metric_name));
         metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("connectivity".into(), json!(connectivity));
@@ -593,7 +593,7 @@ fn main() {
     eprintln!("  Compiled ISA: {}", usearch::hardware_acceleration_compiled());
     eprintln!("  Available ISA: {}", usearch::hardware_acceleration_available());
 
-    let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| bail(&format!("{e}")));
+    let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     cli.common.ensure_single_config(&[
@@ -618,9 +618,7 @@ fn main() {
         &cli.shards,
         &cli.threads
     ) {
-        state
-            .check_dimensions(*dimensions)
-            .unwrap_or_else(|e| bail(&format!("invalid --dimensions: {e}")));
+        state.check_dimensions(*dimensions).unwrap_or_bail("invalid --dimensions");
 
         let description = format!(
             "usearch · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"

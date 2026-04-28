@@ -26,7 +26,7 @@ use std::time::Duration;
 use clap::Parser;
 use itertools::iproduct;
 use retrieval::docker::ContainerHandle;
-use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, Vectors};
+use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, Vectors};
 use serde_json::json;
 use weaviate_community::collections::objects::Object;
 use weaviate_community::collections::query::RawQuery;
@@ -295,10 +295,10 @@ fn main() {
     let cli = Cli::parse();
 
     for m in &cli.metric {
-        parse_weaviate_distance(m).unwrap_or_else(|e| bail(&e));
+        parse_weaviate_distance(m).unwrap_or_bail("metric");
     }
     for quantization in &cli.quantization {
-        parse_weaviate_quantization(quantization).unwrap_or_else(|e| bail(&e));
+        parse_weaviate_quantization(quantization).unwrap_or_bail("quantization");
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -341,9 +341,7 @@ fn main() {
         retrieval::bail("--dimensions sweep with >1 value isn't supported on Weaviate; rerun the binary per dimensions");
     }
     let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
-    state
-        .check_dimensions(dimensions)
-        .unwrap_or_else(|e| retrieval::bail(&format!("invalid --dimensions: {e}")));
+    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
 
     let mut container_slot = Some(handle);
     let num_configs = cli.metric.len() * cli.quantization.len();

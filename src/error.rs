@@ -133,9 +133,9 @@ pub enum BackendError {
     #[error("{backend}: unknown metric `{value}`")]
     UnknownMetric { backend: &'static str, value: String },
 
-    /// Unknown scalar-type string (e.g. `--data_type foo`).
+    /// Unknown scalar-type string (e.g. `--data-type foo`).
     #[error("{backend}: unknown data_type `{value}`")]
-    UnknownDtype { backend: &'static str, value: String },
+    UnknownDataType { backend: &'static str, value: String },
 
     /// Engine-internal operation failure — `add`, `search`, `create`, etc.
     #[error("{backend}: {operation}: {message}")]
