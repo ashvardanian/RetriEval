@@ -161,6 +161,16 @@ It works with the same plain input format standardized by the [BigANN benchmark]
 The recommended methodology is to parameter-sweep different configuration options to achieve comparable recall between search backends on a given dataset.
 Once the behavior is confirmed on a small 1M–10M subset, 100M–1B and larger benchmarks can be run to validate scaling curves.
 
+Each search reports two recall conventions, because they answer different questions and one of them saturates.
+`recall_at_k` is __1-recall@K__ (hit-rate@K): the fraction of queries whose single true nearest neighbor lands within the top-K — FAISS's `OneRecallAtRCriterion`, and the measure USearch reports.
+`intersection_at_k` is __K-recall@K__ (`|top-K ∩ ground-truth-K| / K`), order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
+1-recall@K ≥ K-recall@K for the same run, so the two are never interchangeable.
+
+K is `--search-count`, which defaults to the ground-truth file's width — 10 on the Wiki sets, 100 on the BigANN ones.
+That matters because 1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
+`intersection_at_k` is what stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix, so both are stricter at wide K than the same-named numbers at K=10.
+Pass `--search-count 10` for figures comparable across datasets of differing ground-truth width.
+
 ## Quick Start
 
 Install the default `retri-eval-usearch` binary:
@@ -172,19 +182,19 @@ cargo install --path .
 Fetch the Unum Wiki 1M dataset — ~400 MB of vectors, queries, and ground truth:
 
 ```sh
-mkdir -p datasets/wiki_1M && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/base.1M.fbin -P datasets/wiki_1M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/query.public.100K.fbin -P datasets/wiki_1M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/groundtruth.public.100K.ibin -P datasets/wiki_1M/
+mkdir -p data/wiki-1m && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/base.1M.fbin -P data/wiki-1m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/query.public.100K.fbin -P data/wiki-1m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/groundtruth.public.100K.ibin -P data/wiki-1m/
 ```
 
 Run a sweep over three quantizations and write JSON reports under `results/`:
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/wiki_1M/base.1M.fbin \
-    --queries datasets/wiki_1M/query.public.100K.fbin \
-    --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+    --base-vectors data/wiki-1m/base.1M.fbin \
+    --query-vectors data/wiki-1m/query.public.100K.fbin \
+    --query-neighbors data/wiki-1m/groundtruth.public.100K.ibin \
     --data-type f32,f16,i8 \
     --metric ip \
     --output results/
@@ -264,23 +274,60 @@ cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
 Each backend is a separate binary. Common flags shared by all:
 
 ```
---vectors <PATH|GLOB>      # Base vectors (.fbin, .u8bin, .i8bin, .b1bin)
---queries <PATH|GLOB>      # Query vectors
---neighbors <PATH|GLOB>    # Ground-truth neighbors (.ibin)
---keys <PATH|GLOB>         # Optional keys file (.i32bin)
---epochs <N>               # Measurement steps (dataset split into N parts, default: 10)
+--base-vectors <PATH|GLOB>    # Base vectors to index (.fbin, .u8bin, .i8bin, .b1bin)
+--base-keys <PATH|GLOB>       # Optional keys for those vectors (.i32bin), one per vector
+--query-vectors <PATH|GLOB>   # Query vectors to search with
+--query-neighbors <PATH|GLOB> # Ground-truth neighbors for those queries (.ibin)
+--search-count <K>            # Neighbors per query — the k every metric is taken at.
+                              # Defaults to the ground-truth file's width; may not exceed it.
+--steps <N>                # Measurement steps (dataset split into N parts, default: 10)
 --no-shuffle               # Disable random insertion order (shuffle is on by default)
 --output <DIR>             # Output directory for JSON result files (omit for progress-only)
 --index <PATH>             # Persisted index handle. If the path exists, the run skips the
                            # add phase, loads, and search-only-runs; otherwise the run
                            # builds, then saves to that path. Requires a single-config sweep.
-                           # USearch / FAISS / cuVS only.
+                           # USearch / FAISS / cuVS only; rejected by the server backends.
 --dimensions <LIST>        # Matryoshka truncations to evaluate (e.g. 128,256,512,1024).
                            # Empty → use the file's native dim. Each value must be ≤ native;
                            # for `.b1bin` files each must be a multiple of 8.
+--self-search              # After the last insertion, replay indexed vectors as their own
+                           # queries and report the share that retrieve themselves. Needs no
+                           # ground truth — a vector in the index is its own nearest neighbor.
+                           # Reported separately from the recall curve.
+--self-search-count <N>    # Neighbors per self-search query. Independent of --search-count:
+                           # this is a load knob, since self-recall@k ≈ self-recall@1 always
+                           # (a vector's distance to itself is zero). Default: 10.
+--self-search-sample <S>   # Base vectors to replay: a bare integer is an absolute count, a
+                           # value with a decimal point (≤ 1.0) is a fraction of the base
+                           # (1.0 = all). Default: all. Takes the leading N rows, not a
+                           # random draw — see the caveat below.
 ```
 
-`--vectors` / `--queries` / `--neighbors` / `--keys` accept shell glob patterns
+### Self-Recall
+
+`--self-search` answers a different question from `--query-neighbors`, and closes two gaps the ground-truth path leaves open.
+
+Shipped query files are small — SIFT has 10K queries, a single batch finishing in under a tenth of a second on a modern GPU.
+A QPS figure measured over that burst is real, but says nothing about sustained throughput.
+Self-recall replays indexed vectors as queries, so an unsampled 100M-vector index issues 100M queries, making it the only phase in a report measured under load.
+Use `--self-search-sample` to cap the sweep (e.g. `0.1` for a tenth, or `50000` for an absolute count) when a full pass is too slow, as it is on the server backends.
+
+It is also the metric that survives `--max-base-vectors` most cleanly.
+Ground-truth files name neighbors drawn from the whole published base, so capping a run to a slice drags recall down by roughly the cap ratio no matter how good the index is — a quarter-size slice of the SIFT base reports about 0.25, not 0.99.
+The harness does not divide that back out: the correction would assume the indexed slice is a uniform sample of the base, and a leading-prefix cap is not one.
+It reports the raw figure and, in `dataset.vectors_count`, the divisor — coverage is `steps[].vectors_indexed / dataset.vectors_count`, plotted as `coverage.png`.
+Self-recall needs no such correction at all: identity truth is computed against exactly the vectors that were inserted.
+
+Three caveats are worth knowing before quoting the numbers.
+Exact-duplicate vectors in the base can cost a hit, since either twin may take rank 1, so a self-recall below 1.0 bounds the index's error rate rather than measuring it exactly.
+A self-query is a graph node rather than an out-of-sample point, so traversal converges faster than it would on real queries — treat the throughput as an optimistic bound, not as a substitute for a query-set measurement.
+And `--self-search-sample` replays the _leading_ N rows rather than a random draw, because contiguous slices are what keep the queries zero-copy and the throughput figure clean.
+On a base whose row order carries structure, only the default full sweep is unbiased.
+
+Note also that a self-search's `recall_at_k` is very nearly redundant with its `recall_at_1`: a vector's own distance to itself is zero, which is minimal, so if the index retrieves it at all it lands at rank 1.
+Raising `--self-search-count` therefore changes how much search work each query does — which is the point when you are measuring throughput — but not the recall value.
+
+`--base-vectors` / `--query-vectors` / `--query-neighbors` / `--base-keys` accept shell glob patterns
 (`*`, `?`, `[…]`). Matched shards are natural-sorted (`shard_2.fbin` before
 `shard_10.fbin`) and validated for matching dim and scalar format — useful for
 multi-shard datasets like USearchWiki.
@@ -293,19 +340,23 @@ __retri-eval-usearch__ additionally supports comma-separated sweeps:
 --connectivity <LIST>      # HNSW M parameter (default: 0 = auto)
 --expansion-add <LIST>     # expansion factor during indexing (default: 0 = auto)
 --expansion-search <LIST>  # expansion factor during search (default: 0 = auto)
---shards <LIST>            # Index shards (default: 2)
+--shards <LIST>            # Index shards (default: 1)
 --threads <LIST>           # Thread count (default: available cores)
 ```
 
 __retri-eval-cuvs__ — requires `--features cuvs-backend` and an NVIDIA GPU:
 
 ```
---data-type <LIST>                 # f32, f16, u8                  (default: f32)
---metric <LIST>                    # l2, ip, cos (default: l2)
---graph-degree <LIST>              # CAGRA output graph degree (default: 32)
---intermediate-graph-degree <LIST> # CAGRA intermediate graph degree (default: 64)
---itopk-size <LIST>                # Search-time intermediate results (default: 64)
+--data-type <LIST>          # f32, f16, u8                  (default: f32)
+--metric <LIST>             # l2, ip, cos (default: l2)
+--connectivity <LIST>       # CAGRA output graph degree (default: 32)
+--expansion-add <LIST>      # CAGRA intermediate graph degree (default: 64)
+--expansion-search <LIST>   # CAGRA search-time top-i list (default: 64)
 ```
+
+cuVS reuses the shared `--connectivity` / `--expansion-add` / `--expansion-search` names, and emits the matching JSON keys, so its runs plot on the same axes as the HNSW backends.
+The mapping is an analogy, not an identity — `--expansion-add` is CAGRA's pre-prune candidate width rather than `ef_construction`, and `--expansion-search` is its internal top-i list rather than `ef_search`.
+Read iso-`expansion` points across engines as comparable, not equal.
 
 __retri-eval-qdrant__ extends the common flags with:
 
@@ -335,12 +386,13 @@ __retri-eval-weaviate__ extends the common flags with:
 
 Wall-clock throughput and peak RSS are always recorded in the JSON report.
 For deeper attribution — "how many cycles did construction spend in cache misses vs searching?" — build with `--features perf-counters`.
-On Linux this pulls [`perf-event2`] and wraps the `index.add` and `index.search` loops inside `src/bench.rs::run` with system-wide hardware counters, populating eight new optional fields on each `StepEntry`:
+On Linux this pulls [`perf-event2`] and wraps the `index.add` and `index.search` loops inside `src/bench.rs::run` with system-wide hardware counters, populating five optional fields on each phase of each step:
 
 ```
-cycles_add / instructions_add / cache_misses_add / branch_misses_add
-cycles_search / instructions_search / cache_misses_search / branch_misses_search
+cycles / instructions / cache_references / cache_misses / branch_misses
 ```
+
+They are unsuffixed because they sit inside the phase they measure — `steps[].add`, `steps[].ground_truth_search`, and `steps[].self_search` each carry their own set.
 
 Fields are `Option<u64>` with `skip_serializing_if = "Option::is_none"`, so reports from runs without the feature are byte-identical to the pre-feature schema.
 
@@ -350,9 +402,9 @@ ulimit -n 65536                                 # see RLIMIT note below
 cargo build --release --features usearch-backend,perf-counters
 
 retri-eval-usearch \
-    --vectors datasets/pubchem_maccs/base.115627267.b1bin \
-    --queries datasets/pubchem_maccs/query.10000.b1bin \
-    --neighbors datasets/pubchem_maccs/groundtruth.10000.ibin \
+    --base-vectors data/pubchem-maccs/base.115627267.b1bin \
+    --query-vectors data/pubchem-maccs/query.10000.b1bin \
+    --query-neighbors data/pubchem-maccs/groundtruth.10000.ibin \
     --data-type b1 --metric hamming --output results/pubchem_maccs
 ```
 
@@ -386,9 +438,9 @@ perf stat -a -e cycles,instructions,cache-references,cache-misses,\
 LLC-load-misses,branch-misses,context-switches,cpu-migrations,page-faults \
     --output results/cohere_en/perf.txt -- \
     retri-eval-usearch \
-        --vectors datasets/cohere_en/base.41488110.b1bin \
-        --queries datasets/cohere_en/query.10000.b1bin \
-        --neighbors datasets/cohere_en/groundtruth.10000.ibin \
+        --base-vectors datasets/cohere_en/base.41488110.b1bin \
+        --query-vectors datasets/cohere_en/query.10000.b1bin \
+        --query-neighbors datasets/cohere_en/groundtruth.10000.ibin \
         --data-type b1 --metric hamming \
         --output results/cohere_en
 kill %1
@@ -438,26 +490,36 @@ Files are auto-named `<backend>-<hash>.json`.
 ```json
 {
   "machine": { "cpu_model": "Intel Xeon 6776P", "physical_cores": 96, ... },
-  "dataset": { "vectors_path": "...", "vectors_count": 10000000, "dimensions": 100, ... },
-  "config": { "backend": "usearch", "data_type": "f32", "metric": "l2", "connectivity": 16, ... },
+  "dataset": { "base_vectors_path": "...", "vectors_count": 10000000, "dimensions": 100, ... },
+  "config": { "backend": "usearch", "data_type": "f32", "metric": "l2", "connectivity": 16,
+              "dimensions": 100, "vectors_count": 10000000, "search_count": 10, ... },
   "steps": [
     {
       "vectors_indexed": 1000000,
-      "add_elapsed": 12.3,
-      "add_throughput": 81300,
       "memory_bytes": 412000000,
-      "search_elapsed": 0.45,
-      "search_throughput": 222000,
-      "recall_at_1": 0.0942,
-      "recall_at_10": 0.2815,
-      "ndcg_at_10": 0.1847,
-      "recall_at_1_normalized": 0.9420,
-      "recall_at_10_normalized": 0.9512,
-      "ndcg_at_10_normalized": 0.8470
+      "add": { "elapsed": 12.3, "throughput": 81300 },
+      "ground_truth_search": {
+        "queries": 100000, "neighbor_count": 10,
+        "elapsed": 0.45, "throughput": 222000,
+        "recall_at_1": 0.0942, "recall_at_k": 0.2815,
+        "intersection_at_k": 0.2604, "ndcg_at_k": 0.1847
+      },
+      "self_search": {
+        "queries": 1000000, "neighbor_count": 10,
+        "elapsed": 1.6, "throughput": 627541,
+        "recall_at_1": 0.9958, "recall_at_k": 0.9961
+      }
     }
   ]
 }
 ```
+
+A step pairs the index state (`vectors_indexed`, `memory_bytes`) with the phases that acted on it.
+`add` is `null` on the `--index` load path, where nothing was inserted; `self_search` appears on at most one step — the last — because it runs once against the finished index, and that step is the index state it ran against.
+Its metrics drop the `self_` prefix because the container already says it, and it carries no `intersection_at_k` or `ndcg_at_k`: identity truth is a single key per query, so neither a set overlap nor a ranked gain says anything beyond `recall_at_1`.
+
+`dataset` describes the input files and `config` describes the run, so `dataset.vectors_count` is the base file's row count while `config.vectors_count` is what `--max-base-vectors` actually indexed; divide `steps[].vectors_indexed` by the former for the share of the ground truth a step could possibly have found.
+`dataset.dimensions` is likewise the file's width, and `config.dimensions` the width a `--dimensions` sweep truncated to.
 
 ## Project Structure
 
@@ -495,7 +557,7 @@ Those often come with precomputed ground-truth neighbors, which is handy for rec
 Datasets below are grouped by scale; only configurations with matching ground truth support recall evaluation.
 
 Most datasets ship as one file per role (base / queries / ground-truth), but larger ones — like [USearchWiki][usearch-wiki] — are split across many `.fbin` shards.
-RetriEval accepts shell glob patterns on `--vectors` / `--queries` / `--neighbors` / `--keys`, so a sharded dataset reads exactly like a single-file one: pass `--vectors 'base.shard_*.fbin'`, quoted so the shell doesn't expand it.
+RetriEval accepts shell glob patterns on `--base-vectors` / `--query-vectors` / `--query-neighbors` / `--base-keys`, so a sharded dataset reads exactly like a single-file one: pass `--base-vectors 'base.shard_*.fbin'`, quoted so the shell doesn't expand it.
 Matched shards are natural-sorted (`shard_2.fbin` before `shard_10.fbin`) and validated for consistent dimensionality and scalar format; per-row stride and recall metrics are unchanged versus the single-file path.
 
 ### ~1M Scale — Development & Testing
@@ -567,17 +629,17 @@ Bench against IP since UForm is L2-normalised at training time.
 <summary>1M — f32, 256d, IP, ~1 GB</summary>
 
 ```sh
-mkdir -p datasets/wiki_1M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/base.1M.fbin -P datasets/wiki_1M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/query.public.100K.fbin -P datasets/wiki_1M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/groundtruth.public.100K.ibin -P datasets/wiki_1M/
+mkdir -p data/wiki-1m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/base.1M.fbin -P data/wiki-1m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/query.public.100K.fbin -P data/wiki-1m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-wiki-1m/resolve/main/groundtruth.public.100K.ibin -P data/wiki-1m/
 ```
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/wiki_1M/base.1M.fbin \
-    --queries datasets/wiki_1M/query.public.100K.fbin \
-    --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+    --base-vectors data/wiki-1m/base.1M.fbin \
+    --query-vectors data/wiki-1m/query.public.100K.fbin \
+    --query-neighbors data/wiki-1m/groundtruth.public.100K.ibin \
     --data-type f32,f16,i8 --metric ip \
     --output results/wiki_1M
 ```
@@ -593,17 +655,17 @@ Ground truth was computed offline by shuffling the base set as queries and recor
 <summary>3M — f32, 256d, IP, ~3 GB</summary>
 
 ```sh
-mkdir -p datasets/cc_3M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/base.fbin -P datasets/cc_3M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/query.fbin -P datasets/cc_3M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/groundtruth.ibin -P datasets/cc_3M/
+mkdir -p data/cc-3m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/base.fbin -P data/cc-3m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/query.fbin -P data/cc-3m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/groundtruth.ibin -P data/cc-3m/
 ```
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/cc_3M/base.fbin \
-    --queries datasets/cc_3M/query.fbin \
-    --neighbors datasets/cc_3M/groundtruth.ibin \
+    --base-vectors data/cc-3m/base.fbin \
+    --query-vectors data/cc-3m/query.fbin \
+    --query-neighbors data/cc-3m/groundtruth.ibin \
     --data-type f32,bf16,f16,i8 --metric ip \
     --output results/cc_3M
 ```
@@ -619,17 +681,17 @@ Same offline GT recipe as Creative Captions: shuffled base as queries, top-100 I
 <summary>2M — f32, 768d, IP, ~6 GB</summary>
 
 ```sh
-mkdir -p datasets/arxiv_2M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/base.fbin -P datasets/arxiv_2M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/query.fbin -P datasets/arxiv_2M/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/groundtruth.ibin -P datasets/arxiv_2M/
+mkdir -p data/arxiv-2m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/base.fbin -P data/arxiv-2m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/query.fbin -P data/arxiv-2m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/groundtruth.ibin -P data/arxiv-2m/
 ```
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/arxiv_2M/base.fbin \
-    --queries datasets/arxiv_2M/query.fbin \
-    --neighbors datasets/arxiv_2M/groundtruth.ibin \
+    --base-vectors data/arxiv-2m/base.fbin \
+    --query-vectors data/arxiv-2m/query.fbin \
+    --query-neighbors data/arxiv-2m/groundtruth.ibin \
     --data-type f32,bf16,f16,i8 --metric ip \
     --output results/arxiv_2M
 ```
@@ -661,9 +723,9 @@ with open('datasets/sift_10M/base.10M.u8bin', 'r+b') as f:
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/sift_10M/base.10M.u8bin \
-    --queries datasets/sift_10M/query.public.10K.u8bin \
-    --neighbors datasets/sift_10M/groundtruth.public.10K.ibin \
+    --base-vectors datasets/sift_10M/base.10M.u8bin \
+    --query-vectors datasets/sift_10M/query.public.10K.u8bin \
+    --query-neighbors datasets/sift_10M/groundtruth.public.10K.ibin \
     --data-type f32,f16,i8 --metric l2 \
     --output results/sift_10M
 ```
@@ -689,11 +751,11 @@ with open('datasets/sift_100M/base.100M.u8bin', 'r+b') as f:
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/sift_100M/base.100M.u8bin \
-    --queries datasets/sift_100M/query.public.10K.u8bin \
-    --neighbors datasets/sift_100M/groundtruth.public.10K.ibin \
+    --base-vectors datasets/sift_100M/base.100M.u8bin \
+    --query-vectors datasets/sift_100M/query.public.10K.u8bin \
+    --query-neighbors datasets/sift_100M/groundtruth.public.10K.ibin \
     --data-type f32,f16,i8 --metric l2 \
-    --epochs 20 --output results/sift_100M
+    --steps 20 --output results/sift_100M
 ```
 
 </details>
@@ -725,9 +787,9 @@ with open('datasets/turing_1M/base.1M.fbin', 'r+b') as f:
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/turing_1M/base.1M.fbin \
-    --queries datasets/turing_1M/query.public.100K.fbin \
-    --neighbors datasets/turing_1M/groundtruth.public.100K.ibin \
+    --base-vectors datasets/turing_1M/base.1M.fbin \
+    --query-vectors datasets/turing_1M/query.public.100K.fbin \
+    --query-neighbors datasets/turing_1M/groundtruth.public.100K.ibin \
     --data-type f32,bf16,f16,i8 --metric l2 \
     --output results/turing_1M
 ```
@@ -755,9 +817,9 @@ with open('datasets/turing_10M/base.10M.fbin', 'r+b') as f:
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/turing_10M/base.10M.fbin \
-    --queries datasets/turing_10M/query.public.100K.fbin \
-    --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
+    --base-vectors datasets/turing_10M/base.10M.fbin \
+    --query-vectors datasets/turing_10M/query.public.100K.fbin \
+    --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
     --data-type f32,bf16,f16,i8 --metric l2 \
     --output results/turing_10M
 ```
@@ -785,11 +847,11 @@ with open('datasets/turing_100M/base.100M.fbin', 'r+b') as f:
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/turing_100M/base.100M.fbin \
-    --queries datasets/turing_100M/query.public.100K.fbin \
-    --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
+    --base-vectors datasets/turing_100M/base.100M.fbin \
+    --query-vectors datasets/turing_100M/query.public.100K.fbin \
+    --query-neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
     --data-type f32,bf16,f16,i8 --metric l2 \
-    --epochs 20 --output results/turing_100M
+    --steps 20 --output results/turing_100M
 ```
 
 </details>
@@ -811,11 +873,11 @@ mkdir -p datasets/spacev_100M/ && \
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/spacev_100M/base.100M.i8bin \
-    --queries datasets/spacev_100M/query.30K.i8bin \
-    --neighbors datasets/spacev_100M/groundtruth.30K.i32bin \
+    --base-vectors datasets/spacev_100M/base.100M.i8bin \
+    --query-vectors datasets/spacev_100M/query.30K.i8bin \
+    --query-neighbors datasets/spacev_100M/groundtruth.30K.i32bin \
     --data-type f32,f16,i8 --metric l2 \
-    --epochs 20 --output results/spacev_100M
+    --steps 20 --output results/spacev_100M
 ```
 
 </details>
@@ -853,9 +915,9 @@ mkdir -p datasets/t2i/ && \
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/t2i/base.1M.fbin \
-    --queries datasets/t2i/query.public.100K.fbin \
-    --neighbors datasets/t2i/groundtruth.public.100K.ibin \
+    --base-vectors datasets/t2i/base.1M.fbin \
+    --query-vectors datasets/t2i/query.public.100K.fbin \
+    --query-neighbors datasets/t2i/groundtruth.public.100K.ibin \
     --data-type f32,bf16,f16,i8 --metric cos \
     --output results/t2i_1M
 ```
@@ -890,15 +952,15 @@ Use `--limit N` to take a subset and `--source {pubchem,gdb13,enamine}` to pick 
 cargo install --path . --features download
 retri-download-molecules \
     --source pubchem --fingerprint maccs \
-    --query-count 10000 --neighbors 10 \
-    --output datasets/pubchem_maccs/
+    --query-count 10000 --count 10 \
+    --output data/pubchem-maccs/
 ```
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/pubchem_maccs/base.115627267.b1bin \
-    --queries datasets/pubchem_maccs/query.10000.b1bin \
-    --neighbors datasets/pubchem_maccs/groundtruth.10000.ibin \
+    --base-vectors data/pubchem-maccs/base.115627267.b1bin \
+    --query-vectors data/pubchem-maccs/query.10000.b1bin \
+    --query-neighbors data/pubchem-maccs/groundtruth.10000.ibin \
     --data-type b1 --metric hamming,jaccard \
     --output results/pubchem_maccs
 ```
@@ -911,15 +973,15 @@ retri-eval-usearch \
 ```sh
 retri-download-molecules \
     --source pubchem --fingerprint ecfp4 \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --count 10 \
     --output datasets/pubchem_ecfp4/
 ```
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/pubchem_ecfp4/base.115627267.b1bin \
-    --queries datasets/pubchem_ecfp4/query.10000.b1bin \
-    --neighbors datasets/pubchem_ecfp4/groundtruth.10000.ibin \
+    --base-vectors datasets/pubchem_ecfp4/base.115627267.b1bin \
+    --query-vectors datasets/pubchem_ecfp4/query.10000.b1bin \
+    --query-neighbors datasets/pubchem_ecfp4/groundtruth.10000.ibin \
     --data-type b1 --metric hamming \
     --output results/pubchem_ecfp4
 ```
@@ -932,7 +994,7 @@ retri-eval-usearch \
 ```sh
 retri-download-molecules \
     --source gdb13 --fingerprint maccs \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --count 10 \
     --output datasets/gdb13_maccs/
 ```
 
@@ -944,7 +1006,7 @@ retri-download-molecules \
 ```sh
 retri-download-molecules \
     --source enamine --fingerprint maccs \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --count 10 \
     --output datasets/enamine_maccs/
 ```
 
@@ -965,15 +1027,15 @@ The dataset also ships text metadata — title, paragraph body, URL — alongsid
 ```sh
 retri-download-cohere \
     --language en \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --count 10 \
     --output datasets/cohere_en/
 ```
 
 ```sh
 retri-eval-usearch \
-    --vectors datasets/cohere_en/base.41488110.b1bin \
-    --queries datasets/cohere_en/query.10000.b1bin \
-    --neighbors datasets/cohere_en/groundtruth.10000.ibin \
+    --base-vectors datasets/cohere_en/base.41488110.b1bin \
+    --query-vectors datasets/cohere_en/query.10000.b1bin \
+    --query-neighbors datasets/cohere_en/groundtruth.10000.ibin \
     --data-type b1 --metric hamming \
     --output results/cohere_en
 ```
@@ -982,9 +1044,9 @@ FAISS binary indexes via `IndexBinaryHNSW` also work — pass `--data-type b1`, 
 
 ```sh
 retri-eval-faiss \
-    --vectors datasets/cohere_en/base.41488110.b1bin \
-    --queries datasets/cohere_en/query.10000.b1bin \
-    --neighbors datasets/cohere_en/groundtruth.10000.ibin \
+    --base-vectors datasets/cohere_en/base.41488110.b1bin \
+    --query-vectors datasets/cohere_en/query.10000.b1bin \
+    --query-neighbors datasets/cohere_en/groundtruth.10000.ibin \
     --data-type b1 --metric hamming \
     --output results/cohere_en_faiss
 ```
@@ -1014,13 +1076,13 @@ cd ../..
 
 ```sh
 retri-eval-usearch \
-    --vectors 'datasets/wikiverse/qwen3-embedding-0.6b/enwiki/*.body.f16bin' \
-    --queries datasets/wikiverse/qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin \
+    --base-vectors 'datasets/wikiverse/qwen3-embedding-0.6b/enwiki/*.body.f16bin' \
+    --query-vectors datasets/wikiverse/qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin \
     --data-type f16 --metric cos \
     --output results/wikiverse_en_qwen3
 ```
 
-The `--vectors` glob picks up every English shard in natural-sort order; queries reuse one shard until the official query/GT split lands upstream.
+The `--base-vectors` glob picks up every English shard in natural-sort order; queries reuse one shard until the official query/GT split lands upstream.
 
 </details>
 
