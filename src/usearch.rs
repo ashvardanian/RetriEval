@@ -13,9 +13,9 @@
 //! Quick sweep over quantization types & metrics (Wiki 1M):
 //! ```sh
 //! retri-eval-usearch \
-//!     --vectors datasets/wiki_1M/base.1M.fbin \
-//!     --queries datasets/wiki_1M/query.public.100K.fbin \
-//!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/wiki_1M/base.1M.fbin \
+//!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
+//!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --data-type f32,bf16,e5m2 \
 //!     --metric ip,cos,l2 \
 //!     --output results/
@@ -24,9 +24,9 @@
 //! Turing 10M at 99% recall (M=32, ef=256/1024):
 //! ```sh
 //! retri-eval-usearch \
-//!     --vectors datasets/turing_10M/base.10M.fbin \
-//!     --queries datasets/turing_10M/query.public.100K.fbin \
-//!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/turing_10M/base.10M.fbin \
+//!     --query-vectors datasets/turing_10M/query.public.100K.fbin \
+//!     --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
 //!     --data-type f32,bf16,e5m2,e4m3,e3m2,e2m3,i8 \
 //!     --metric l2 \
 //!     --connectivity 48 \
@@ -38,25 +38,25 @@
 //! Turing 100M with 20 measurement steps:
 //! ```sh
 //! retri-eval-usearch \
-//!     --vectors datasets/turing_100M/base.100M.fbin \
-//!     --queries datasets/turing_100M/query.public.100K.fbin \
-//!     --neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/turing_100M/base.100M.fbin \
+//!     --query-vectors datasets/turing_100M/query.public.100K.fbin \
+//!     --query-neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
 //!     --data-type f32,bf16 \
 //!     --shards 2 \
 //!     --metric l2 \
 //!     --connectivity 32 \
 //!     --expansion-add 256 \
 //!     --expansion-search 1024 \
-//!     --epochs 20 \
+//!     --steps 20 \
 //!     --output results/turing_100M
 //! ```
 //!
 //! Binary 1M hamming-distance search (1024-bit vectors in `.b1bin` format):
 //! ```sh
 //! retri-eval-usearch \
-//!     --vectors datasets/binary_1M/base.1M.b1bin \
-//!     --queries datasets/binary_1M/query.10K.b1bin \
-//!     --neighbors datasets/binary_1M/groundtruth.10K.ibin \
+//!     --base-vectors datasets/binary_1M/base.1M.b1bin \
+//!     --query-vectors datasets/binary_1M/query.10K.b1bin \
+//!     --query-neighbors datasets/binary_1M/groundtruth.10K.ibin \
 //!     --data-type b1 \
 //!     --metric hamming \
 //!     --output results/binary_1M
@@ -188,16 +188,16 @@ unsafe impl Sync for USearchBackend {}
 unsafe impl Send for USearchBackend {}
 
 impl USearchBackend {
-    pub fn new(
-        dimensions: usize,
-        metric_name: &str,
-        data_type_name: &str,
-        connectivity: usize,
-        expansion_add: usize,
-        expansion_search: usize,
-        threads: usize,
-        shards: usize,
-    ) -> Result<Self, String> {
+    pub fn new(config: IndexConfig<'_>, threads: usize, shards: usize) -> Result<Self, String> {
+        let IndexConfig {
+            dimensions,
+            data_type: data_type_name,
+            metric: metric_name,
+            connectivity,
+            expansion_add,
+            expansion_search,
+        } = config;
+
         let metric = parse_metric(metric_name)?;
         let data_type = parse_data_type(data_type_name)?;
         let opts = ::usearch::IndexOptions {
@@ -257,7 +257,6 @@ impl USearchBackend {
         );
         metadata.insert("data_type".into(), json!(data_type_name));
         metadata.insert("metric".into(), json!(metric_name));
-        metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("connectivity".into(), json!(connectivity));
         metadata.insert("expansion_add".into(), json!(expansion_add));
         metadata.insert("expansion_search".into(), json!(expansion_search));
@@ -324,9 +323,10 @@ impl USearchBackend {
 
         let pool = ThreadPool::try_spawn(threads).map_err(|e| format!("failed to create thread pool: {e}"))?;
 
-        // Read the file's actual values back for description + metadata.
+        // Read the file's actual values back for description + metadata. The
+        // vector width is not among them: `save_report` records the width the
+        // harness sliced queries at, which is what produced the results.
         let head = &shard_vec[0];
-        let dimensions = head.dimensions();
         let connectivity = head.connectivity();
         let exp_add = head.expansion_add();
         let exp_search = head.expansion_search();
@@ -358,7 +358,6 @@ impl USearchBackend {
         );
         metadata.insert("data_type".into(), json!(data_type_name));
         metadata.insert("metric".into(), json!(metric_name));
-        metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("connectivity".into(), json!(connectivity));
         metadata.insert("expansion_add".into(), json!(exp_add));
         metadata.insert("expansion_search".into(), json!(exp_search));
@@ -433,9 +432,7 @@ impl Backend for USearchBackend {
                         shard
                             .add(
                                 keys[vector_index] as u64,
-                                ::usearch::b1x8::from_u8s(
-                                    &data[vector_index * stride..(vector_index + 1) * stride],
-                                ),
+                                ::usearch::b1x8::from_u8s(&data[vector_index * stride..(vector_index + 1) * stride]),
                             )
                             .is_ok()
                     }
@@ -618,7 +615,9 @@ fn main() {
         &cli.shards,
         &cli.threads
     ) {
-        state.check_dimensions(*dimensions).unwrap_or_bail("invalid --dimensions");
+        state
+            .check_dimensions(*dimensions)
+            .unwrap_or_bail("invalid --dimensions");
 
         let description = format!(
             "usearch · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"
@@ -629,12 +628,14 @@ fn main() {
             cli.common.index.as_deref(),
             || {
                 USearchBackend::new(
-                    *dimensions,
-                    metric,
-                    data_type,
-                    *connectivity,
-                    *expansion_add,
-                    *expansion_search,
+                    IndexConfig {
+                        dimensions: *dimensions,
+                        data_type,
+                        metric,
+                        connectivity: *connectivity,
+                        expansion_add: *expansion_add,
+                        expansion_search: *expansion_search,
+                    },
                     *threads,
                     *shards,
                 )

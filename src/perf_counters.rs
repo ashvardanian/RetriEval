@@ -68,16 +68,6 @@ pub struct CounterSample {
     pub branch_misses: u64,
 }
 
-impl CounterSample {
-    pub fn ipc(&self) -> f64 {
-        self.instructions as f64 / self.cycles.max(1) as f64
-    }
-
-    pub fn cache_miss_rate(&self) -> f64 {
-        self.cache_misses as f64 / self.cache_references.max(1) as f64
-    }
-}
-
 /// System-wide hardware performance counters spanning every online CPU.
 ///
 /// Construction opens one [`KernelCounterGroup`] per CPU, each holding five
@@ -147,13 +137,6 @@ impl PerfCounters {
         }
         Ok(sample)
     }
-
-    pub fn scope<R>(&mut self, f: impl FnOnce() -> R) -> io::Result<(R, CounterSample)> {
-        self.reset_and_enable()?;
-        let out = f();
-        let sample = self.disable_and_read()?;
-        Ok((out, sample))
-    }
 }
 
 /// Open a five-counter group for `perf stat -a` equivalent capture on one CPU.
@@ -208,10 +191,6 @@ impl PerfCounters {
     }
 
     pub fn disable_and_read(&mut self) -> io::Result<CounterSample> {
-        unreachable!("stub PerfCounters is never constructed")
-    }
-
-    pub fn scope<R>(&mut self, _f: impl FnOnce() -> R) -> io::Result<(R, CounterSample)> {
         unreachable!("stub PerfCounters is never constructed")
     }
 }

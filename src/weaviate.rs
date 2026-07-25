@@ -14,9 +14,9 @@
 //!
 //! ```sh
 //! retri-eval-weaviate \
-//!     --vectors datasets/wiki_1M/base.1M.fbin \
-//!     --queries datasets/wiki_1M/query.public.100K.fbin \
-//!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/wiki_1M/base.1M.fbin \
+//!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
+//!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --metric cos --quantization none,binary \
 //!     --output results/
 //! ```
@@ -26,7 +26,9 @@ use std::time::Duration;
 use clap::Parser;
 use itertools::iproduct;
 use retrieval::docker::ContainerHandle;
-use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, Vectors};
+use retrieval::{
+    bail, try_run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, UnwrapOrBail, Vectors,
+};
 use serde_json::json;
 use weaviate_community::collections::objects::Object;
 use weaviate_community::collections::query::RawQuery;
@@ -89,14 +91,18 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_value = "none")]
     quantization: Vec<String>,
 
-    #[arg(long, default_value_t = 16)]
-    connectivity: usize,
+    /// HNSW connectivity M (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', default_value = "16")]
+    connectivity: Vec<usize>,
 
-    #[arg(long, default_value_t = 128)]
-    expansion_add: usize,
+    /// HNSW expansion factor during indexing (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', default_value = "128")]
+    expansion_add: Vec<usize>,
 
-    #[arg(long, default_value_t = 64)]
-    expansion_search: usize,
+    /// HNSW expansion factor during search (comma-separated for sweep).
+    /// Class-level on Weaviate, so each value rebuilds the class.
+    #[arg(long, value_delimiter = ',', default_value = "64")]
+    expansion_search: Vec<usize>,
 
     #[arg(long, default_value_t = 120)]
     docker_timeout: u64,
@@ -177,29 +183,23 @@ impl Backend for WeaviateBackend {
                     .map_err(|e| format!("Weaviate query failed: {e}"))?;
 
                 let offset = query_index * count;
-                let mut found = 0;
-                if let Some(items) = response
+                let items = response
                     .pointer(&format!("/data/Get/{CLASS_NAME}"))
-                    .and_then(|v| v.as_array())
-                {
-                    for (rank, item) in items.iter().enumerate().take(count) {
-                        let stored_index = item.get("idx").and_then(|v| v.as_i64()).unwrap_or(-1);
-                        let distance_value = item
-                            .pointer("/_additional/distance")
-                            .and_then(|d| d.as_f64())
-                            .unwrap_or(f64::INFINITY) as f32;
-                        out_keys[offset + rank] = if stored_index >= 0 { stored_index as Key } else { Key::MAX };
-                        out_distances[offset + rank] = distance_value;
-                        if stored_index >= 0 {
-                            found += 1;
-                        }
-                    }
-                }
-                for rank in found..count {
-                    out_keys[offset + rank] = Key::MAX;
-                    out_distances[offset + rank] = Distance::INFINITY;
-                }
-                out_counts[query_index] = found;
+                    .and_then(|v| v.as_array());
+                let hits = items.into_iter().flatten().filter_map(|item| {
+                    let stored_index = item.get("idx").and_then(|v| v.as_i64())?;
+                    let key = u32::try_from(stored_index).ok()?;
+                    let distance = item
+                        .pointer("/_additional/distance")
+                        .and_then(|d| d.as_f64())
+                        .unwrap_or(f64::INFINITY) as Distance;
+                    Some((key as Key, distance))
+                });
+                out_counts[query_index] = retrieval::write_row(
+                    hits,
+                    &mut out_keys[offset..offset + count],
+                    &mut out_distances[offset..offset + count],
+                );
             }
             Ok::<(), String>(())
         })
@@ -291,8 +291,33 @@ async fn create_class(
     Ok(())
 }
 
+/// Reject argument combinations Weaviate will refuse, before a container starts.
+fn validate(cli: &Cli) -> Result<(), String> {
+    for &expansion_search in &cli.expansion_search {
+        if expansion_search == 0 {
+            return Err("--expansion-search must be greater than 0".into());
+        }
+    }
+    for &connectivity in &cli.connectivity {
+        for &expansion_add in &cli.expansion_add {
+            if expansion_add < connectivity {
+                return Err(format!(
+                    "--expansion-add {expansion_add} is below --connectivity {connectivity}; \
+                     efConstruction below maxConnections leaves the graph under-linked"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
+    validate(&cli).unwrap_or_bail("invalid arguments");
+
+    if cli.common.index.is_some() {
+        bail("--index is not supported for this backend");
+    }
 
     for m in &cli.metric {
         parse_weaviate_distance(m).unwrap_or_bail("metric");
@@ -338,14 +363,33 @@ fn main() {
         std::process::exit(1);
     });
     if cli.common.dimensions.len() > 1 {
-        retrieval::bail("--dimensions sweep with >1 value isn't supported on Weaviate; rerun the binary per dimensions");
+        retrieval::bail(
+            "--dimensions sweep with >1 value isn't supported on Weaviate; rerun the binary per dimensions",
+        );
     }
-    let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
-    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
+    let dimensions = cli
+        .common
+        .dimensions
+        .first()
+        .copied()
+        .unwrap_or_else(|| state.dimensions());
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_bail("invalid --dimensions");
 
     let mut container_slot = Some(handle);
-    let num_configs = cli.metric.len() * cli.quantization.len();
-    for (idx, (metric_str, quant_str)) in iproduct!(&cli.metric, &cli.quantization).enumerate() {
+    let configs: Vec<_> = iproduct!(
+        &cli.metric,
+        &cli.quantization,
+        &cli.connectivity,
+        &cli.expansion_add,
+        &cli.expansion_search
+    )
+    .collect();
+    let num_configs = configs.len();
+    let mut summary = SweepSummary::default();
+    for (idx, (metric_str, quant_str, connectivity, expansion_add, expansion_search)) in configs.into_iter().enumerate()
+    {
         let is_last = idx + 1 == num_configs;
         let metric = parse_weaviate_distance(metric_str).expect("validated above");
         let quant = parse_weaviate_quantization(quant_str).expect("validated above");
@@ -356,9 +400,9 @@ fn main() {
                 &http_base,
                 metric,
                 quant,
-                cli.connectivity as u64,
-                cli.expansion_add as u64,
-                cli.expansion_search as i64,
+                *connectivity as u64,
+                *expansion_add as u64,
+                *expansion_search as i64,
             )
             .await
             .expect("create class");
@@ -366,30 +410,33 @@ fn main() {
 
         let container_for_this_run = if is_last { container_slot.take() } else { None };
 
-        let mut backend = WeaviateBackend {
+        let description = format!(
+            "weaviate · {metric_str} · quant={quant_str} · \
+             M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"
+        );
+        let backend = WeaviateBackend {
             client: WeaviateClient::new(&http_base, None, None).expect("weaviate client"),
             container: container_for_this_run,
             runtime: runtime.handle().clone(),
-            description: format!(
-                "weaviate · {metric_str} · quant={quant_str} · M={} · ef={}/{} · {dimensions}d",
-                cli.connectivity, cli.expansion_add, cli.expansion_search,
-            ),
+            description: description.clone(),
             metadata: {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("backend".into(), json!("weaviate"));
                 metadata.insert("metric".into(), json!(metric_str));
                 metadata.insert("quantization".into(), json!(quant_str));
-                metadata.insert("connectivity".into(), json!(cli.connectivity));
-                metadata.insert("expansion_add".into(), json!(cli.expansion_add));
-                metadata.insert("expansion_search".into(), json!(cli.expansion_search));
+                metadata.insert("connectivity".into(), json!(connectivity));
+                metadata.insert("expansion_add".into(), json!(expansion_add));
+                metadata.insert("expansion_search".into(), json!(expansion_search));
                 metadata
             },
         };
 
-        run(&mut backend, &mut state, dimensions).unwrap_or_else(|e| {
-            eprintln!("Benchmark failed: {e}");
-            std::process::exit(1);
-        });
+        summary.record(try_run_config(
+            &description,
+            Ok::<_, String>(backend),
+            &mut state,
+            dimensions,
+        ));
     }
-    eprintln!("Benchmark complete.");
+    summary.print();
 }

@@ -22,9 +22,9 @@
 //!
 //! ```sh
 //! retri-eval-faiss \
-//!     --vectors datasets/turing_10M/base.10M.fbin \
-//!     --queries datasets/turing_10M/query.public.100K.fbin \
-//!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/turing_10M/base.10M.fbin \
+//!     --query-vectors datasets/turing_10M/query.public.100K.fbin \
+//!     --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
 //!     --data-type f32,bf16,f16,i8 \
 //!     --metric l2 \
 //!     --output results/
@@ -33,9 +33,9 @@
 //! Binary hamming-distance search via BinaryHNSW (1024-bit vectors in `.b1bin`):
 //! ```sh
 //! retri-eval-faiss \
-//!     --vectors datasets/binary_1M/base.1M.b1bin \
-//!     --queries datasets/binary_1M/query.10K.b1bin \
-//!     --neighbors datasets/binary_1M/groundtruth.10K.ibin \
+//!     --base-vectors datasets/binary_1M/base.1M.b1bin \
+//!     --query-vectors datasets/binary_1M/query.10K.b1bin \
+//!     --query-neighbors datasets/binary_1M/groundtruth.10K.ibin \
 //!     --data-type b1 \
 //!     --metric hamming \
 //!     --output results/binary_1M
@@ -49,7 +49,7 @@ use faiss::index::io::{read_index, write_index};
 use faiss::Index as _;
 use itertools::iproduct;
 use retrieval::{
-    run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, UnwrapOrBail, Vectors,
+    run_config, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary, UnwrapOrBail, Vectors,
 };
 use serde_json::{json, Value};
 
@@ -197,33 +197,44 @@ fn is_binary(data_type: &str) -> bool {
     data_type == "b1"
 }
 
-/// Unpack FAISS search results into output buffers, translating FAISS internal
-/// sequential IDs back to our keys via `key_map`.
-fn unpack_search_results<D: Copy>(
-    labels: &[faiss::Idx],
-    distances: &[D],
-    key_map: &[Key],
+/// Buffers one query batch's results, translating FAISS's internal sequential
+/// IDs back to our keys. `key_map` is empty on the `IDMap` paths, where FAISS
+/// already returns the caller's keys.
+struct SearchResults<'a, D> {
+    labels: &'a [faiss::Idx],
+    distances: &'a [D],
+    key_map: &'a [Key],
     count: usize,
+}
+
+fn unpack_search_results<D: Copy>(
+    results: SearchResults<'_, D>,
     to_distance: impl Fn(D) -> Distance,
     out_keys: &mut [Key],
     out_distances: &mut [Distance],
     out_counts: &mut [usize],
 ) {
-    for (query_idx, found_count) in out_counts.iter_mut().enumerate() {
-        let offset = query_idx * count;
-        let mut found = 0;
-        for rank in 0..count {
-            let faiss_id = labels[offset + rank];
-            if let Some(internal_id) = faiss_id.get() {
-                out_keys[offset + rank] = key_map[internal_id as usize];
-                out_distances[offset + rank] = to_distance(distances[offset + rank]);
-                found += 1;
-            } else {
-                out_keys[offset + rank] = Key::MAX;
-                out_distances[offset + rank] = Distance::INFINITY;
-            }
-        }
-        *found_count = found;
+    let SearchResults {
+        labels,
+        distances,
+        key_map,
+        count,
+    } = results;
+    for (query_index, found_count) in out_counts.iter_mut().enumerate() {
+        let offset = query_index * count;
+        let hits = (0..count).filter_map(|rank| {
+            let internal_id = labels[offset + rank].get()?;
+            let key = match key_map.is_empty() {
+                true => internal_id as Key,
+                false => key_map[internal_id as usize],
+            };
+            Some((key, to_distance(distances[offset + rank])))
+        });
+        *found_count = retrieval::write_row(
+            hits,
+            &mut out_keys[offset..offset + count],
+            &mut out_distances[offset..offset + count],
+        );
     }
 }
 
@@ -248,15 +259,16 @@ unsafe impl Send for FaissBackend {}
 unsafe impl Sync for FaissBackend {}
 
 impl FaissBackend {
-    fn new(
-        dimensions: usize,
-        data_type_name: &str,
-        metric_name: &str,
-        connectivity: usize,
-        expansion_add: usize,
-        expansion_search: usize,
-        threads: usize,
-    ) -> Result<Self, String> {
+    fn new(config: IndexConfig<'_>, threads: usize) -> Result<Self, String> {
+        let IndexConfig {
+            dimensions,
+            data_type: data_type_name,
+            metric: metric_name,
+            connectivity,
+            expansion_add,
+            expansion_search,
+        } = config;
+
         unsafe {
             omp_set_num_threads(threads as i32);
         }
@@ -305,7 +317,6 @@ impl FaissBackend {
         metadata.insert("library_version".into(), json!(faiss_version()));
         metadata.insert("data_type".into(), json!(data_type_name));
         metadata.insert("metric".into(), json!(metric_label));
-        metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("connectivity".into(), json!(connectivity));
         metadata.insert("expansion_add".into(), json!(expansion_add));
         metadata.insert("expansion_search".into(), json!(expansion_search));
@@ -362,10 +373,15 @@ impl FaissBackend {
         metadata.insert("backend".into(), json!("faiss"));
         metadata.insert("library_version".into(), json!(faiss_version()));
         metadata.insert("metric".into(), json!(metric_label));
-        metadata.insert("dimensions".into(), json!(dimensions));
         metadata.insert("expansion_search".into(), json!(expansion_search));
         metadata.insert("threads".into(), json!(threads));
         metadata.insert("loaded_from".into(), json!(handle));
+        // faiss-sys binds no HNSW introspection, so these are genuinely unknown
+        // on the load path. Emitted as null rather than omitted: absent would
+        // read as "this backend has no such knob".
+        metadata.insert("data_type".into(), Value::Null);
+        metadata.insert("connectivity".into(), Value::Null);
+        metadata.insert("expansion_add".into(), Value::Null);
 
         Ok(Self {
             index,
@@ -430,25 +446,20 @@ impl Backend for FaissBackend {
                     .search(&data, count)
                     .map_err(|e| format!("FAISS search failed: {e}"))?;
 
-                // IDMap stored our keys natively; labels already are user keys.
-                for (query_idx, found_count) in out_counts.iter_mut().enumerate() {
-                    let offset = query_idx * count;
-                    let mut found = 0;
-                    for rank in 0..count {
-                        match result.labels[offset + rank].get() {
-                            Some(key_u64) => {
-                                out_keys[offset + rank] = key_u64 as Key;
-                                out_distances[offset + rank] = result.distances[offset + rank];
-                                found += 1;
-                            }
-                            None => {
-                                out_keys[offset + rank] = Key::MAX;
-                                out_distances[offset + rank] = Distance::INFINITY;
-                            }
-                        }
-                    }
-                    *found_count = found;
-                }
+                // IDMap stored our keys natively, so an empty `key_map` means
+                // "labels already are user keys".
+                unpack_search_results(
+                    SearchResults {
+                        labels: &result.labels,
+                        distances: &result.distances,
+                        key_map: &[],
+                        count,
+                    },
+                    |d| d,
+                    out_keys,
+                    out_distances,
+                    out_counts,
+                );
                 Ok(())
             }
             FaissIndex::Binary(index) => {
@@ -466,10 +477,12 @@ impl Backend for FaissBackend {
                     .as_deref()
                     .ok_or("binary search requires a key_map populated by add()")?;
                 unpack_search_results(
-                    &result.labels,
-                    &result.distances,
-                    key_map,
-                    count,
+                    SearchResults {
+                        labels: &result.labels,
+                        distances: &result.distances,
+                        key_map,
+                        count,
+                    },
                     |d| d as Distance,
                     out_keys,
                     out_distances,
@@ -541,7 +554,9 @@ fn main() {
         &cli.expansion_add,
         &cli.expansion_search
     ) {
-        state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
+        state
+            .check_dimensions(dimensions)
+            .unwrap_or_bail("invalid --dimensions");
 
         let description =
             format!("faiss · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search}");
@@ -551,12 +566,14 @@ fn main() {
             cli.common.index.as_deref(),
             || {
                 FaissBackend::new(
-                    dimensions,
-                    data_type,
-                    metric,
-                    connectivity,
-                    expansion_add,
-                    expansion_search,
+                    IndexConfig {
+                        dimensions,
+                        data_type,
+                        metric,
+                        connectivity,
+                        expansion_add,
+                        expansion_search,
+                    },
                     cli.threads,
                 )
             },

@@ -1,25 +1,7 @@
-//! Structured error types for the retrieval library.
+//! Structured error types for dataset parsing and brute-force ground truth.
 //!
-//! Replaces the earlier `Result<_, String>` / `Result<_, Box<dyn Error>>`
-//! patterns so callers can pattern-match on variants, attach context, or
-//! translate errors into JSON shapes for reporting.
-//!
-//! Five enums, one per concern:
-//!
-//! - [`DatasetError`] — parsing `.fbin` / `.u8bin` / `.i8bin` / `.b1bin` /
-//!   `.ibin` files.
-//! - [`GroundTruthError`] — brute-force top-K computation (shape, stride,
-//!   thread-pool spawn, NumKong tensor errors).
-//! - [`BackendError`] — USearch, FAISS, Qdrant, Redis, Weaviate, LanceDB,
-//!   cuVS engine-level failures (unknown metric/data_type/op).
-//! - [`PerfCountersError`] — Linux `perf_event_open` permission /
-//!   unsupported-target paths.
-//! - [`DownloadError`] — Parquet shard fetch, HTTP status, schema mismatch.
-//!   Feature-gated on `download` so non-download builds don't pull reqwest.
-//!
-//! Binary-level `main()` functions continue to return
-//! `Result<(), Box<dyn Error>>` — those are terminal sinks and every enum
-//! here implements `Error`, so they box automatically via `?`.
+//! Backends still return `Result<_, String>` — their failure messages are
+//! engine-specific strings with no shared shape worth matching on.
 
 use std::io;
 use std::path::PathBuf;
@@ -93,6 +75,14 @@ pub enum GroundTruthError {
     #[error("dimension mismatch: queries.dimensions={queries}, base.dimensions={base}")]
     DimensionMismatch { queries: usize, base: usize },
 
+    /// The ground-truth output view has a different number of rows than the
+    /// query set — one row of neighbors is expected per query.
+    #[error("row-count mismatch: ground_truth.rows={ground_truth_rows}, queries.rows={query_rows}")]
+    RowCountMismatch {
+        ground_truth_rows: usize,
+        query_rows: usize,
+    },
+
     /// `top_k` larger than the base set.
     #[error("top_k={top_k} exceeds base_count={base_count}")]
     TopKTooLarge { top_k: usize, base_count: usize },
@@ -119,31 +109,6 @@ impl From<numkong::TensorError> for GroundTruthError {
     fn from(error: numkong::TensorError) -> Self {
         Self::Tensor(error)
     }
-}
-
-// #endregion
-
-// #region Backend errors
-
-/// Errors raised by the backend engines (USearch, FAISS, etc.) and the
-/// small amount of wrapper code that drives them.
-#[derive(Debug, thiserror::Error)]
-pub enum BackendError {
-    /// Unknown distance-metric string (e.g. `--metric foo`).
-    #[error("{backend}: unknown metric `{value}`")]
-    UnknownMetric { backend: &'static str, value: String },
-
-    /// Unknown scalar-type string (e.g. `--data-type foo`).
-    #[error("{backend}: unknown data_type `{value}`")]
-    UnknownDataType { backend: &'static str, value: String },
-
-    /// Engine-internal operation failure — `add`, `search`, `create`, etc.
-    #[error("{backend}: {operation}: {message}")]
-    OpFailed {
-        backend: &'static str,
-        operation: &'static str,
-        message: String,
-    },
 }
 
 // #endregion

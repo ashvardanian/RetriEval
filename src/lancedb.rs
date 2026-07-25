@@ -12,9 +12,9 @@
 //!
 //! ```sh
 //! retri-eval-lancedb \
-//!     --vectors datasets/wiki_1M/base.1M.fbin \
-//!     --queries datasets/wiki_1M/query.public.100K.fbin \
-//!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/wiki_1M/base.1M.fbin \
+//!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
+//!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --metric ip \
 //!     --output results/
 //! ```
@@ -167,26 +167,20 @@ impl Backend for LanceDbBackend {
                     .map_err(|e| format!("LanceDB collect: {e}"))?;
 
                 let offset = query_index * count;
-                let mut found = 0;
-                for batch in &batches {
-                    let id_col: Option<&UInt64Array> =
-                        batch.column_by_name("id").and_then(|c| c.as_any().downcast_ref());
-                    let dist_col: Option<&Float32Array> = batch
+                let hits = batches.iter().flat_map(|batch| {
+                    let ids: Option<&UInt64Array> = batch.column_by_name("id").and_then(|c| c.as_any().downcast_ref());
+                    let distances: Option<&Float32Array> = batch
                         .column_by_name("_distance")
                         .and_then(|c| c.as_any().downcast_ref());
-                    if let (Some(ids), Some(distances)) = (id_col, dist_col) {
-                        for rank in 0..ids.len().min(count - found) {
-                            out_keys[offset + found] = ids.value(rank) as Key;
-                            out_distances[offset + found] = distances.value(rank);
-                            found += 1;
-                        }
-                    }
-                }
-                for rank in found..count {
-                    out_keys[offset + rank] = Key::MAX;
-                    out_distances[offset + rank] = Distance::INFINITY;
-                }
-                out_counts[query_index] = found;
+                    let pair = ids.zip(distances);
+                    (0..pair.map_or(0, |(ids, _)| ids.len()))
+                        .filter_map(move |rank| pair.map(|(ids, d)| (ids.value(rank) as Key, d.value(rank))))
+                });
+                out_counts[query_index] = retrieval::write_row(
+                    hits,
+                    &mut out_keys[offset..offset + count],
+                    &mut out_distances[offset..offset + count],
+                );
             }
             Ok::<(), String>(())
         })
@@ -201,6 +195,10 @@ impl Backend for LanceDbBackend {
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.common.index.is_some() {
+        retrieval::bail("--index is not supported for this backend");
+    }
 
     // Validate the metric string early.
     parse_lancedb_metric(&cli.metric).unwrap_or_else(|e| {
@@ -228,7 +226,9 @@ fn main() {
         .first()
         .copied()
         .unwrap_or_else(|| state.dimensions());
-    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_bail("invalid --dimensions");
 
     let mut backend = LanceDbBackend {
         db,
@@ -241,7 +241,13 @@ fn main() {
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("backend".into(), json!("lancedb"));
             metadata.insert("metric".into(), json!(&cli.metric));
-            metadata.insert("dimensions".into(), json!(dimensions));
+            metadata.insert("data_type".into(), json!("f32"));
+            // No `create_index` call: LanceDB's only graph indexes are
+            // `IvfHnswPq` / `IvfHnswSq`, both IVF-bucketed and k-means trained,
+            // which the no-learned-codebook rule excludes. Exhaustive scan is
+            // the compliant fallback, and its recall of 1.0 means that rather
+            // than a perfect graph.
+            metadata.insert("index_type".into(), json!("flat"));
             metadata
         },
     };

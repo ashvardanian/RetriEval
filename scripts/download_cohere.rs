@@ -162,7 +162,6 @@ async fn download_shard(client: &reqwest::Client, url: &str) -> Result<Bytes, Bo
 
 /// Extract `emb_ubinary` bytes (+ optional text columns) from one Parquet shard
 /// and append at most `take` rows.
-#[allow(clippy::too_many_arguments)]
 fn extract_and_append<B: Write>(
     shard_bytes: Bytes,
     take: usize,

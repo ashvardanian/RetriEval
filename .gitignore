@@ -7,7 +7,6 @@
 *.jsonl
 
 /datasets
-/data
 /plots
 *.usearch
 __pycache__/
@@ -16,3 +15,10 @@ __pycache__/
 /results*/
 .claude/
 benchmark*/
+
+# Dataset symlinks into /mnt/data/sources are per-machine; the directory itself
+# is tracked via its .gitkeep. `data/*` (not `/data`) so git descends far enough
+# for the negation below to be reachable.
+data/*
+!data/.gitkeep
+CLAUDE.local.md

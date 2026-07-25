@@ -22,7 +22,7 @@
 //!     --query-count 10000 \
 //!     --dimensions 1024 \
 //!     --clusters 256 \
-//!     --neighbors 10 \
+//!     --count 10 \
 //!     --output datasets/binary_1M/
 //! ```
 
@@ -91,22 +91,12 @@ pub fn auto_tune_batch(base_count: usize, query_count: usize) -> usize {
         .min(query_count.max(1))
 }
 
-/// Compute Hamming top-K nearest neighbors with NumKong SIMD distances
-/// and ForkUnion-parallel top-K selection.
+/// Exact top-K via NumKong's packed distance kernels plus a ForkUnion-parallel
+/// top-K pass (NumKong provides distances but no top-K).
 ///
-/// Shapes (enforced at call time):
-/// - `base` — `[base_count, bits_per_vector]`, row-major and contiguous.
-/// - `queries` — `[query_count, bits_per_vector]`, same `bits_per_vector`.
-/// - `ground_truth` — `[query_count, top_k]`, contiguous u32 output span.
-///
-/// The caller owns all backing storage. `batch_size = None` triggers
-/// [`auto_tune_batch`]. Ties in distance are broken by ascending base index
-/// for deterministic output.
-///
-/// Uses `numkong::Tensor::try_hammings_packed_parallel_into` so the distance
-/// matrix is computed in parallel by NumKong's tile-SIMD kernels directly into
-/// a reusable output buffer. Our ForkUnion wrapping is retained only for the
-/// top-K extraction (NumKong does not provide a top-K).
+/// All three views must have contiguous rows; `base` and `queries` must agree
+/// on width, and `ground_truth` is `[query_count, top_k]`. `batch_size = None`
+/// triggers [`auto_tune_batch`]. Ties break toward the lower base index.
 pub fn compute_top_k<Metric: PackedDistance>(
     base: MatrixView<'_, Metric>,
     queries: MatrixView<'_, Metric>,
@@ -136,9 +126,9 @@ pub fn compute_top_k<Metric: PackedDistance>(
     }
     let query_count = queries.shape()[0];
     if ground_truth.shape()[0] != query_count {
-        return Err(GroundTruthError::DimensionMismatch {
-            queries: ground_truth.shape()[0],
-            base: query_count,
+        return Err(GroundTruthError::RowCountMismatch {
+            ground_truth_rows: ground_truth.shape()[0],
+            query_rows: query_count,
         });
     }
     let top_k = ground_truth.shape()[1];
@@ -411,9 +401,9 @@ struct Cli {
     #[arg(long, default_value_t = 0.1)]
     noise: f64,
 
-    /// Number of ground-truth neighbors per query
+    /// Neighbors to compute per query (the k in the ground-truth file)
     #[arg(long, default_value_t = 10)]
-    neighbors: usize,
+    count: usize,
 
     /// Ground-truth query batch size. When omitted, auto-tuned from available RAM
     /// (distance matrix is `batch_size * base_count * 4 bytes`).
@@ -561,7 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// ground truth → write `base.N.b1bin`, `query.M.b1bin`, `groundtruth.M.ibin`.
 #[allow(dead_code)]
 fn run_b1bin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    if cli.dimensions % 8 != 0 {
+    if !cli.dimensions.is_multiple_of(8) {
         return Err("--dimensions must be a multiple of 8 for b1bin format".into());
     }
     let bytes_per_vector = cli.dimensions / 8;
@@ -596,12 +586,12 @@ fn run_b1bin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "Computing brute-force hamming top-{} ground truth (NumKong + ForkUnion)...",
-        cli.neighbors
+        cli.count
     );
     let base_view = binary_view(&base, cli.base_count, cli.dimensions);
     let query_view = binary_view(&queries, cli.query_count, cli.dimensions);
-    let mut ground_truth_storage = vec![0u32; cli.query_count * cli.neighbors];
-    let ground_truth_span = matrix_span(&mut ground_truth_storage, cli.query_count, cli.neighbors);
+    let mut ground_truth_storage = vec![0u32; cli.query_count * cli.count];
+    let ground_truth_span = matrix_span(&mut ground_truth_storage, cli.query_count, cli.count);
     compute_hamming_top_k(
         base_view,
         query_view,
@@ -631,12 +621,12 @@ fn run_fbin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "Computing brute-force L2 top-{} ground truth (NumKong + ForkUnion)...",
-        cli.neighbors
+        cli.count
     );
     let base_view = matrix_view(&base, cli.base_count, cli.dimensions);
     let query_view = matrix_view(&queries, cli.query_count, cli.dimensions);
-    let mut ground_truth = vec![0u32; cli.query_count * cli.neighbors];
-    let ground_truth_span = matrix_span(&mut ground_truth, cli.query_count, cli.neighbors);
+    let mut ground_truth = vec![0u32; cli.query_count * cli.count];
+    let ground_truth_span = matrix_span(&mut ground_truth, cli.query_count, cli.count);
     compute_top_k::<f32>(
         base_view,
         query_view,
@@ -683,7 +673,7 @@ fn write_dataset<T: Copy>(
 
     eprintln!("Writing {}", gt_path.display());
     let mut file = std::fs::File::create(&gt_path)?;
-    write_bin_header(&mut file, cli.query_count as u32, cli.neighbors as u32)?;
+    write_bin_header(&mut file, cli.query_count as u32, cli.count as u32)?;
     file.write_all(unsafe { retrieval::pod_slice_as_bytes(ground_truth) })?;
 
     let base_mb = (8 + std::mem::size_of_val(base)) as f64 / 1e6;

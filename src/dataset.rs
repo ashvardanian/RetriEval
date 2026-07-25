@@ -59,16 +59,14 @@ fn natural_key(s: &str) -> Vec<NaturalSegment<'_>> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i].is_ascii_digit() {
-            let start = i;
             let mut n: u64 = 0;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
+                // Saturating so an absurdly long digit run clamps instead of panicking.
                 n = n.saturating_mul(10).saturating_add((bytes[i] - b'0') as u64);
                 i += 1;
             }
-            // saturating_mul guarantees the parse never panics on absurdly long
-            // digit runs; the original byte slice doubles as a tiebreaker for
-            // leading-zero variants like `shard_007` vs `shard_7`.
-            let _ = start;
+            // Zero-padding is not preserved, so `shard_007` and `shard_7` compare
+            // equal. Shard sets mixing both spellings would sort unstably.
             out.push(NaturalSegment::Number(n));
         } else {
             let start = i;
@@ -554,9 +552,9 @@ impl Keys {
     /// Get the key at a specific index.
     pub fn get(&self, index: usize) -> Key {
         debug_assert!(
-            index < self.count(),
-            "key index {index} out of bounds (count={})",
-            self.count()
+            index < self.rows(),
+            "key index {index} out of bounds (rows={})",
+            self.rows()
         );
         match self {
             Keys::Mapped(shards) => {
@@ -567,7 +565,7 @@ impl Keys {
         }
     }
 
-    pub fn count(&self) -> usize {
+    pub fn rows(&self) -> usize {
         match self {
             Keys::Mapped(shards) => shards.rows(),
             Keys::Sequential { count } => *count,
@@ -578,7 +576,7 @@ impl Keys {
     /// a single mapped shard; otherwise (cross-shard or `Sequential`) the
     /// scratch buffer is filled and returned.
     pub fn slice<'a>(&'a self, start: usize, count: usize, scratch: &'a mut [Key]) -> &'a [Key] {
-        let count = count.min(self.count() - start);
+        let count = count.min(self.rows() - start);
         match self {
             Keys::Mapped(shards) => {
                 if let Some(bytes) = shards.zero_copy_range(start, count) {
@@ -586,9 +584,9 @@ impl Keys {
                     // mmap base is page-aligned (so 4-byte alignment holds).
                     return unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Key, count) };
                 }
-                for offset in 0..count {
+                for (offset, slot) in scratch[..count].iter_mut().enumerate() {
                     let bytes = shards.row_bytes(start + offset, std::mem::size_of::<Key>());
-                    scratch[offset] = Key::from_le_bytes(bytes.try_into().unwrap());
+                    *slot = Key::from_le_bytes(bytes.try_into().unwrap());
                 }
                 &scratch[..count]
             }

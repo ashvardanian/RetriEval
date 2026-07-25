@@ -16,58 +16,104 @@ pub struct MachineInfo {
     pub ram_bytes: u64,
 }
 
-/// Dataset descriptor.
+/// Dataset descriptor — describes the input files, not the configuration.
 #[derive(Debug, Serialize)]
 pub struct DatasetInfo {
-    pub vectors_path: String,
-    pub queries_path: String,
-    pub neighbors_path: String,
+    pub base_vectors_path: String,
+    pub query_vectors_path: String,
+    pub query_neighbors_path: String,
+    /// Rows in the base file, before any `--max-base-vectors` cap. Divide
+    /// `steps[].vectors_indexed` by this for the share of the ground truth a
+    /// step could possibly have found.
     pub vectors_count: usize,
     pub queries_count: usize,
+    /// The input file's vector width. A `--dimensions` sweep truncates per
+    /// config and reports the effective width as `config.dimensions`.
     pub dimensions: usize,
     pub neighbors_per_query: usize,
 }
 
-/// One measurement step combining add + search results.
+/// One measurement step: how much of the base is in the index, what it cost to
+/// put it there, and how the index scored.
 ///
-/// Fields under "Optional perf counters" are populated only when the benchmark
-/// was run with `--features perf-counters` on Linux AND the caller has
-/// `CAP_PERFMON` (or `kernel.perf_event_paranoid ≤ 1`). They are serde-skipped
-/// when absent, so historical reports parse against the updated struct
-/// without schema changes.
+/// `add` is absent on the `--index` load path, where nothing was inserted.
+/// `self_search` is present on at most one step — the last — because it runs
+/// once against the finished index.
 #[derive(Debug, Serialize)]
 pub struct StepEntry {
     pub vectors_indexed: usize,
-    pub add_elapsed: f64,
-    pub add_throughput: u64,
     pub memory_bytes: u64,
-    pub search_elapsed: f64,
-    pub search_throughput: u64,
-    pub recall_at_1: f64,
-    pub recall_at_10: f64,
-    pub ndcg_at_10: f64,
-    pub recall_at_1_normalized: f64,
-    pub recall_at_10_normalized: f64,
-    pub ndcg_at_10_normalized: f64,
+    pub add: Option<StepAddEntry>,
+    pub ground_truth_search: Option<StepSearchEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_search: Option<StepSearchEntry>,
+}
 
-    // Optional perf counters — summed across all online CPUs, system-wide
-    // for the duration of the add-loop (…_add) or search-loop (…_search).
+/// The insertion half of a step.
+#[derive(Debug, Serialize)]
+pub struct StepAddEntry {
+    pub elapsed: f64,
+    pub throughput: u64,
+    #[serde(flatten)]
+    pub counters: PhaseCounters,
+}
+
+/// One pass of a query set against the index, timed and scored. The same shape
+/// serves the supplied ground truth and the self-search, which differ only in
+/// where their truth comes from.
+#[derive(Debug, Serialize)]
+pub struct StepSearchEntry {
+    pub queries: usize,
+    /// Neighbors requested per query — the k every metric below is taken at.
+    pub neighbor_count: usize,
+    pub elapsed: f64,
+    pub throughput: u64,
+    /// Rank-1 truth found anywhere in the top-k: FAISS's `OneRecallAtRCriterion`,
+    /// USearch's `mean_recall`. Saturates as k grows — `intersection_at_k` is the
+    /// discriminating measure at large k.
+    pub recall_at_1: f64,
+    pub recall_at_k: f64,
+    /// Set overlap `|top-k ∩ truth-k| / k`, order-independent — what
+    /// ann-benchmarks and cuVS publish as recall. Absent for a self-search,
+    /// whose truth set is a single key.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cycles_add: Option<u64>,
+    pub intersection_at_k: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions_add: Option<u64>,
+    pub ndcg_at_k: Option<f64>,
+    #[serde(flatten)]
+    pub counters: PhaseCounters,
+}
+
+/// Hardware counters for one phase, summed across all online CPUs. Populated
+/// only with `--features perf-counters` on Linux and `CAP_PERFMON` (or
+/// `kernel.perf_event_paranoid <= 1`); every field is serde-skipped otherwise.
+#[derive(Debug, Default, Serialize)]
+pub struct PhaseCounters {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_misses_add: Option<u64>,
+    pub cycles: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch_misses_add: Option<u64>,
+    pub instructions: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cycles_search: Option<u64>,
+    pub cache_references: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions_search: Option<u64>,
+    pub cache_misses: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_misses_search: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch_misses_search: Option<u64>,
+    pub branch_misses: Option<u64>,
+}
+
+impl PhaseCounters {
+    pub fn from_sample(sample: Option<&crate::perf_counters::CounterSample>) -> Self {
+        match sample {
+            None => Self::default(),
+            Some(s) => Self {
+                cycles: Some(s.cycles),
+                instructions: Some(s.instructions),
+                cache_references: Some(s.cache_references),
+                cache_misses: Some(s.cache_misses),
+                branch_misses: Some(s.branch_misses),
+            },
+        }
+    }
 }
 
 /// Complete report for one backend configuration.

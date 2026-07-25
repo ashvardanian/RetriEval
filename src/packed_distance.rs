@@ -59,9 +59,7 @@ where
     fn metric_name() -> &'static str;
 }
 
-// ----------------------------------------------------------------------------
-// Hamming (u1x8 → u32)
-// ----------------------------------------------------------------------------
+// #region Hamming (u1x8 → u32)
 
 impl PackedDistance for numkong::u1x8 {
     type Distance = u32;
@@ -86,9 +84,7 @@ impl PackedDistance for numkong::u1x8 {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Euclidean L2 (f32 → f64)
-// ----------------------------------------------------------------------------
+// #region Euclidean L2 (f32 → f64)
 
 impl PackedDistance for f32 {
     /// NumKong's `Euclideans::SpatialResult` for `f32` input is `f64` —

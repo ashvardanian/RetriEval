@@ -14,9 +14,9 @@
 //!
 //! ```sh
 //! retri-eval-redis \
-//!     --vectors datasets/wiki_1M/base.1M.fbin \
-//!     --queries datasets/wiki_1M/query.public.100K.fbin \
-//!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/wiki_1M/base.1M.fbin \
+//!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
+//!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --metric ip \
 //!     --output results/
 //! ```
@@ -28,7 +28,8 @@ use clap::Parser;
 use itertools::iproduct;
 use retrieval::docker::ContainerHandle;
 use retrieval::{
-    bail, pod_slice_as_bytes, run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, VectorSlice, Vectors,
+    bail, pod_slice_as_bytes, try_run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary,
+    UnwrapOrBail, VectorSlice, Vectors,
 };
 use serde_json::json;
 
@@ -209,11 +210,19 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_value = "f32")]
     data_type: Vec<String>,
 
-    #[arg(long, default_value_t = 16)]
-    connectivity: usize,
+    /// HNSW connectivity M (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', default_value = "16")]
+    connectivity: Vec<usize>,
 
-    #[arg(long, default_value_t = 128)]
-    expansion_add: usize,
+    /// HNSW expansion factor during indexing (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', default_value = "128")]
+    expansion_add: Vec<usize>,
+
+    /// HNSW expansion factor during search — RediSearch's `EF_RUNTIME`
+    /// (comma-separated for sweep). RediSearch rejects values below the
+    /// requested neighbor count, so this is raised to it when smaller.
+    #[arg(long, value_delimiter = ',', default_value = "64")]
+    expansion_search: Vec<usize>,
 
     #[arg(long, default_value_t = 120)]
     docker_timeout: u64,
@@ -222,9 +231,10 @@ struct Cli {
     #[arg(long, default_value_t = 6379)]
     port: u16,
 
-    /// Batch size for pipeline operations
+    /// Vectors per pipeline flush (distinct from the shared `--batch-size-add`
+    /// / `--batch-size-search`, which pace the harness's add/search loops)
     #[arg(long, default_value_t = 1_000)]
-    batch_size: usize,
+    batch_size_upsert: usize,
 }
 
 // #region Backend
@@ -235,6 +245,9 @@ struct RedisBackend {
     runtime: tokio::runtime::Handle,
     batch_size: usize,
     data_type: RedisDataType,
+    /// RediSearch's `EF_RUNTIME`, applied per query rather than at index
+    /// creation so it can be swept without rebuilding.
+    expansion_search: usize,
     description: String,
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -287,13 +300,15 @@ impl Backend for RedisBackend {
         let dimensions = queries.dimensions;
         let num_vectors = queries.len();
         let bytes_per_row = dimensions * self.data_type.bytes_per_element;
-        let query_str = format!("*=>[KNN {count} @vector $BLOB]");
+        // `EF_RUNTIME` below the requested count is rejected by RediSearch.
+        let ef_runtime = self.expansion_search.max(count);
+        let query_str = format!("*=>[KNN {count} @vector $BLOB EF_RUNTIME {ef_runtime}]");
 
         // FT.SEARCH is one request per query (no pipelining for vector search), so encode the whole
         // query batch once and index into it per iteration — single allocation for num_vectors rows.
         let encoded = encode_batch(self.data_type, &queries.data, 0, num_vectors, dimensions);
 
-        for query_index in 0..num_vectors {
+        for (query_index, found_count) in out_counts.iter_mut().enumerate().take(num_vectors) {
             let query_bytes = encoded.row_bytes(query_index, bytes_per_row);
 
             let raw: redis::Value = redis::cmd("FT.SEARCH")
@@ -316,16 +331,11 @@ impl Backend for RedisBackend {
 
             let offset = query_index * count;
             let pairs = parse_ft_search(&raw);
-            let found = pairs.len().min(count);
-            for (rank, (id, score)) in pairs.iter().enumerate().take(count) {
-                out_keys[offset + rank] = *id;
-                out_distances[offset + rank] = *score;
-            }
-            for rank in found..count {
-                out_keys[offset + rank] = Key::MAX;
-                out_distances[offset + rank] = Distance::INFINITY;
-            }
-            out_counts[query_index] = found;
+            *found_count = retrieval::write_row(
+                pairs.iter().copied(),
+                &mut out_keys[offset..offset + count],
+                &mut out_distances[offset..offset + count],
+            );
         }
         Ok(())
     }
@@ -389,8 +399,37 @@ fn parse_ft_search(value: &redis::Value) -> Vec<(Key, Distance)> {
 
 // #region main
 
+/// Reject argument combinations RediSearch will refuse or silently reinterpret,
+/// before a container is started.
+fn validate(cli: &Cli) -> Result<(), String> {
+    for &expansion_search in &cli.expansion_search {
+        if expansion_search == 0 {
+            return Err("--expansion-search must be greater than 0".into());
+        }
+    }
+    for &connectivity in &cli.connectivity {
+        for &expansion_add in &cli.expansion_add {
+            if expansion_add < connectivity {
+                return Err(format!(
+                    "--expansion-add {expansion_add} is below --connectivity {connectivity}; \
+                     RediSearch cannot build a graph with fewer candidates than edges"
+                ));
+            }
+        }
+    }
+    if cli.batch_size_upsert == 0 {
+        return Err("--batch-size-upsert must be greater than 0".into());
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
+    validate(&cli).unwrap_or_bail("invalid arguments");
+
+    if cli.common.index.is_some() {
+        bail("--index is not supported for this backend");
+    }
 
     for m in &cli.metric {
         parse_redis_metric(m).unwrap_or_bail("metric");
@@ -423,15 +462,32 @@ fn main() {
     if cli.common.dimensions.len() > 1 {
         retrieval::bail("--dimensions sweep with >1 value isn't supported on Redis; rerun the binary per dimensions");
     }
-    let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
-    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
+    let dimensions = cli
+        .common
+        .dimensions
+        .first()
+        .copied()
+        .unwrap_or_else(|| state.dimensions());
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_bail("invalid --dimensions");
 
     let redis_url = format!("redis://localhost:{}/", cli.port);
     let client = redis::Client::open(redis_url.as_str()).expect("redis client");
 
     let mut container_slot = Some(handle);
-    let num_configs = cli.metric.len() * cli.data_type.len();
-    for (idx, (metric_str, dtype_str)) in iproduct!(&cli.metric, &cli.data_type).enumerate() {
+    let configs: Vec<_> = iproduct!(
+        &cli.metric,
+        &cli.data_type,
+        &cli.connectivity,
+        &cli.expansion_add,
+        &cli.expansion_search
+    )
+    .collect();
+    let num_configs = configs.len();
+    let mut summary = SweepSummary::default();
+    for (idx, (metric_str, dtype_str, connectivity, expansion_add, expansion_search)) in configs.into_iter().enumerate()
+    {
         let is_last = idx + 1 == num_configs;
         let metric = parse_redis_metric(metric_str).expect("metric validated above");
         let data_type = parse_redis_data_type(dtype_str).expect("data_type validated above");
@@ -457,40 +513,45 @@ fn main() {
             .arg("DISTANCE_METRIC")
             .arg(metric)
             .arg("M")
-            .arg(cli.connectivity)
+            .arg(*connectivity)
             .arg("EF_CONSTRUCTION")
-            .arg(cli.expansion_add)
+            .arg(*expansion_add)
             .query(&mut conn)
             .expect("FT.CREATE");
 
         let container_for_this_run = if is_last { container_slot.take() } else { None };
 
-        let mut backend = RedisBackend {
+        let description = format!(
+            "redis · {metric_str} · data_type={dtype_str} · \
+             M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"
+        );
+        let backend = RedisBackend {
             connection: RefCell::new(conn),
             container: container_for_this_run,
             runtime: runtime.handle().clone(),
-            batch_size: cli.batch_size,
+            batch_size: cli.batch_size_upsert,
             data_type,
-            description: format!(
-                "redis · {metric_str} · data_type={dtype_str} · M={} · ef={} · {dimensions}d",
-                cli.connectivity, cli.expansion_add,
-            ),
+            expansion_search: *expansion_search,
+            description: description.clone(),
             metadata: {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("backend".into(), json!("redis"));
                 metadata.insert("metric".into(), json!(metric_str));
                 metadata.insert("data_type".into(), json!(dtype_str));
                 metadata.insert("bytes_per_element".into(), json!(data_type.bytes_per_element));
-                metadata.insert("connectivity".into(), json!(cli.connectivity));
-                metadata.insert("expansion_add".into(), json!(cli.expansion_add));
+                metadata.insert("connectivity".into(), json!(connectivity));
+                metadata.insert("expansion_add".into(), json!(expansion_add));
+                metadata.insert("expansion_search".into(), json!(expansion_search));
                 metadata
             },
         };
 
-        run(&mut backend, &mut state, dimensions).unwrap_or_else(|e| {
-            eprintln!("Benchmark failed: {e}");
-            std::process::exit(1);
-        });
+        summary.record(try_run_config(
+            &description,
+            Ok::<_, String>(backend),
+            &mut state,
+            dimensions,
+        ));
     }
-    eprintln!("Benchmark complete.");
+    summary.print();
 }

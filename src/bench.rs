@@ -24,7 +24,7 @@ pub mod perf_counters;
 
 #[cfg(feature = "download")]
 pub use error::DownloadError;
-pub use error::{BackendError, DatasetError, GroundTruthError, PerfCountersError};
+pub use error::{DatasetError, GroundTruthError, PerfCountersError};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -35,7 +35,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 
 pub use dataset::{Dataset, GroundTruth, Keys};
-pub use output::{collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo, StepEntry};
+pub use output::{
+    collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo, PhaseCounters,
+    StepAddEntry, StepEntry, StepSearchEntry,
+};
 
 // #region Core types
 
@@ -113,12 +116,68 @@ pub trait Backend: Send {
     ) -> Result<(), String>;
     fn memory_bytes(&self) -> usize;
 
+    /// How many vectors the backend actually holds, when it can say.
+    ///
+    /// The harness otherwise infers this from the dataset, which is wrong on
+    /// the `--index` load path: a saved index may have been built over a
+    /// different slice of the base than the current run's `--max-base-vectors`
+    /// implies. Self-recall depends on the answer — it queries base rows and
+    /// asserts each one is in the index — so a backend that knows its own
+    /// population should report it. `None` means "no idea, trust the dataset".
+    fn indexed_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Persist the index under `handle`. For embedded backends `handle` is a
     /// filesystem path; for server-style backends it's a collection / table /
     /// index name. Default returns Err so backends opt in by overriding.
     fn save(&self, _handle: &str) -> Result<(), String> {
         Err("--index: save not yet implemented for this backend".into())
     }
+}
+
+// #region Index configuration
+
+/// The hyper-parameters every graph backend understands, in the shared
+/// vocabulary. Backends take this by value and add their own engine-specific
+/// knobs alongside; naming the fields is what stops `metric` and `data_type`,
+/// or the run of `usize` graph knobs, from being transposed at a call site.
+#[derive(Clone, Copy)]
+pub struct IndexConfig<'a> {
+    pub dimensions: usize,
+    pub data_type: &'a str,
+    pub metric: &'a str,
+    pub connectivity: usize,
+    pub expansion_add: usize,
+    pub expansion_search: usize,
+}
+
+// #region Result buffers
+
+/// Write one query's hits into its slice of the output buffers and return how
+/// many landed. Hits are compacted to the front and the tail is padded with
+/// `Key::MAX` / `Distance::INFINITY`.
+///
+/// `eval` scores `out_keys[..found_count]`, so a backend that leaves a hole at
+/// a non-terminal rank pushes real hits outside the scanned window. Backends
+/// filter their engine's misses out of `hits` rather than yielding sentinels.
+pub fn write_row(
+    hits: impl IntoIterator<Item = (Key, Distance)>,
+    out_keys: &mut [Key],
+    out_distances: &mut [Distance],
+) -> usize {
+    let count = out_keys.len().min(out_distances.len());
+    let mut found = 0;
+    for (key, distance) in hits.into_iter().take(count) {
+        out_keys[found] = key;
+        out_distances[found] = distance;
+        found += 1;
+    }
+    for slot in found..count {
+        out_keys[slot] = Key::MAX;
+        out_distances[slot] = Distance::INFINITY;
+    }
+    found
 }
 
 // #region Utilities
@@ -156,21 +215,26 @@ pub fn format_thousands(n: u64) -> String {
 /// Shared CLI arguments for all backends.
 #[derive(clap::Args, Debug)]
 pub struct CommonArgs {
-    /// Path to the base vectors file (.fbin, .u8bin, .i8bin)
+    /// Base vectors to index (.fbin, .u8bin, .i8bin, .b1bin)
     #[arg(long)]
-    pub vectors: PathBuf,
+    pub base_vectors: PathBuf,
 
-    /// Path to the query vectors file
+    /// Optional keys for the base vectors (.i32bin). One per base vector.
     #[arg(long)]
-    pub queries: PathBuf,
+    pub base_keys: Option<PathBuf>,
 
-    /// Path to the ground-truth neighbors file (.ibin)
+    /// Query vectors to search with
     #[arg(long)]
-    pub neighbors: PathBuf,
+    pub query_vectors: PathBuf,
 
-    /// Optional path to a keys file (.i32bin)
+    /// Ground-truth neighbors for those queries (.ibin)
     #[arg(long)]
-    pub keys: Option<PathBuf>,
+    pub query_neighbors: PathBuf,
+
+    /// Neighbors to request per query — the k every metric is taken at.
+    /// Defaults to the ground-truth file's width, and may not exceed it.
+    #[arg(long)]
+    pub search_count: Option<usize>,
 
     /// Disable shuffling of insertion order (shuffle is on by default)
     #[arg(long, default_value_t = false)]
@@ -178,7 +242,7 @@ pub struct CommonArgs {
 
     /// Number of measurement steps (dataset is split into this many equal parts)
     #[arg(long, default_value_t = 10)]
-    pub epochs: usize,
+    pub steps: usize,
 
     /// Vectors per backend add() call
     #[arg(long, default_value_t = 10_000)]
@@ -205,6 +269,34 @@ pub struct CommonArgs {
     /// at startup when `--index` is set.
     #[arg(long)]
     pub index: Option<String>,
+
+    /// Replay indexed vectors as their own queries and report the fraction that
+    /// retrieve themselves within the top-`--self-search-count` ("self-recall").
+    /// Runs once, after the last insertion, and needs no ground truth — a vector
+    /// in the index is its own nearest neighbor. Because it can sweep the whole
+    /// base rather than a short query file, it is also the only phase that
+    /// measures throughput under sustained load.
+    #[arg(long, default_value_t = false)]
+    pub self_search: bool,
+
+    /// Neighbors requested per query during the self-recall sweep (the `k` in
+    /// self-recall@k). No effect without `--self-search`.
+    #[arg(long, default_value_t = 10)]
+    pub self_search_count: usize,
+
+    /// How many base vectors the self-recall sweep replays. A bare integer ≥ 1
+    /// is an absolute count; a value with a decimal point (≤ 1.0) is a fraction
+    /// of the base, so `1.0` means all and `1` means a single vector. Omitted →
+    /// all. A full sweep is the point on GPU backends, but 100M round trips
+    /// through a server-style backend is not a measurement anyone waits for.
+    ///
+    /// The subset is the *leading* N rows of the base file, not a random draw —
+    /// contiguity is what keeps the query slices zero-copy, so the throughput
+    /// figure stays clean. On a base whose row order carries structure (sorted,
+    /// clustered, or concatenated shards) a partial sweep is therefore not a
+    /// representative sample; only the default full sweep is unbiased.
+    #[arg(long, value_name = "N|FRACTION")]
+    pub self_search_sample: Option<String>,
 
     /// Matryoshka-style embedding-dimension truncations to evaluate
     /// (comma-separated). Empty → use the file's native dimensions. Each value must
@@ -254,9 +346,14 @@ pub struct BenchState {
     pub query_dataset: Dataset,
     pub ground_truth: GroundTruth,
     pub perm: dataset::Permutation,
-    pub epochs: usize,
+    /// Resolved `--search-count`: the search width and the k every metric uses.
+    pub count: usize,
+    pub steps: usize,
     pub batch_size_add: usize,
     pub batch_size_search: usize,
+    pub self_search: bool,
+    pub self_search_count: usize,
+    pub self_search_sample: Option<String>,
     pub output_dir: Option<PathBuf>,
     pub machine_info: MachineInfo,
     pub dataset_info: DatasetInfo,
@@ -274,11 +371,24 @@ pub struct BenchState {
 
 impl BenchState {
     pub fn load(args: &CommonArgs) -> Result<Self, Box<dyn std::error::Error>> {
-        if args.epochs == 0 {
-            return Err("--epochs must be greater than 0".into());
+        if args.steps == 0 {
+            return Err("--steps must be greater than 0".into());
         }
         if args.batch_size_add == 0 {
             return Err("--batch-size-add must be greater than 0".into());
+        }
+        if args.self_search {
+            if args.self_search_count == 0 {
+                return Err("--self-search-count must be greater than 0".into());
+            }
+            // Validate the sample spec's grammar now (before the base size is
+            // known); the actual vector count is resolved per-run in
+            // `resolve_self_search_sample`.
+            if let Some(spec) = &args.self_search_sample {
+                parse_self_search_sample(spec)?;
+            }
+        } else if args.self_search_sample.is_some() {
+            return Err("--self-search-sample has no effect without --self-search".into());
         }
 
         // Create output directory if specified
@@ -296,8 +406,8 @@ impl BenchState {
 
         let machine_info = collect_machine_info();
 
-        eprintln!("Loading dataset: {}", args.vectors.display());
-        let dataset = Dataset::load(&args.vectors)?;
+        eprintln!("Loading dataset: {}", args.base_vectors.display());
+        let dataset = Dataset::load(&args.base_vectors)?;
         let file_vectors = dataset.rows();
         let total_vectors = match args.max_base_vectors {
             Some(cap) => cap.min(file_vectors),
@@ -310,6 +420,14 @@ impl BenchState {
                 format_thousands(file_vectors as u64),
                 format_thousands(total_vectors as u64),
             );
+            eprintln!(
+                "  note: ground truth still refers to all {} rows, so raw recall is bounded by \
+                 ~{:.0}%. The `*_normalized` fields divide that back out, assuming the indexed \
+                 slice is a uniform sample of the base — treat them as estimates, and don't \
+                 compare capped runs against uncapped ones.",
+                format_thousands(file_vectors as u64),
+                100.0 * total_vectors as f64 / file_vectors as f64,
+            );
         } else {
             eprintln!(
                 "  {} vectors, {} dimensions",
@@ -318,18 +436,31 @@ impl BenchState {
             );
         }
 
-        let keys = match &args.keys {
+        let keys = match &args.base_keys {
             Some(path) => {
                 eprintln!("Loading keys: {}", path.display());
                 let k = Keys::load(path)?;
-                eprintln!("  {} keys", format_thousands(k.count() as u64));
+                eprintln!("  {} keys", format_thousands(k.rows() as u64));
+                // One key per base vector is a hard requirement: the add loop
+                // indexes keys by base row, so a short file reads past the end
+                // of the mapping (a bounds panic at best, a garbage key at
+                // worst, since the check is only a `debug_assert`).
+                if k.rows() < total_vectors {
+                    return Err(format!(
+                        "--base-keys has {} entries but {} base vectors are in play; \
+                         one key per vector is required",
+                        format_thousands(k.rows() as u64),
+                        format_thousands(total_vectors as u64),
+                    )
+                    .into());
+                }
                 k
             }
             None => Keys::sequential(total_vectors),
         };
 
-        eprintln!("Loading queries: {}", args.queries.display());
-        let query_dataset = Dataset::load(&args.queries)?;
+        eprintln!("Loading queries: {}", args.query_vectors.display());
+        let query_dataset = Dataset::load(&args.query_vectors)?;
         let num_queries = query_dataset.rows();
         eprintln!(
             "  {} queries, {} dimensions",
@@ -337,8 +468,8 @@ impl BenchState {
             query_dataset.dimensions()
         );
 
-        eprintln!("Loading ground truth: {}", args.neighbors.display());
-        let ground_truth = GroundTruth::load(&args.neighbors)?;
+        eprintln!("Loading ground truth: {}", args.query_neighbors.display());
+        let ground_truth = GroundTruth::load(&args.query_neighbors)?;
         eprintln!(
             "  {} queries, {} neighbors each",
             format_thousands(ground_truth.queries() as u64),
@@ -352,34 +483,47 @@ impl BenchState {
             dataset::Permutation::shuffled(total_vectors, 42)
         };
 
-        let search_count = ground_truth.neighbors_per_query();
-        let add_chunk_size = args.batch_size_add;
+        let ground_truth_width = ground_truth.neighbors_per_query();
+        let count = args.search_count.unwrap_or(ground_truth_width);
+        if count == 0 {
+            return Err("--search-count must be greater than 0".into());
+        }
+        if count > ground_truth_width {
+            return Err(format!(
+                "--search-count {count} exceeds the ground truth's {ground_truth_width} neighbors per query"
+            )
+            .into());
+        }
 
         let dataset_info = DatasetInfo {
-            vectors_path: args.vectors.display().to_string(),
-            queries_path: args.queries.display().to_string(),
-            neighbors_path: args.neighbors.display().to_string(),
-            vectors_count: total_vectors,
+            base_vectors_path: args.base_vectors.display().to_string(),
+            query_vectors_path: args.query_vectors.display().to_string(),
+            query_neighbors_path: args.query_neighbors.display().to_string(),
+            vectors_count: file_vectors,
             queries_count: num_queries,
             dimensions,
-            neighbors_per_query: search_count,
+            neighbors_per_query: ground_truth_width,
         };
 
         Ok(Self {
             total_vectors,
             perm,
-            epochs: args.epochs,
-            batch_size_add: add_chunk_size,
+            count,
+            steps: args.steps,
+            batch_size_add: args.batch_size_add,
             batch_size_search: args.batch_size_search,
+            self_search: args.self_search,
+            self_search_count: args.self_search_count,
+            self_search_sample: args.self_search_sample.clone(),
             output_dir: args.output.clone(),
             machine_info,
             dataset_info,
-            out_keys: vec![0 as Key; num_queries * search_count],
-            out_distances: vec![0.0 as Distance; num_queries * search_count],
+            out_keys: vec![0 as Key; num_queries * count],
+            out_distances: vec![0.0 as Distance; num_queries * count],
             out_counts: vec![0usize; num_queries],
-            key_scratch: vec![0 as Key; add_chunk_size],
+            key_scratch: vec![0 as Key; args.batch_size_add],
             scratch_buf: {
-                let max_batch = add_chunk_size.max(args.batch_size_search);
+                let max_batch = args.batch_size_add.max(args.batch_size_search);
                 let max_row_bytes = dataset.vector_bytes().max(query_dataset.vector_bytes());
                 vec![0u8; max_batch * max_row_bytes]
             },
@@ -416,16 +560,6 @@ struct AddPhaseOutcome {
     counter_sample: Option<perf_counters::CounterSample>,
 }
 
-/// Outcome of one step's search phase.
-struct SearchPhaseOutcome {
-    elapsed_secs: f64,
-    throughput_per_sec: u64,
-    counter_sample: Option<perf_counters::CounterSample>,
-    recall_at_1: f64,
-    recall_at_10: f64,
-    ndcg_at_10: f64,
-}
-
 /// Arm perf counters before a phase; on failure disarm the whole capture so
 /// later phases don't try again. Single place for the error-logging wording.
 fn start_counter_capture(perf: &mut Option<perf_counters::PerfCounters>, phase: &str) {
@@ -453,23 +587,32 @@ fn stop_and_read_counters(
     }
 }
 
-/// Run the add-phase of one step: insert `step_count` vectors in batches of
-/// `add_chunk_size`, capturing perf counters across the whole phase.
-/// Mutates `vectors_indexed` to the new cumulative count. `dimensions` is the
-/// per-vector dimensionality exposed to the backend (≤ native).
-#[allow(clippy::too_many_arguments)]
+/// The slice of the base one step inserts, at the dimensionality this config
+/// exposes to the backend.
+struct StepSlice {
+    start: usize,
+    count: usize,
+    dimensions: usize,
+}
+
+/// Insert one step's slice in `batch_size_add` chunks, capturing perf counters
+/// across the phase. Advances `vectors_indexed` to the new cumulative count.
 fn run_add_phase(
-    index: &mut dyn Backend,
+    backend: &mut dyn Backend,
     state: &mut BenchState,
     perf: &mut Option<perf_counters::PerfCounters>,
     progress_style: &ProgressStyle,
-    step_start: usize,
-    step_count: usize,
-    total_vectors: usize,
-    add_chunk_size: usize,
-    dimensions: usize,
+    slice: StepSlice,
     vectors_indexed: &mut usize,
 ) -> BenchResult<AddPhaseOutcome> {
+    let StepSlice {
+        start: step_start,
+        count: step_count,
+        dimensions,
+    } = slice;
+    let total_vectors = state.total_vectors;
+    let batch_size_add = state.batch_size_add;
+
     let progress = ProgressBar::new(total_vectors as u64);
     progress.set_style(progress_style.clone());
     progress.set_position(*vectors_indexed as u64);
@@ -478,7 +621,7 @@ fn run_add_phase(
     let add_start = Instant::now();
     let mut added = 0;
     while added < step_count {
-        let batch = add_chunk_size.min(step_count - added);
+        let batch = batch_size_add.min(step_count - added);
         let logical_offset = step_start + added;
         let indices = state.perm.range(logical_offset, batch);
 
@@ -488,7 +631,7 @@ fn run_add_phase(
         let batch_keys = &state.key_scratch[..batch];
         let vectors = state.dataset.gather(indices, dimensions, &mut state.scratch_buf);
 
-        index.add(batch_keys, vectors)?;
+        backend.add(batch_keys, vectors)?;
         added += batch;
         *vectors_indexed += batch;
         let elapsed = add_start.elapsed().as_secs_f64();
@@ -527,22 +670,21 @@ fn run_add_phase(
     })
 }
 
-/// Run the search-phase of one step: execute all queries against the current
-/// index, compute recall/NDCG against the ground truth, emit a progress bar.
-/// `dimensions` is the per-vector dimensionality exposed to the backend.
-#[allow(clippy::too_many_arguments)]
+/// Run all queries against the current index and score them. `vectors_indexed`
+/// only affects normalization; `is_final_step` drops the `~` from the progress
+/// line once the index is complete.
 fn run_search_phase(
-    index: &dyn Backend,
+    backend: &dyn Backend,
     state: &mut BenchState,
     perf: &mut Option<perf_counters::PerfCounters>,
     progress_style: &ProgressStyle,
-    num_queries: usize,
-    search_count: usize,
-    vectors_indexed: usize,
-    total_vectors: usize,
     dimensions: usize,
+    vectors_indexed: usize,
     is_final_step: bool,
-) -> BenchResult<SearchPhaseOutcome> {
+) -> BenchResult<StepSearchEntry> {
+    let num_queries = state.query_dataset.rows();
+    let count = state.count;
+
     let progress = ProgressBar::new(num_queries as u64);
     progress.set_style(progress_style.clone());
     progress.set_position(0);
@@ -551,22 +693,22 @@ fn run_search_phase(
     let search_start = Instant::now();
     let mut searched = 0usize;
     while searched < num_queries {
-        let batch_count = state.batch_size_search.min(num_queries - searched);
+        let batch_rows = state.batch_size_search.min(num_queries - searched);
         let batch_queries = state
             .query_dataset
-            .slice(searched, batch_count, dimensions, &mut state.scratch_buf);
-        let key_offset = searched * search_count;
-        let key_end = key_offset + batch_count * search_count;
+            .slice(searched, batch_rows, dimensions, &mut state.scratch_buf);
+        let key_offset = searched * count;
+        let key_end = key_offset + batch_rows * count;
 
-        index.search(
+        backend.search(
             batch_queries,
-            search_count,
+            count,
             &mut state.out_keys[key_offset..key_end],
             &mut state.out_distances[key_offset..key_end],
-            &mut state.out_counts[searched..searched + batch_count],
+            &mut state.out_counts[searched..searched + batch_rows],
         )?;
 
-        searched += batch_count;
+        searched += batch_rows;
         let elapsed = search_start.elapsed().as_secs_f64();
         let throughput = if elapsed > 0.0 {
             (searched as f64 / elapsed) as u64
@@ -589,51 +731,234 @@ fn run_search_phase(
     } else {
         0
     };
-    let recall_at_1 = eval::recall_at_k(&state.out_keys, &state.out_counts, search_count, &state.ground_truth, 1);
-    let recall_at_10 = eval::recall_at_k(
-        &state.out_keys,
-        &state.out_counts,
-        search_count,
-        &state.ground_truth,
-        10,
-    );
-    let ndcg_at_10 = eval::ndcg_at_k(
-        &state.out_keys,
-        &state.out_counts,
-        search_count,
-        &state.ground_truth,
-        10,
-    );
+    let recall_at_1 = eval::recall_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, 1);
+    let recall_at_k = eval::recall_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, count);
+    let intersection_at_k =
+        eval::intersection_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, count);
+    let ndcg_at_k = eval::ndcg_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, count);
 
-    let recall_at_1_norm = eval::normalize_metric(recall_at_1, vectors_indexed, total_vectors);
-    let recall_at_10_norm = eval::normalize_metric(recall_at_10, vectors_indexed, total_vectors);
-    let ndcg_at_10_norm = eval::normalize_metric(ndcg_at_10, vectors_indexed, total_vectors);
-
+    // Metrics are raw. A step that holds only part of the base cannot find the
+    // ground truth it does not hold, so the coverage share is printed alongside
+    // rather than divided out — that correction assumes the indexed slice is a
+    // uniform sample, which a leading prefix is not.
+    let coverage = vectors_indexed as f64 / state.dataset.rows().max(1) as f64;
     let approx = if is_final_step { "" } else { "~" };
     progress.finish_with_message(format!(
-        "{} search/s, {approx}recall@1={recall_at_1_norm:.4}, \
-         {approx}recall@10={recall_at_10_norm:.4}, \
-         {approx}NDCG@10={ndcg_at_10_norm:.4} ({} vectors)",
+        "{} search/s, {approx}recall@1={recall_at_1:.4}, \
+         {approx}recall@{count}={recall_at_k:.4}, \
+         {approx}intersection@{count}={intersection_at_k:.4}, \
+         {approx}NDCG@{count}={ndcg_at_k:.4} ({} vectors, {:.0}% coverage)",
         format_thousands(throughput_per_sec),
         format_thousands(vectors_indexed as u64),
+        coverage * 100.0,
     ));
 
-    Ok(SearchPhaseOutcome {
-        elapsed_secs,
-        throughput_per_sec,
-        counter_sample,
+    Ok(StepSearchEntry {
+        queries: num_queries,
+        neighbor_count: count,
+        elapsed: elapsed_secs,
+        throughput: throughput_per_sec,
         recall_at_1,
-        recall_at_10,
-        ndcg_at_10,
+        recall_at_k,
+        intersection_at_k: Some(intersection_at_k),
+        ndcg_at_k: Some(ndcg_at_k),
+        counters: PhaseCounters::from_sample(counter_sample.as_ref()),
     })
+}
+
+/// Replay every indexed vector as its own query: a vector that is in the index
+/// is its own nearest neighbor, so the top-`count` result for row `i` must
+/// contain `keys[i]`. Identity is the ground truth, which is what makes this
+/// runnable on any dataset — including ones that ship without neighbor files.
+///
+/// Results are scored batch by batch and discarded rather than accumulated:
+/// the whole base at 100M vectors and `count = 10` would otherwise need ~9 GB
+/// of host buffers to hold an answer we reduce to a single counter. Requesting
+/// `count` neighbors also yields self-recall@1 for free, so both are reported.
+fn run_self_search_phase(
+    backend: &dyn Backend,
+    state: &mut BenchState,
+    perf: &mut Option<perf_counters::PerfCounters>,
+    progress_style: &ProgressStyle,
+    count: usize,
+    num_queries: usize,
+    dimensions: usize,
+) -> BenchResult<StepSearchEntry> {
+    let batch_size = state.batch_size_search.min(num_queries).max(1);
+    let mut batch_keys = vec![0 as Key; batch_size * count];
+    let mut batch_distances = vec![0.0 as Distance; batch_size * count];
+    let mut batch_counts = vec![0usize; batch_size];
+    let mut expected_scratch = vec![0 as Key; batch_size];
+
+    let progress = ProgressBar::new(num_queries as u64);
+    progress.set_style(progress_style.clone());
+    progress.set_position(0);
+
+    start_counter_capture(perf, "self-recall");
+    let self_search_start = Instant::now();
+    let mut searched = 0usize;
+    let mut hits_at_1 = 0usize;
+    let mut hits_at_k = 0usize;
+    while searched < num_queries {
+        let batch_rows = batch_size.min(num_queries - searched);
+        let expected = state.keys.slice(searched, batch_rows, &mut expected_scratch);
+        let batch_queries = state
+            .dataset
+            .slice(searched, batch_rows, dimensions, &mut state.scratch_buf);
+        let key_end = batch_rows * count;
+
+        backend.search(
+            batch_queries,
+            count,
+            &mut batch_keys[..key_end],
+            &mut batch_distances[..key_end],
+            &mut batch_counts[..batch_rows],
+        )?;
+
+        let counts = &batch_counts[..batch_rows];
+        hits_at_1 += eval::self_recall_at_k(&batch_keys, counts, count, expected, 1);
+        hits_at_k += eval::self_recall_at_k(&batch_keys, counts, count, expected, count);
+
+        searched += batch_rows;
+        let elapsed = self_search_start.elapsed().as_secs_f64();
+        let throughput = if elapsed > 0.0 {
+            (searched as f64 / elapsed) as u64
+        } else {
+            0
+        };
+        progress.set_position(searched as u64);
+        progress.set_message(format!(
+            "{}/{} ({} search/s)",
+            format_thousands(searched as u64),
+            format_thousands(num_queries as u64),
+            format_thousands(throughput),
+        ));
+    }
+    let elapsed = self_search_start.elapsed().as_secs_f64();
+    let counter_sample = stop_and_read_counters(perf, "self-recall");
+
+    let throughput = if elapsed > 0.0 {
+        (num_queries as f64 / elapsed) as u64
+    } else {
+        0
+    };
+    let recall_at_1 = hits_at_1 as f64 / num_queries as f64;
+    let recall_at_k = hits_at_k as f64 / num_queries as f64;
+
+    progress.finish_with_message(format!(
+        "{} search/s, recall@1={recall_at_1:.4}, recall@{count}={recall_at_k:.4} ({} queries)",
+        format_thousands(throughput),
+        format_thousands(num_queries as u64),
+    ));
+
+    Ok(StepSearchEntry {
+        queries: num_queries,
+        neighbor_count: count,
+        elapsed,
+        throughput,
+        recall_at_1,
+        recall_at_k,
+        // Identity truth is a single key per query, so neither a set overlap
+        // nor a ranked gain says anything beyond `recall_at_1`.
+        intersection_at_k: None,
+        ndcg_at_k: None,
+        counters: PhaseCounters::from_sample(counter_sample.as_ref()),
+    })
+}
+
+/// Parsed form of `--self-search-sample`. A value containing a decimal point is
+/// a fraction of the base (`≤ 1.0`); a bare integer is an absolute vector count.
+enum SelfSearchSample {
+    Fraction(f64),
+    Absolute(usize),
+}
+
+/// Validate the grammar of a `--self-search-sample` spec. The base size isn't
+/// known at CLI-parse time, so resolution to a concrete count is deferred to
+/// `resolve_self_search_sample`.
+fn parse_self_search_sample(spec: &str) -> Result<SelfSearchSample, String> {
+    let trimmed = spec.trim();
+    if trimmed.contains('.') {
+        let fraction: f64 = trimmed
+            .parse()
+            .map_err(|_| format!("--self-search-sample: invalid fraction `{spec}`"))?;
+        if !(fraction > 0.0 && fraction <= 1.0) {
+            return Err(format!(
+                "--self-search-sample fraction must be in (0.0, 1.0], got {fraction}"
+            ));
+        }
+        Ok(SelfSearchSample::Fraction(fraction))
+    } else {
+        let count: usize = trimmed
+            .parse()
+            .map_err(|_| format!("--self-search-sample: invalid count `{spec}`"))?;
+        if count == 0 {
+            return Err("--self-search-sample count must be greater than 0".into());
+        }
+        Ok(SelfSearchSample::Absolute(count))
+    }
+}
+
+/// Resolve a sample spec against the number of indexed vectors. `None` → all.
+/// A fraction rounds to at least one vector; an absolute count is clamped to
+/// what is actually in the index.
+fn resolve_self_search_sample(spec: Option<&str>, vectors_indexed: usize) -> Result<usize, String> {
+    Ok(match spec {
+        None => vectors_indexed,
+        Some(spec) => match parse_self_search_sample(spec)? {
+            SelfSearchSample::Fraction(fraction) => ((vectors_indexed as f64 * fraction).round() as usize).max(1),
+            SelfSearchSample::Absolute(count) => count.min(vectors_indexed),
+        },
+    })
+}
+
+/// Resolve how many vectors the self-recall sweep should replay, given how many
+/// are actually in the index. `None` when `--self-search` was not passed. The
+/// sample grammar is validated in `BenchState::load`, so resolution here is
+/// infallible in practice.
+fn self_search_query_count(state: &BenchState, vectors_indexed: usize) -> Option<usize> {
+    if !state.self_search {
+        return None;
+    }
+    let resolved = resolve_self_search_sample(state.self_search_sample.as_deref(), vectors_indexed)
+        .expect("self-recall sample spec validated at load");
+    (resolved > 0).then_some(resolved)
+}
+
+/// Progress-bar style for the self-recall sweep.
+fn self_search_style() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template("  self   [{elapsed_precise}] {bar:40.magenta/blue} {msg}")
+        .unwrap()
+        .progress_chars("##-")
 }
 
 /// Assemble a `ConfigReport` and write it to `<output_dir>/<backend>-<hash>.json`.
 /// No-op when the state has no output directory configured.
-fn save_report(state: &BenchState, metadata: HashMap<String, Value>, steps: Vec<StepEntry>) -> BenchResult<()> {
+fn save_report(
+    state: &BenchState,
+    mut metadata: HashMap<String, Value>,
+    dimensions: usize,
+    steps: Vec<StepEntry>,
+) -> BenchResult<()> {
     let Some(dir) = &state.output_dir else {
         return Ok(());
     };
+
+    // Every harness-level flag that changes what was measured belongs in the
+    // hash, centrally: leaving it to each backend is how `--dimensions` came to
+    // be missing on two of them, silently overwriting result files. Backends
+    // contribute only their engine-specific knobs.
+    metadata.insert("dimensions".into(), Value::from(dimensions));
+    metadata.insert("vectors_count".into(), Value::from(state.total_vectors));
+    metadata.insert("steps".into(), Value::from(state.steps));
+    metadata.insert("batch_size_add".into(), Value::from(state.batch_size_add));
+    metadata.insert("batch_size_search".into(), Value::from(state.batch_size_search));
+    metadata.insert("search_count".into(), Value::from(state.count));
+    if let Some(entry) = steps.last().and_then(|step| step.self_search.as_ref()) {
+        metadata.insert("self_search_count".into(), Value::from(entry.neighbor_count));
+        metadata.insert("self_search_sample".into(), Value::from(entry.queries));
+    }
     let backend_name = metadata.get("backend").and_then(|v| v.as_str()).unwrap_or("unknown");
     let hash = config_hash(&metadata);
     let filename = format!("{backend_name}-{hash}.json");
@@ -642,9 +967,9 @@ fn save_report(state: &BenchState, metadata: HashMap<String, Value>, steps: Vec<
     let report = ConfigReport {
         machine: collect_machine_info(),
         dataset: DatasetInfo {
-            vectors_path: state.dataset_info.vectors_path.clone(),
-            queries_path: state.dataset_info.queries_path.clone(),
-            neighbors_path: state.dataset_info.neighbors_path.clone(),
+            base_vectors_path: state.dataset_info.base_vectors_path.clone(),
+            query_vectors_path: state.dataset_info.query_vectors_path.clone(),
+            query_neighbors_path: state.dataset_info.query_neighbors_path.clone(),
             vectors_count: state.dataset_info.vectors_count,
             queries_count: state.dataset_info.queries_count,
             dimensions: state.dataset_info.dimensions,
@@ -662,17 +987,14 @@ fn save_report(state: &BenchState, metadata: HashMap<String, Value>, steps: Vec<
 /// Run one benchmark configuration. Accumulates steps, writes JSON report at
 /// the end. `dimensions` is the per-vector dimensionality this config exposes to
 /// the backend (≤ native dimensions of the underlying datasets).
-pub fn run(index: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
+pub fn run(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
     let total_vectors = state.total_vectors;
-    let num_queries = state.query_dataset.rows();
-    let search_count = state.ground_truth.neighbors_per_query();
-    let add_chunk_size = state.key_scratch.len();
 
-    let description = index.description();
-    let metadata = index.metadata();
+    let description = backend.description();
+    let metadata = backend.metadata();
     eprintln!("\n── {description} ──");
 
-    let num_steps = state.epochs;
+    let num_steps = state.steps;
     let step_size = total_vectors.div_ceil(num_steps);
     let add_style = ProgressStyle::default_bar()
         .template("  add    [{elapsed_precise}] {bar:40.cyan/blue} {msg}")
@@ -707,61 +1029,61 @@ pub fn run(index: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -
         let is_final_step = step == num_steps - 1;
 
         let add = run_add_phase(
-            index,
+            backend,
             state,
             &mut perf,
             &add_style,
-            step_start,
-            step_count,
-            total_vectors,
-            add_chunk_size,
-            dimensions,
+            StepSlice {
+                start: step_start,
+                count: step_count,
+                dimensions,
+            },
             &mut vectors_indexed,
         )?;
 
         let search = run_search_phase(
-            index,
+            backend,
             state,
             &mut perf,
             &search_style,
-            num_queries,
-            search_count,
-            vectors_indexed,
-            total_vectors,
             dimensions,
+            vectors_indexed,
             is_final_step,
         )?;
 
-        let recall_at_1_norm = eval::normalize_metric(search.recall_at_1, vectors_indexed, total_vectors);
-        let recall_at_10_norm = eval::normalize_metric(search.recall_at_10, vectors_indexed, total_vectors);
-        let ndcg_at_10_norm = eval::normalize_metric(search.ndcg_at_10, vectors_indexed, total_vectors);
-
         steps.push(StepEntry {
             vectors_indexed,
-            add_elapsed: add.elapsed_secs,
-            add_throughput: add.throughput_per_sec,
-            memory_bytes: index.memory_bytes() as u64,
-            search_elapsed: search.elapsed_secs,
-            search_throughput: search.throughput_per_sec,
-            recall_at_1: search.recall_at_1,
-            recall_at_10: search.recall_at_10,
-            ndcg_at_10: search.ndcg_at_10,
-            recall_at_1_normalized: recall_at_1_norm,
-            recall_at_10_normalized: recall_at_10_norm,
-            ndcg_at_10_normalized: ndcg_at_10_norm,
-            cycles_add: add.counter_sample.map(|s| s.cycles),
-            instructions_add: add.counter_sample.map(|s| s.instructions),
-            cache_misses_add: add.counter_sample.map(|s| s.cache_misses),
-            branch_misses_add: add.counter_sample.map(|s| s.branch_misses),
-            cycles_search: search.counter_sample.map(|s| s.cycles),
-            instructions_search: search.counter_sample.map(|s| s.instructions),
-            cache_misses_search: search.counter_sample.map(|s| s.cache_misses),
-            branch_misses_search: search.counter_sample.map(|s| s.branch_misses),
+            memory_bytes: backend.memory_bytes() as u64,
+            add: Some(StepAddEntry {
+                elapsed: add.elapsed_secs,
+                throughput: add.throughput_per_sec,
+                counters: PhaseCounters::from_sample(add.counter_sample.as_ref()),
+            }),
+            ground_truth_search: Some(search),
+            self_search: None,
         });
     }
 
+    // Once, against the finished index — a per-step sweep would cost the sum of
+    // every prefix, and on batch-built backends would force a rebuild each time.
+    // It lands on the last step because that is the index state it ran against.
+    if let Some(queries) = self_search_query_count(state, vectors_indexed) {
+        let entry = run_self_search_phase(
+            backend,
+            state,
+            &mut perf,
+            &self_search_style(),
+            state.self_search_count,
+            queries,
+            dimensions,
+        )?;
+        if let Some(last) = steps.last_mut() {
+            last.self_search = Some(entry);
+        }
+    }
+
     let peak_memory = steps.iter().map(|s| s.memory_bytes).max().unwrap_or(0);
-    save_report(state, metadata, steps)?;
+    save_report(state, metadata, dimensions, steps)?;
 
     eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / 1e9);
     eprintln!();
@@ -772,13 +1094,26 @@ pub fn run(index: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -
 /// add phase. Emits a single `StepEntry` whose `add_*` fields are zero /
 /// `None`. `dimensions` is the per-vector dimensionality the loaded index expects
 /// (queries are sliced at this dimensions before being handed to `search`).
-pub fn run_search_only(index: &dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
-    let total_vectors = state.total_vectors;
-    let num_queries = state.query_dataset.rows();
-    let search_count = state.ground_truth.neighbors_per_query();
+pub fn run_search_only(backend: &dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
+    // A loaded index need not cover the same slice of the base as this run's
+    // `--max-base-vectors` implies — it was built by an earlier invocation with
+    // its own flags. Prefer the backend's own count; self-recall in particular
+    // reports nonsense if it queries rows the index never saw.
+    let total_vectors = match backend.indexed_count() {
+        Some(indexed) if indexed != state.total_vectors => {
+            eprintln!(
+                "  loaded index holds {} vectors, dataset implies {} — using the index's count",
+                format_thousands(indexed as u64),
+                format_thousands(state.total_vectors as u64),
+            );
+            indexed
+        }
+        Some(indexed) => indexed,
+        None => state.total_vectors,
+    };
 
-    let description = index.description();
-    let metadata = index.metadata();
+    let description = backend.description();
+    let metadata = backend.metadata();
     eprintln!("\n── {description} (search-only) ──");
 
     let search_style = ProgressStyle::default_bar()
@@ -798,50 +1133,37 @@ pub fn run_search_only(index: &dyn Backend, state: &mut BenchState, dimensions: 
     };
 
     let search = run_search_phase(
-        index,
+        backend,
         state,
         &mut perf,
         &search_style,
-        num_queries,
-        search_count,
-        total_vectors,
-        total_vectors,
         dimensions,
+        total_vectors,
         true,
     )?;
 
-    // Recall normalization assumes the index covers the whole base; for
-    // search-only we always pass `vectors_indexed == total_vectors`, so the
-    // raw and normalized values coincide.
-    let recall_at_1_norm = eval::normalize_metric(search.recall_at_1, total_vectors, total_vectors);
-    let recall_at_10_norm = eval::normalize_metric(search.recall_at_10, total_vectors, total_vectors);
-    let ndcg_at_10_norm = eval::normalize_metric(search.ndcg_at_10, total_vectors, total_vectors);
-
-    let step = StepEntry {
+    let mut step = StepEntry {
         vectors_indexed: total_vectors,
-        add_elapsed: 0.0,
-        add_throughput: 0,
-        memory_bytes: index.memory_bytes() as u64,
-        search_elapsed: search.elapsed_secs,
-        search_throughput: search.throughput_per_sec,
-        recall_at_1: search.recall_at_1,
-        recall_at_10: search.recall_at_10,
-        ndcg_at_10: search.ndcg_at_10,
-        recall_at_1_normalized: recall_at_1_norm,
-        recall_at_10_normalized: recall_at_10_norm,
-        ndcg_at_10_normalized: ndcg_at_10_norm,
-        cycles_add: None,
-        instructions_add: None,
-        cache_misses_add: None,
-        branch_misses_add: None,
-        cycles_search: search.counter_sample.map(|s| s.cycles),
-        instructions_search: search.counter_sample.map(|s| s.instructions),
-        cache_misses_search: search.counter_sample.map(|s| s.cache_misses),
-        branch_misses_search: search.counter_sample.map(|s| s.branch_misses),
+        memory_bytes: backend.memory_bytes() as u64,
+        add: None,
+        ground_truth_search: Some(search),
+        self_search: None,
     };
 
+    if let Some(queries) = self_search_query_count(state, total_vectors) {
+        step.self_search = Some(run_self_search_phase(
+            backend,
+            state,
+            &mut perf,
+            &self_search_style(),
+            state.self_search_count,
+            queries,
+            dimensions,
+        )?);
+    }
+
     let peak_memory = step.memory_bytes;
-    save_report(state, metadata, vec![step])?;
+    save_report(state, metadata, dimensions, vec![step])?;
 
     eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / 1e9);
     eprintln!();
@@ -862,12 +1184,10 @@ pub enum ConfigOutcome {
     Failed,
 }
 
-/// Run one config of a sweep without aborting the whole process: any construction error is logged as
-/// "skipped", any runtime error as "failed", and the remaining configs still execute.
-///
-/// Binaries build the per-config pre-construction `description` themselves (we don't have a
-/// `Backend::description()` yet when construction fails), then pass in the backend `Result` and let this
-/// helper route the outcome.
+/// Run an already-constructed backend, routing a construction or run failure to
+/// `Skipped` / `Failed` rather than aborting the sweep. For backends that build
+/// their engine handle eagerly (the server-backed ones) and have no `--index`
+/// branch to take.
 pub fn try_run_config<Index, ConstructError>(
     description: &str,
     backend: Result<Index, ConstructError>,
@@ -893,11 +1213,10 @@ where
     }
 }
 
-/// `try_run_config`-style graceful-skip wrapper that also handles the
-/// `--index` load-vs-build branch.
+/// Run one config, routing failures to `Skipped` / `Failed` instead of
+/// aborting the sweep, and handling the `--index` load-vs-build branch.
 ///
-/// - `handle = None` → behaves like `try_run_config` against a freshly-built
-///   backend.
+/// - `handle = None` → build and run.
 /// - `handle = Some(h)` and the path **exists** → calls `load(h)` and runs
 ///   `run_search_only`. No add phase.
 /// - `handle = Some(h)` and the path **does not exist** → calls `build()`,
@@ -1013,5 +1332,52 @@ impl<T, E: std::fmt::Display> UnwrapOrBail<T> for Result<T, E> {
             Ok(value) => value,
             Err(error) => bail(&format!("{prefix}: {error}")),
         }
+    }
+}
+
+// #region Tests
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_self_search_sample, SelfSearchSample};
+
+    #[test]
+    fn self_recall_sample_none_is_all() {
+        assert_eq!(resolve_self_search_sample(None, 1000).unwrap(), 1000);
+    }
+
+    #[test]
+    fn self_recall_sample_absolute_is_clamped() {
+        assert_eq!(resolve_self_search_sample(Some("250"), 1000).unwrap(), 250);
+        assert_eq!(resolve_self_search_sample(Some("5000"), 1000).unwrap(), 1000);
+    }
+
+    #[test]
+    fn self_recall_sample_fraction_rounds_and_floors_at_one() {
+        assert_eq!(resolve_self_search_sample(Some("0.1"), 1000).unwrap(), 100);
+        assert_eq!(resolve_self_search_sample(Some("1.0"), 1000).unwrap(), 1000);
+        // A fraction so small it would round to zero still yields one vector.
+        assert_eq!(resolve_self_search_sample(Some("0.0001"), 1000).unwrap(), 1);
+    }
+
+    #[test]
+    fn self_recall_sample_one_vs_one_point_zero_disambiguate() {
+        // `1` is an absolute count; `1.0` is the whole base.
+        assert!(matches!(
+            super::parse_self_search_sample("1").unwrap(),
+            SelfSearchSample::Absolute(1)
+        ));
+        assert!(matches!(
+            super::parse_self_search_sample("1.0").unwrap(),
+            SelfSearchSample::Fraction(_)
+        ));
+    }
+
+    #[test]
+    fn self_recall_sample_rejects_zero_and_out_of_range() {
+        assert!(resolve_self_search_sample(Some("0"), 1000).is_err());
+        assert!(resolve_self_search_sample(Some("0.0"), 1000).is_err());
+        assert!(resolve_self_search_sample(Some("1.5"), 1000).is_err());
+        assert!(resolve_self_search_sample(Some("abc"), 1000).is_err());
     }
 }

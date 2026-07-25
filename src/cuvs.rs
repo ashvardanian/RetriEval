@@ -43,23 +43,23 @@
 //! Quick data_type sweep:
 //! ```sh
 //! retri-eval-cuvs \
-//!     --vectors datasets/wiki_1M/base.1M.fbin \
-//!     --queries datasets/wiki_1M/query.public.100K.fbin \
-//!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/wiki_1M/base.1M.fbin \
+//!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
+//!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --data-type f32,f16 --metric ip \
 //!     --output results/
 //! ```
 //!
-//! Turing 10M at ~99% recall (gd=64, igd=128, itopk=256, search_width=32):
+//! Turing 10M at ~99% recall (M=64, ef=128/256, search_width=32):
 //! ```sh
 //! retri-eval-cuvs \
-//!     --vectors datasets/turing_10M/base.10M.fbin \
-//!     --queries datasets/turing_10M/query.public.100K.fbin \
-//!     --neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/turing_10M/base.10M.fbin \
+//!     --query-vectors datasets/turing_10M/query.public.100K.fbin \
+//!     --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
 //!     --data-type f32,f16 --metric l2 \
-//!     --graph-degree 64 \
-//!     --intermediate-graph-degree 128 \
-//!     --itopk-size 256 \
+//!     --connectivity 64 \
+//!     --expansion-add 128 \
+//!     --expansion-search 256 \
 //!     --search-width 32 \
 //!     --build-algo nn_descent \
 //!     --output results/turing_10M
@@ -73,7 +73,7 @@ use clap::Parser;
 use cuvs::distance_type::DistanceType;
 use itertools::iproduct;
 use retrieval::{
-    bail, run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, UnwrapOrBail, Vectors,
+    run_config, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary, UnwrapOrBail, Vectors,
 };
 use serde_json::json;
 
@@ -137,7 +137,7 @@ unsafe fn dl_tensor(
                 device_id: 0,
             },
             ndim,
-            data_type,
+            dtype: data_type,
             shape,
             strides: std::ptr::null_mut(),
             byte_offset: 0,
@@ -269,7 +269,10 @@ impl CagraIndex {
     fn new() -> Result<Self, String> {
         let mut handle = std::mem::MaybeUninit::<cuvs_sys::cuvsCagraIndex_t>::uninit();
         unsafe {
-            cuvs_check(cuvs_sys::cuvsCagraIndexCreate(handle.as_mut_ptr()), "cuvsCagraIndexCreate")?;
+            cuvs_check(
+                cuvs_sys::cuvsCagraIndexCreate(handle.as_mut_ptr()),
+                "cuvsCagraIndexCreate",
+            )?;
             Ok(Self(handle.assume_init()))
         }
     }
@@ -356,31 +359,47 @@ fn keys_sidecar_path(handle: &str) -> String {
     format!("{handle}.keys")
 }
 
-fn write_host_keys(path: &str, keys: &[Key]) -> Result<(), String> {
-    let mut bytes = Vec::with_capacity(8 + keys.len() * std::mem::size_of::<Key>());
+/// Sidecar layout: `magic | graph_degree: u64 | count: u64 | keys`, all
+/// little-endian. Widths are fixed rather than `usize` because this is a file
+/// read back on whatever machine opens the index; the counts are `u64` to match
+/// the key count the format already carried. The magic is what makes a
+/// pre-graph-degree file a loud error instead of one that parses with a
+/// nonsense degree, since the old layout opened with a bare `u64`.
+const KEYS_SIDECAR_MAGIC: &[u8; 8] = b"RETRIKY1";
+const KEYS_SIDECAR_HEADER_BYTES: usize = 24;
+
+/// `graph_degree` rides along because CAGRA's deserializer cannot report the
+/// build parameters, and `memory_bytes()` needs the degree to size the graph.
+fn write_host_keys(path: &str, keys: &[Key], graph_degree: usize) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(KEYS_SIDECAR_HEADER_BYTES + keys.len() * std::mem::size_of::<Key>());
+    bytes.extend_from_slice(KEYS_SIDECAR_MAGIC);
+    bytes.extend_from_slice(&(graph_degree as u64).to_le_bytes());
     bytes.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-    for &k in keys {
-        bytes.extend_from_slice(&k.to_le_bytes());
+    for &key in keys {
+        bytes.extend_from_slice(&key.to_le_bytes());
     }
     std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))
 }
 
-fn read_host_keys(path: &str) -> Result<Vec<Key>, String> {
+fn read_host_keys(path: &str) -> Result<(Vec<Key>, usize), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-    if bytes.len() < 8 {
-        return Err(format!("{path}: too short for key-count header"));
+    if bytes.len() < KEYS_SIDECAR_HEADER_BYTES || &bytes[0..8] != KEYS_SIDECAR_MAGIC {
+        return Err(format!(
+            "{path}: not a versioned key sidecar — it predates graph-degree persistence, rebuild the index"
+        ));
     }
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
-    let expected = 8 + count * std::mem::size_of::<Key>();
+    let graph_degree = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+    let expected = KEYS_SIDECAR_HEADER_BYTES + count * std::mem::size_of::<Key>();
     if bytes.len() < expected {
         return Err(format!("{path}: expected {expected} bytes, got {}", bytes.len()));
     }
     let mut keys = Vec::with_capacity(count);
     for key_index in 0..count {
-        let offset = 8 + key_index * std::mem::size_of::<Key>();
+        let offset = KEYS_SIDECAR_HEADER_BYTES + key_index * std::mem::size_of::<Key>();
         keys.push(Key::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()));
     }
-    Ok(keys)
+    Ok((keys, graph_degree))
 }
 
 // #region GpuQueries
@@ -419,10 +438,20 @@ impl GpuQueries {
 // #region SearchBuffers
 
 /// Pre-allocated GPU + host buffers for search, reused across calls.
+///
+/// Sized for `capacity_queries` rows and exactly `neighbor_count` neighbors.
+/// A batch shorter than the capacity is a contiguous row-major prefix of the
+/// same allocation, so it reuses the buffers and only the leading extent of
+/// the DLPack shapes changes — see `set_batch_rows`.
 struct SearchBuffers {
     queries: GpuQueries,
     neighbors: GpuTensor<Key>,
     distances: GpuTensor<Distance>,
+
+    /// Rows the buffers were sized for. Batches at or below this reuse them.
+    capacity_queries: usize,
+    /// Neighbors per query the buffers — and `search_params` — were sized for.
+    neighbor_count: usize,
 
     queries_shape: [i64; 2],
     neighbors_shape: [i64; 2],
@@ -434,38 +463,56 @@ struct SearchBuffers {
     /// Reusable host-side buffer for data_type conversion before H2D copy.
     query_staging: Vec<u8>,
 
-    /// Cached search params — never change between calls.
+    /// Search params, cached for as long as `neighbor_count` holds — the itopk
+    /// floor is derived from it, so a different neighbor count needs new params.
     search_params: cuvs::cagra::SearchParams,
 }
 
 impl SearchBuffers {
     fn allocate(
         allocator: CudaAllocator,
-        num_queries: usize,
+        capacity_queries: usize,
         dimensions: usize,
         neighbor_count: usize,
         data_type: CuvsDataType,
         search_params: cuvs::cagra::SearchParams,
     ) -> Result<Self, String> {
         let error = |e| format!("GPU alloc failed: {e}");
-        let queries = GpuQueries::allocate(data_type, &[num_queries, dimensions], allocator.clone())?;
+        let queries = GpuQueries::allocate(data_type, &[capacity_queries, dimensions], allocator.clone())?;
         let neighbors = unsafe {
-            GpuTensor::<Key>::try_empty_in(&[num_queries, neighbor_count], allocator.clone()).map_err(error)?
+            GpuTensor::<Key>::try_empty_in(&[capacity_queries, neighbor_count], allocator.clone()).map_err(error)?
         };
-        let distances =
-            unsafe { GpuTensor::<Distance>::try_empty_in(&[num_queries, neighbor_count], allocator).map_err(error)? };
+        let distances = unsafe {
+            GpuTensor::<Distance>::try_empty_in(&[capacity_queries, neighbor_count], allocator).map_err(error)?
+        };
         Ok(Self {
             queries,
             neighbors,
             distances,
-            queries_shape: [num_queries as i64, dimensions as i64],
-            neighbors_shape: [num_queries as i64, neighbor_count as i64],
-            distances_shape: [num_queries as i64, neighbor_count as i64],
-            neighbors_host: vec![Key::default(); num_queries * neighbor_count],
-            distances_host: vec![Distance::default(); num_queries * neighbor_count],
+            capacity_queries,
+            neighbor_count,
+            queries_shape: [capacity_queries as i64, dimensions as i64],
+            neighbors_shape: [capacity_queries as i64, neighbor_count as i64],
+            distances_shape: [capacity_queries as i64, neighbor_count as i64],
+            neighbors_host: vec![Key::default(); capacity_queries * neighbor_count],
+            distances_host: vec![Distance::default(); capacity_queries * neighbor_count],
             query_staging: Vec::new(),
             search_params,
         })
+    }
+
+    /// Whether this allocation can serve a `num_queries` × `neighbor_count` batch.
+    fn fits(&self, num_queries: usize, neighbor_count: usize) -> bool {
+        num_queries <= self.capacity_queries && neighbor_count == self.neighbor_count
+    }
+
+    /// Point the DLPack shapes at the current batch, leaving the allocation
+    /// alone. Without this a trailing partial batch would keep the previous
+    /// batch's row count and make CAGRA search stale rows.
+    fn set_batch_rows(&mut self, num_queries: usize) {
+        self.queries_shape[0] = num_queries as i64;
+        self.neighbors_shape[0] = num_queries as i64;
+        self.distances_shape[0] = num_queries as i64;
     }
 }
 
@@ -485,18 +532,19 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_value = "l2")]
     metric: Vec<String>,
 
-    /// CAGRA output graph degree (analogous to HNSW M)
+    /// CAGRA output graph degree — the shared-vocabulary name for HNSW's M.
     #[arg(long, value_delimiter = ',', default_value = "32")]
-    graph_degree: Vec<usize>,
+    connectivity: Vec<usize>,
 
-    /// CAGRA intermediate graph degree before pruning (analogous to expansion_add)
+    /// CAGRA intermediate graph degree before pruning — analogous to
+    /// `ef_construction`.
     #[arg(long, value_delimiter = ',', default_value = "64")]
-    intermediate_graph_degree: Vec<usize>,
+    expansion_add: Vec<usize>,
 
-    /// Intermediate search results retained during search (analogous to expansion_search).
-    /// Higher values improve recall at the cost of speed.
+    /// CAGRA internal top-i list retained during search — analogous to
+    /// `ef_search`. Higher values improve recall at the cost of speed.
     #[arg(long, value_delimiter = ',', default_value = "64")]
-    itopk_size: Vec<usize>,
+    expansion_search: Vec<usize>,
 
     /// Number of graph nodes used as starting points per search iteration.
     /// Higher values improve recall. 0 = auto.
@@ -560,10 +608,10 @@ pub struct CuvsBackend {
     dimensions: usize,
     metric: DistanceType,
     data_type: CuvsDataType,
-    graph_degree: usize,
-    intermediate_graph_degree: usize,
+    connectivity: usize,
+    expansion_add: usize,
     build_algo: cuvs_sys::cuvsCagraGraphBuildAlgo,
-    itopk_size: usize,
+    expansion_search: usize,
     search_width: usize,
     min_iterations: usize,
     max_iterations: usize,
@@ -580,20 +628,34 @@ pub struct CuvsBackend {
 unsafe impl Send for CuvsBackend {}
 unsafe impl Sync for CuvsBackend {}
 
+/// CAGRA knobs with no counterpart in the shared vocabulary.
+#[derive(Clone, Copy)]
+pub struct CagraTuning<'a> {
+    pub build_algo: &'a str,
+    pub search_width: usize,
+    pub min_iterations: usize,
+    pub max_iterations: usize,
+    pub num_random_samplings: u32,
+}
+
 impl CuvsBackend {
-    pub fn new(
-        dimensions: usize,
-        data_type_name: &str,
-        metric_name: &str,
-        graph_degree: usize,
-        intermediate_graph_degree: usize,
-        build_algo_name: &str,
-        itopk_size: usize,
-        search_width: usize,
-        min_iterations: usize,
-        max_iterations: usize,
-        num_random_samplings: u32,
-    ) -> Result<Self, String> {
+    pub fn new(config: IndexConfig<'_>, tuning: CagraTuning<'_>) -> Result<Self, String> {
+        let IndexConfig {
+            dimensions,
+            data_type: data_type_name,
+            metric: metric_name,
+            connectivity,
+            expansion_add,
+            expansion_search,
+        } = config;
+        let CagraTuning {
+            build_algo: build_algo_name,
+            search_width,
+            min_iterations,
+            max_iterations,
+            num_random_samplings,
+        } = tuning;
+
         let metric = parse_metric(metric_name)?;
         let data_type = CuvsDataType::from_str(data_type_name)?;
         let build_algo = parse_build_algo(build_algo_name)?;
@@ -601,8 +663,8 @@ impl CuvsBackend {
         let cuda_alloc = CudaAllocator(res.0);
 
         let description = format!(
-            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} gd={graph_degree} \u{b7} \
-             igd={intermediate_graph_degree} \u{b7} itopk={itopk_size} \u{b7} sw={search_width}",
+            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} M={connectivity} \u{b7} \
+             ef={expansion_add}/{expansion_search} \u{b7} sw={search_width}",
             data_type.as_str(),
         );
 
@@ -610,11 +672,14 @@ impl CuvsBackend {
         metadata.insert("backend".into(), json!("cuvs-cagra"));
         metadata.insert("data_type".into(), json!(data_type.as_str()));
         metadata.insert("metric".into(), json!(metric_label(metric_name)));
-        metadata.insert("dimensions".into(), json!(dimensions));
-        metadata.insert("graph_degree".into(), json!(graph_degree));
-        metadata.insert("intermediate_graph_degree".into(), json!(intermediate_graph_degree));
-        metadata.insert("itopk_size".into(), json!(itopk_size));
+        metadata.insert("connectivity".into(), json!(connectivity));
+        metadata.insert("expansion_add".into(), json!(expansion_add));
+        metadata.insert("expansion_search".into(), json!(expansion_search));
         metadata.insert("search_width".into(), json!(search_width));
+        metadata.insert("build_algo".into(), json!(build_algo_name));
+        metadata.insert("min_iterations".into(), json!(min_iterations));
+        metadata.insert("max_iterations".into(), json!(max_iterations));
+        metadata.insert("num_random_samplings".into(), json!(num_random_samplings));
 
         Ok(Self {
             search_buffers: UnsafeCell::new(None),
@@ -624,10 +689,10 @@ impl CuvsBackend {
             dimensions,
             metric,
             data_type,
-            graph_degree,
-            intermediate_graph_degree,
+            connectivity,
+            expansion_add,
             build_algo,
-            itopk_size,
+            expansion_search,
             search_width,
             min_iterations,
             max_iterations,
@@ -640,23 +705,25 @@ impl CuvsBackend {
         })
     }
 
-    /// Sibling of `new` for opening a previously-saved CAGRA index. Build-time
-    /// params (`graph_degree`, `intermediate_graph_degree`, `build_algo`) are
-    /// baked into the saved file and ignored on load — they're omitted from
-    /// the call. Search-time knobs (`itopk_size`, `search_width`, etc.) are
-    /// runtime-tunable and pass through to `SearchParams`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn load(
-        handle: &str,
-        dimensions: usize,
-        data_type_name: &str,
-        metric_name: &str,
-        itopk_size: usize,
-        search_width: usize,
-        min_iterations: usize,
-        max_iterations: usize,
-        num_random_samplings: u32,
-    ) -> Result<Self, String> {
+    /// Open a saved CAGRA index. CAGRA's deserializer reports no build params,
+    /// so the graph degree comes from the key sidecar written alongside the
+    /// index; `config`'s build-time fields are ignored on this path.
+    pub fn load(handle: &str, config: IndexConfig<'_>, tuning: CagraTuning<'_>) -> Result<Self, String> {
+        let IndexConfig {
+            dimensions,
+            data_type: data_type_name,
+            metric: metric_name,
+            expansion_search,
+            ..
+        } = config;
+        let CagraTuning {
+            search_width,
+            min_iterations,
+            max_iterations,
+            num_random_samplings,
+            ..
+        } = tuning;
+
         let metric = parse_metric(metric_name)?;
         let data_type = CuvsDataType::from_str(data_type_name)?;
         let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
@@ -664,10 +731,12 @@ impl CuvsBackend {
 
         let index = CagraIndex::new()?;
         index.deserialize(&res, handle)?;
-        let host_keys = read_host_keys(&keys_sidecar_path(handle))?;
+        // The sidecar, not `config.connectivity`, is the authority here — it
+        // records what the index was actually built with.
+        let (host_keys, connectivity) = read_host_keys(&keys_sidecar_path(handle))?;
 
         let description = format!(
-            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} itopk={itopk_size} \u{b7} sw={search_width} \u{b7} loaded[{handle}]",
+            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} M={connectivity} \u{b7} ef={expansion_search} \u{b7} sw={search_width} \u{b7} loaded[{handle}]",
             data_type.as_str(),
         );
 
@@ -675,10 +744,17 @@ impl CuvsBackend {
         metadata.insert("backend".into(), json!("cuvs-cagra"));
         metadata.insert("data_type".into(), json!(data_type.as_str()));
         metadata.insert("metric".into(), json!(metric_label(metric_name)));
-        metadata.insert("dimensions".into(), json!(dimensions));
-        metadata.insert("itopk_size".into(), json!(itopk_size));
+        metadata.insert("connectivity".into(), json!(connectivity));
+        metadata.insert("expansion_search".into(), json!(expansion_search));
         metadata.insert("search_width".into(), json!(search_width));
         metadata.insert("loaded_from".into(), json!(handle));
+        // Build-time knobs the serialized index does not carry. `connectivity`
+        // escapes this because the key sidecar records it.
+        metadata.insert("expansion_add".into(), serde_json::Value::Null);
+        metadata.insert("build_algo".into(), serde_json::Value::Null);
+        metadata.insert("min_iterations".into(), serde_json::Value::Null);
+        metadata.insert("max_iterations".into(), serde_json::Value::Null);
+        metadata.insert("num_random_samplings".into(), serde_json::Value::Null);
 
         Ok(Self {
             search_buffers: UnsafeCell::new(None),
@@ -688,10 +764,10 @@ impl CuvsBackend {
             dimensions,
             metric,
             data_type,
-            graph_degree: 0,
-            intermediate_graph_degree: 0,
+            connectivity,
+            expansion_add: 0,
             build_algo: cuvs_sys::cuvsCagraGraphBuildAlgo::AUTO_SELECT,
-            itopk_size,
+            expansion_search,
             search_width,
             min_iterations,
             max_iterations,
@@ -706,7 +782,7 @@ impl CuvsBackend {
 
     /// Create search params once, reused across all search calls.
     fn build_search_params(&self, neighbor_count: usize) -> Result<cuvs::cagra::SearchParams, String> {
-        let effective_itopk = self.itopk_size.max(neighbor_count);
+        let effective_itopk = self.expansion_search.max(neighbor_count);
         let params = cuvs::cagra::SearchParams::new()
             .map_err(|e| format!("search params: {e}"))?
             .set_itopk_size(effective_itopk);
@@ -746,8 +822,8 @@ impl CuvsBackend {
 
         let build_params = cuvs::cagra::IndexParams::new()
             .map_err(|e| format!("failed to create CAGRA index params: {e}"))?
-            .set_graph_degree(self.graph_degree)
-            .set_intermediate_graph_degree(self.intermediate_graph_degree)
+            .set_graph_degree(self.connectivity)
+            .set_intermediate_graph_degree(self.expansion_add)
             .set_build_algo(self.build_algo);
         unsafe { (*build_params.0).metric = self.metric };
 
@@ -824,13 +900,20 @@ impl Backend for CuvsBackend {
 
         let num_queries = queries.len();
 
-        // Lazily allocate GPU buffers and search params; reused on subsequent calls.
+        // Allocate GPU buffers and search params on first use, and again whenever
+        // a batch outgrows them or asks for a different neighbor count — the
+        // `--self-search` pass replays the whole base at its own count, and the
+        // capacity never shrinks so alternating batch sizes don't thrash.
         let buffers = unsafe { &mut *self.search_buffers.get() };
-        if buffers.is_none() {
+        if !buffers.as_ref().is_some_and(|b| b.fits(num_queries, count)) {
+            let capacity = num_queries.max(buffers.as_ref().map_or(0, |b| b.capacity_queries));
             let search_params = self.build_search_params(count)?;
+            // Free the old buffers before allocating the new ones: reallocation
+            // is rare and device memory is the scarce resource here.
+            *buffers = None;
             *buffers = Some(SearchBuffers::allocate(
                 self.cuda_alloc.clone(),
-                num_queries,
+                capacity,
                 queries.dimensions,
                 count,
                 self.data_type,
@@ -838,6 +921,7 @@ impl Backend for CuvsBackend {
             )?);
         }
         let buffers = buffers.as_mut().unwrap();
+        buffers.set_batch_rows(num_queries);
 
         // Upload queries to GPU. For f32 data_type, copy directly from the source
         // data without an intermediate staging buffer.
@@ -897,50 +981,52 @@ impl Backend for CuvsBackend {
             &mut distances_dl,
         )?;
 
-        // D2H copy results.
+        // D2H copy results — only the rows this batch actually filled, which is
+        // a prefix of the (possibly larger) capacity.
+        let filled = num_queries * count;
         unsafe {
-            self.device_to_host(buffers.neighbors.as_ptr(), &mut buffers.neighbors_host)?;
-            self.device_to_host(buffers.distances.as_ptr(), &mut buffers.distances_host)?;
+            self.device_to_host(buffers.neighbors.as_ptr(), &mut buffers.neighbors_host[..filled])?;
+            self.device_to_host(buffers.distances.as_ptr(), &mut buffers.distances_host[..filled])?;
         }
 
-        // Map CAGRA 0-based indices back to original keys.
-        let num_indexed = self.host_keys.len();
-        for (query_idx, found_count) in out_counts[..num_queries].iter_mut().enumerate() {
-            let offset = query_idx * count;
-            let mut found = 0;
-            for rank in 0..count {
-                let neighbor_idx = buffers.neighbors_host[offset + rank] as usize;
-                if neighbor_idx < num_indexed {
-                    out_keys[offset + rank] = self.host_keys[neighbor_idx];
-                    out_distances[offset + rank] = buffers.distances_host[offset + rank];
-                    found += 1;
-                } else {
-                    out_keys[offset + rank] = Key::MAX;
-                    out_distances[offset + rank] = Distance::INFINITY;
-                }
-            }
-            *found_count = found;
+        // Map CAGRA's 0-based row indices back to the caller's keys. Out-of-range
+        // indices are CAGRA's tail padding.
+        for (query_index, found_count) in out_counts[..num_queries].iter_mut().enumerate() {
+            let offset = query_index * count;
+            let hits = (0..count).filter_map(|rank| {
+                let neighbor_index = buffers.neighbors_host[offset + rank] as usize;
+                let key = *self.host_keys.get(neighbor_index)?;
+                Some((key, buffers.distances_host[offset + rank]))
+            });
+            *found_count = retrieval::write_row(
+                hits,
+                &mut out_keys[offset..offset + count],
+                &mut out_distances[offset..offset + count],
+            );
         }
 
         Ok(())
+    }
+
+    /// The host-key sidecar has one entry per indexed vector, on both the
+    /// freshly-built and the deserialized path.
+    fn indexed_count(&self) -> Option<usize> {
+        Some(self.host_keys.len())
     }
 
     fn memory_bytes(&self) -> usize {
         let num_vectors = self.host_keys.len();
         let host_bytes = self.host_vectors.len() + num_vectors * std::mem::size_of::<Key>();
         let gpu_bytes = num_vectors * self.dimensions * self.data_type.bytes_per_element()
-            + num_vectors * self.graph_degree * std::mem::size_of::<u32>();
+            + num_vectors * self.connectivity * std::mem::size_of::<u32>();
         host_bytes + gpu_bytes
     }
 
     fn save(&self, handle: &str) -> Result<(), String> {
-        // Serialize even if the index hasn't been built yet (no-op for an
-        // empty index would be an error from CAGRA — caller must call save
-        // after at least one search/build cycle).
         let index_ref = unsafe { &*self.index.get() };
         let index = index_ref.as_ref().ok_or("CAGRA index not built — nothing to save")?;
         index.serialize(&self.res, handle, /*include_dataset=*/ true)?;
-        write_host_keys(&keys_sidecar_path(handle), &self.host_keys)
+        write_host_keys(&keys_sidecar_path(handle), &self.host_keys, self.connectivity)
     }
 }
 
@@ -956,57 +1042,66 @@ fn main() {
         dimensions_sweep.len(),
         cli.data_type.len(),
         cli.metric.len(),
-        cli.graph_degree.len(),
-        cli.intermediate_graph_degree.len(),
-        cli.itopk_size.len(),
+        cli.connectivity.len(),
+        cli.expansion_add.len(),
+        cli.expansion_search.len(),
         cli.search_width.len(),
     ]);
 
     let mut summary = SweepSummary::default();
-    for (&dimensions, data_type, metric, graph_degree, intermediate_graph_degree, itopk_size, search_width) in iproduct!(
+    for (&dimensions, data_type, metric, connectivity, expansion_add, expansion_search, search_width) in iproduct!(
         &dimensions_sweep,
         &cli.data_type,
         &cli.metric,
-        &cli.graph_degree,
-        &cli.intermediate_graph_degree,
-        &cli.itopk_size,
+        &cli.connectivity,
+        &cli.expansion_add,
+        &cli.expansion_search,
         &cli.search_width
     ) {
-        state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
+        state
+            .check_dimensions(dimensions)
+            .unwrap_or_bail("invalid --dimensions");
 
         let description = format!(
-            "cuvs-cagra · {data_type} · {metric} · d={dimensions} · gd={graph_degree} · igd={intermediate_graph_degree} · itopk={itopk_size} · sw={search_width}"
+            "cuvs-cagra · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search} · sw={search_width}"
         );
+
+        let cagra_tuning = CagraTuning {
+            build_algo: &cli.build_algo,
+            search_width: *search_width,
+            min_iterations: cli.min_iterations,
+            max_iterations: cli.max_iterations,
+            num_random_samplings: cli.num_random_samplings,
+        };
 
         summary.record(run_config(
             &description,
             cli.common.index.as_deref(),
             || {
                 CuvsBackend::new(
-                    dimensions,
-                    data_type,
-                    metric,
-                    *graph_degree,
-                    *intermediate_graph_degree,
-                    &cli.build_algo,
-                    *itopk_size,
-                    *search_width,
-                    cli.min_iterations,
-                    cli.max_iterations,
-                    cli.num_random_samplings,
+                    IndexConfig {
+                        dimensions,
+                        data_type,
+                        metric,
+                        connectivity: *connectivity,
+                        expansion_add: *expansion_add,
+                        expansion_search: *expansion_search,
+                    },
+                    cagra_tuning,
                 )
             },
             |h| {
                 CuvsBackend::load(
                     h,
-                    dimensions,
-                    data_type,
-                    metric,
-                    *itopk_size,
-                    *search_width,
-                    cli.min_iterations,
-                    cli.max_iterations,
-                    cli.num_random_samplings,
+                    IndexConfig {
+                        dimensions,
+                        data_type,
+                        metric,
+                        connectivity: *connectivity,
+                        expansion_add: *expansion_add,
+                        expansion_search: *expansion_search,
+                    },
+                    cagra_tuning,
                 )
             },
             &mut state,

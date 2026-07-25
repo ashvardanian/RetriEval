@@ -14,9 +14,9 @@
 //!
 //! ```sh
 //! retri-eval-qdrant \
-//!     --vectors datasets/wiki_1M/base.1M.fbin \
-//!     --queries datasets/wiki_1M/query.public.100K.fbin \
-//!     --neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
+//!     --base-vectors datasets/wiki_1M/base.1M.fbin \
+//!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
+//!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --metric ip \
 //!     --output results/
 //! ```
@@ -29,11 +29,13 @@ use itertools::iproduct;
 use qdrant_client::qdrant::{
     point_id, quantization_config::Quantization, BinaryQuantization, CreateCollectionBuilder, Datatype,
     Distance as QdrantDistance, HnswConfigDiffBuilder, PointStruct, QuantizationType, ScalarQuantization,
-    SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    SearchParamsBuilder, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use retrieval::docker::ContainerHandle;
-use retrieval::{bail, run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, Vectors};
+use retrieval::{
+    bail, try_run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, UnwrapOrBail, Vectors,
+};
 use serde_json::json;
 
 const COLLECTION: &str = "bench";
@@ -104,11 +106,18 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_value = "none")]
     quantization: Vec<String>,
 
-    #[arg(long, value_delimiter = ',', default_value_t = 16)]
-    connectivity: usize,
+    /// HNSW connectivity M (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', default_value = "16")]
+    connectivity: Vec<usize>,
 
-    #[arg(long, value_delimiter = ',', default_value_t = 128)]
-    expansion_add: usize,
+    /// HNSW expansion factor during indexing (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', default_value = "128")]
+    expansion_add: Vec<usize>,
+
+    /// HNSW expansion factor during search — Qdrant's `hnsw_ef` search param
+    /// (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', default_value = "64")]
+    expansion_search: Vec<usize>,
 
     /// Docker timeout in seconds
     #[arg(long, default_value_t = 120)]
@@ -122,9 +131,10 @@ struct Cli {
     #[arg(long, default_value_t = 6333)]
     http_port: u16,
 
-    /// Batch size for upsert operations
+    /// Vectors per upsert request (distinct from the shared `--batch-size-add`
+    /// / `--batch-size-search`, which pace the harness's add/search loops)
     #[arg(long, default_value_t = 10_000)]
-    batch_size: usize,
+    batch_size_upsert: usize,
 }
 
 // #region Backend
@@ -134,6 +144,9 @@ struct QdrantBackend {
     container: Option<ContainerHandle>,
     runtime: tokio::runtime::Handle,
     batch_size: usize,
+    /// Qdrant's `hnsw_ef`. Set per request rather than on the collection, so it
+    /// can be swept without rebuilding the index.
+    expansion_search: usize,
     description: String,
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -188,31 +201,26 @@ impl Backend for QdrantBackend {
                 let query = data[query_index * dimensions..(query_index + 1) * dimensions].to_vec();
                 let response = self
                     .client
-                    .search_points(SearchPointsBuilder::new(COLLECTION, query, count as u64))
+                    .search_points(
+                        SearchPointsBuilder::new(COLLECTION, query, count as u64)
+                            .params(SearchParamsBuilder::default().hnsw_ef(self.expansion_search as u64)),
+                    )
                     .await
                     .map_err(|e| format!("Qdrant search failed: {e}"))?;
 
                 let offset = query_index * count;
-                let mut found = 0;
-                for (rank, point) in response.result.iter().enumerate().take(count) {
-                    let id = match &point.id {
-                        Some(id) => match &id.point_id_options {
-                            Some(point_id::PointIdOptions::Num(numeric_id)) => *numeric_id as Key,
-                            _ => Key::MAX,
-                        },
-                        None => Key::MAX,
+                let hits = response.result.iter().filter_map(|point| {
+                    let numeric_id = match point.id.as_ref()?.point_id_options.as_ref()? {
+                        point_id::PointIdOptions::Num(numeric_id) => *numeric_id,
+                        _ => return None,
                     };
-                    out_keys[offset + rank] = id;
-                    out_distances[offset + rank] = point.score;
-                    if id != Key::MAX {
-                        found += 1;
-                    }
-                }
-                for rank in response.result.len()..count {
-                    out_keys[offset + rank] = Key::MAX;
-                    out_distances[offset + rank] = Distance::INFINITY;
-                }
-                out_counts[query_index] = found;
+                    Some((numeric_id as Key, point.score))
+                });
+                out_counts[query_index] = retrieval::write_row(
+                    hits,
+                    &mut out_keys[offset..offset + count],
+                    &mut out_distances[offset..offset + count],
+                );
             }
             Ok::<(), String>(())
         })
@@ -236,21 +244,57 @@ impl Drop for QdrantBackend {
 
 // #region main
 
+/// Reject argument combinations Qdrant will refuse or silently ignore, before a
+/// container is started.
+fn validate(cli: &Cli) -> Result<(), String> {
+    for &expansion_search in &cli.expansion_search {
+        if expansion_search == 0 {
+            return Err("--expansion-search must be greater than 0".into());
+        }
+    }
+    for &connectivity in &cli.connectivity {
+        for &expansion_add in &cli.expansion_add {
+            if expansion_add < connectivity {
+                return Err(format!(
+                    "--expansion-add {expansion_add} is below --connectivity {connectivity}; \
+                     ef_construct below M gives Qdrant fewer candidates than edges to keep"
+                ));
+            }
+        }
+    }
+    // Binary quantization thresholds at zero, so it is meaningless on a storage
+    // type that is already unsigned and offset — Qdrant accepts the pair and
+    // returns noise.
+    for quantization in &cli.quantization {
+        for data_type in &cli.data_type {
+            if quantization == "binary" && data_type == "u8" {
+                return Err("--quantization binary with --data-type u8 quantizes an already-unsigned type".into());
+            }
+        }
+    }
+    if cli.batch_size_upsert == 0 {
+        return Err("--batch-size-upsert must be greater than 0".into());
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
+    validate(&cli).unwrap_or_bail("invalid arguments");
 
-    // Validate sweep axes up front so we fail fast on bad CLI input.
-    let sweeps: Vec<(String, Datatype, Option<Quantization>, QdrantDistance)> =
-        iproduct!(&cli.metric, &cli.data_type, &cli.quantization)
-            .map(|(metric, data_type, quantization)| {
-                let parsed_metric = parse_qdrant_distance(metric).unwrap_or_bail("metric");
-                let parsed_data_type = parse_qdrant_datatype(data_type).unwrap_or_bail("data type");
-                let parsed_quantization = parse_qdrant_quantization(quantization).unwrap_or_bail("quantization");
-                (quantization.clone(), parsed_data_type, parsed_quantization, parsed_metric)
-            })
-            .enumerate()
-            .map(|(_, v)| v)
-            .collect();
+    if cli.common.index.is_some() {
+        bail("--index is not supported for this backend");
+    }
+
+    // Reject bad CLI input before starting a container. The loop below re-parses
+    // rather than carrying a parallel vector — one `iproduct!` zipped against a
+    // second is only correct while both enumerate identically, which silently
+    // stops holding the moment a sweep axis is added to one of them.
+    for (metric, data_type, quantization) in iproduct!(&cli.metric, &cli.data_type, &cli.quantization) {
+        parse_qdrant_distance(metric).unwrap_or_bail("metric");
+        parse_qdrant_datatype(data_type).unwrap_or_bail("data type");
+        parse_qdrant_quantization(quantization).unwrap_or_bail("quantization");
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -286,17 +330,35 @@ fn main() {
     if cli.common.dimensions.len() > 1 {
         retrieval::bail("--dimensions sweep with >1 value isn't supported on Qdrant; rerun the binary per dimensions");
     }
-    let dimensions = cli.common.dimensions.first().copied().unwrap_or_else(|| state.dimensions());
-    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dimensions");
+    let dimensions = cli
+        .common
+        .dimensions
+        .first()
+        .copied()
+        .unwrap_or_else(|| state.dimensions());
+    state
+        .check_dimensions(dimensions)
+        .unwrap_or_bail("invalid --dimensions");
 
     let mut container_slot = Some(handle);
-    let num_configs = cli.metric.len() * cli.data_type.len() * cli.quantization.len();
-    for (idx, ((metric_str, dtype_str, quant_str), (_raw_q, dtype_enum, quant_opt, metric_enum))) in
-        iproduct!(&cli.metric, &cli.data_type, &cli.quantization)
-            .zip(sweeps.into_iter())
-            .enumerate()
+    let configs: Vec<_> = iproduct!(
+        &cli.metric,
+        &cli.data_type,
+        &cli.quantization,
+        &cli.connectivity,
+        &cli.expansion_add,
+        &cli.expansion_search
+    )
+    .collect();
+    let num_configs = configs.len();
+    let mut summary = SweepSummary::default();
+    for (idx, (metric_str, dtype_str, quant_str, connectivity, expansion_add, expansion_search)) in
+        configs.into_iter().enumerate()
     {
         let is_last = idx + 1 == num_configs;
+        let metric_enum = parse_qdrant_distance(metric_str).unwrap_or_bail("metric");
+        let dtype_enum = parse_qdrant_datatype(dtype_str).unwrap_or_bail("data type");
+        let quant_opt = parse_qdrant_quantization(quant_str).unwrap_or_bail("quantization");
 
         runtime.block_on(async {
             let _ = client.delete_collection(COLLECTION).await;
@@ -306,8 +368,8 @@ fn main() {
                 .vectors_config(vector_params)
                 .hnsw_config(
                     HnswConfigDiffBuilder::default()
-                        .m(cli.connectivity as u64)
-                        .ef_construct(cli.expansion_add as u64),
+                        .m(*connectivity as u64)
+                        .ef_construct(*expansion_add as u64),
                 );
             if let Some(q) = quant_opt {
                 create = create.quantization_config(q);
@@ -321,33 +383,36 @@ fn main() {
         let container_for_this_run = if is_last { container_slot.take() } else { None };
 
         let description = format!(
-            "qdrant · {metric_str} · data_type={dtype_str} · quant={quant_str} · M={} · ef={} · {dimensions}d",
-            cli.connectivity, cli.expansion_add
+            "qdrant · {metric_str} · data_type={dtype_str} · quant={quant_str} · \
+             M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"
         );
 
-        let mut backend = QdrantBackend {
+        let backend = QdrantBackend {
             client: client.clone(),
             container: container_for_this_run,
             runtime: runtime.handle().clone(),
-            batch_size: cli.batch_size,
-            description,
+            batch_size: cli.batch_size_upsert,
+            expansion_search: *expansion_search,
+            description: description.clone(),
             metadata: {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("backend".into(), json!("qdrant"));
                 metadata.insert("metric".into(), json!(metric_str));
                 metadata.insert("data_type".into(), json!(dtype_str));
                 metadata.insert("quantization".into(), json!(quant_str));
-                metadata.insert("dimensions".into(), json!(dimensions));
-                metadata.insert("connectivity".into(), json!(cli.connectivity));
-                metadata.insert("expansion_add".into(), json!(cli.expansion_add));
+                metadata.insert("connectivity".into(), json!(connectivity));
+                metadata.insert("expansion_add".into(), json!(expansion_add));
+                metadata.insert("expansion_search".into(), json!(expansion_search));
                 metadata
             },
         };
 
-        run(&mut backend, &mut state, dimensions).unwrap_or_else(|e| {
-            eprintln!("Benchmark failed: {e}");
-            std::process::exit(1);
-        });
+        summary.record(try_run_config(
+            &description,
+            Ok::<_, String>(backend),
+            &mut state,
+            dimensions,
+        ));
     }
-    eprintln!("Benchmark complete.");
+    summary.print();
 }

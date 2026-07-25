@@ -45,24 +45,50 @@ def series_key(report: dict[str, Any]) -> str:
     """Derive a unique series name from a report's config."""
     config: dict[str, Any] = report.get("config", {})
     parts: list[str] = [config.get("backend", "?")]
-    for field in ("dtype", "metric"):
+    for field in ("data_type", "metric"):
         if field in config:
             parts.append(str(config[field]))
     if "connectivity" in config:
         parts.append(f"M={config['connectivity']}")
     if "expansion_add" in config and "expansion_search" in config:
         parts.append(f"ef={config['expansion_add']}/{config['expansion_search']}")
+    elif "expansion_search" in config:
+        parts.append(f"ef=?/{config['expansion_search']}")
     shards = config.get("shards", 1)
     if isinstance(shards, int) and shards > 1:
         parts.append(f"{shards}s")
+    # k varies by dataset and by --search-count, and metrics taken at different
+    # k are not comparable — without it two such runs draw as one series.
+    if "search_count" in config:
+        parts.append(f"@{config['search_count']}")
+    # Self-search parameters take part in the config hash, so two runs differing
+    # only in these write separate report files.
+    if "self_search_count" in config:
+        parts.append(f"self@{config['self_search_count']}×{config.get('self_search_sample', '?')}")
     return " · ".join(parts)
+
+
+def add_field(name: str) -> Callable[[dict[str, Any], dict[str, Any]], Any]:
+    """Read a field out of a step's add phase; None when the step had none."""
+    return lambda step, _report: (step.get("add") or {}).get(name)
+
+
+def ground_truth_field(name: str) -> Callable[[dict[str, Any], dict[str, Any]], Any]:
+    """Read a field out of a step's ground-truth search."""
+    return lambda step, _report: (step.get("ground_truth_search") or {}).get(name)
+
+
+def coverage(step: dict[str, Any], report: dict[str, Any]) -> float | None:
+    """Share of the base file this step had indexed — the ceiling raw recall is
+    bounded by, and the divisor a reader needs to interpret a capped run."""
+    total = (report.get("dataset") or {}).get("vectors_count") or 0
+    return int(step["vectors_indexed"]) / total if total else None
 
 
 def make_plot(
     title: str,
     reports: list[dict[str, Any]],
-    x_fn: Callable[[dict[str, Any]], Any],
-    y_fn: Callable[[dict[str, Any]], Any],
+    y_fn: Callable[[dict[str, Any], dict[str, Any]], Any],
     x_label: str,
     y_label: str,
     filename: str,
@@ -72,13 +98,21 @@ def make_plot(
     """Generate a single Plotly chart."""
     fig = go.Figure()
     for i, report in enumerate(reports):
-        name = series_key(report)
-        steps: list[dict[str, Any]] = report.get("steps", [])
-        x_values = [x_fn(s) for s in steps]
-        y_values = [y_fn(s) for s in steps]
+        # Points are paired before filtering: dropping only the y-values would
+        # shift every remaining point onto the wrong x.
+        points = []
+        for step in report.get("steps", []):
+            value = y_fn(step, report)
+            if value is None:
+                continue
+            points.append((int(step["vectors_indexed"]), value))
+        # A load run has no add phase, so it contributes nothing to some charts.
+        # Skip it rather than drawing an empty legend entry.
+        if not points:
+            continue
         fig.add_trace(go.Scatter(
-            x=x_values, y=y_values, mode="lines+markers", name=name,
-            line={"color": COLORS[i % len(COLORS)]},
+            x=[x for x, _ in points], y=[y for _, y in points], mode="lines+markers",
+            name=series_key(report), line={"color": COLORS[i % len(COLORS)]},
         ))
 
     subtitle = f"<br><sub>{machine_info.get('cpu_model', '')}</sub>" if machine_info else ""
@@ -110,43 +144,45 @@ def main() -> None:
     series_names = [series_key(r) for r in reports]
     print(f"Found {len(reports)} reports: {', '.join(series_names)}", file=sys.stderr)
 
-    def vectors_indexed(step: dict[str, Any]) -> int:
-        return int(step["vectors_indexed"])
+    # k is per-report now, so title it only when every report agrees.
+    counts = {
+        (r.get("config") or {}).get("search_count")
+        for r in reports
+        if (r.get("config") or {}).get("search_count") is not None
+    }
+    k_label = str(counts.pop()) if len(counts) == 1 else "K"
 
-    make_plot("Construction Speed", reports, vectors_indexed,
-              lambda s: s["add_throughput"],
+    make_plot("Construction Speed", reports, add_field("throughput"),
               "Vectors Indexed", "Vectors / Second",
               "construction-speed.png", output_dir, machine_info)
 
-    make_plot("Index Memory", reports, vectors_indexed,
-              lambda s: s["memory_bytes"] / 1e9,
+    make_plot("Index Memory", reports, lambda s, _r: s["memory_bytes"] / 1e9,
               "Vectors Indexed", "Memory (GB)",
               "construction-memory.png", output_dir, machine_info)
 
-    make_plot("Search Speed", reports, vectors_indexed,
-              lambda s: s["search_throughput"],
+    make_plot("Search Speed", reports, ground_truth_field("throughput"),
               "Vectors Indexed", "Queries / Second",
               "search-speed.png", output_dir, machine_info)
 
-    make_plot("Recall@1", reports, vectors_indexed,
-              lambda s: s["recall_at_1"],
+    make_plot("Recall@1", reports, ground_truth_field("recall_at_1"),
               "Vectors Indexed", "Recall@1",
               "recall-at-1.png", output_dir, machine_info)
 
-    make_plot("Recall@10", reports, vectors_indexed,
-              lambda s: s["recall_at_10"],
-              "Vectors Indexed", "Recall@10",
-              "recall-at-10.png", output_dir, machine_info)
+    make_plot(f"Recall@{k_label}", reports, ground_truth_field("recall_at_k"),
+              "Vectors Indexed", f"Recall@{k_label}",
+              "recall-at-k.png", output_dir, machine_info)
 
-    make_plot("Recall@1 (normalized)", reports, vectors_indexed,
-              lambda s: s["recall_at_1_normalized"],
-              "Vectors Indexed", "Recall@1 (normalized)",
-              "recall-at-1-normalized.png", output_dir, machine_info)
+    make_plot(f"Intersection@{k_label}", reports, ground_truth_field("intersection_at_k"),
+              "Vectors Indexed", f"Intersection@{k_label}",
+              "intersection-at-k.png", output_dir, machine_info)
 
-    make_plot("NDCG@10", reports, vectors_indexed,
-              lambda s: s["ndcg_at_10"],
-              "Vectors Indexed", "NDCG@10",
-              "ndcg-at-10.png", output_dir, machine_info)
+    make_plot(f"NDCG@{k_label}", reports, ground_truth_field("ndcg_at_k"),
+              "Vectors Indexed", f"NDCG@{k_label}",
+              "ndcg-at-k.png", output_dir, machine_info)
+
+    make_plot("Ground-Truth Coverage", reports, coverage,
+              "Vectors Indexed", "Indexed / Base File",
+              "coverage.png", output_dir, machine_info)
 
     print(f"Plots written to {output_dir}/", file=sys.stderr)
 
