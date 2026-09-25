@@ -28,7 +28,7 @@ use clap::Parser;
 use itertools::iproduct;
 use qdrant_client::qdrant::{
     point_id, quantization_config::Quantization, BinaryQuantization, CreateCollectionBuilder, Datatype,
-    Distance as QdrantDistance, HnswConfigDiffBuilder, PointStruct, QuantizationType, ScalarQuantization,
+    Distance as QdrantDistance, HnswConfigDiffBuilder, Memory, PointStruct, QuantizationType, ScalarQuantization,
     SearchParamsBuilder, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
@@ -71,14 +71,14 @@ fn parse_qdrant_quantization(s: &str) -> Result<Option<Quantization>, String> {
     match s {
         "none" => Ok(None),
         "binary" => Ok(Some(Quantization::Binary(BinaryQuantization {
-            always_ram: Some(true),
-            encoding: None,
-            query_encoding: None,
+            memory: Some(Memory::Pinned as i32),
+            ..Default::default()
         }))),
         "scalar" => Ok(Some(Quantization::Scalar(ScalarQuantization {
             r#type: QuantizationType::Int8 as i32,
             quantile: Some(0.99),
-            always_ram: Some(true),
+            memory: Some(Memory::Pinned as i32),
+            ..Default::default()
         }))),
         _ => Err(format!(
             "unknown Qdrant quantization: {s} (supported: none, binary, scalar)"
@@ -304,7 +304,7 @@ fn main() {
 
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start(
-            "qdrant/qdrant:v1.17.1",
+            "qdrant/qdrant:v1.19.1",
             "retrieval-qdrant",
             &vec![(cli.http_port, 6333), (cli.grpc_port, 6334)],
             &[],

@@ -235,14 +235,14 @@ Server-side quantization is managed by the database engine, not the benchmark.
 Binary quantization is deterministic `sign(x)` per dim, and scalar quantization is per-dim min/max — neither trains a codebook, so both stay inside the "no learned logic" constraint the rest of the benchmark holds for the native backends.
 Product quantization is deliberately excluded everywhere.
 
-| Backend      | Client                       | Docker Image                        | Metrics                | Wire dtype sweep                        | Server-side quantization   |
-| ------------ | ---------------------------- | ----------------------------------- | ---------------------- | --------------------------------------- | -------------------------- |
-| __Qdrant__   | `qdrant-client`, gRPC        | `qdrant/qdrant:v1.17.1`             | ip, l2, cos, manhattan | `f32`, `f16`, `u8`                      | `none`, `binary`, `scalar` |
-| __Redis__    | `redis`, RESP                | `redis:8.6`                         | ip, l2, cos            | `f32`, `f64`, `f16`, `bf16`, `u8`, `i8` | —                          |
-| __Weaviate__ | `weaviate-community`, REST   | `semitechnologies/weaviate:1.36.10` | ip, l2, cos            | `f32` only                              | `none`, `binary`           |
-| __LanceDB__  | `lancedb`, in-process, Arrow | —                                   | ip, l2, cos            | `f32` only                              | — (IVF-bucketed only) ¹    |
+| Backend      | Client                       | Docker Image                       | Metrics                | Wire dtype sweep                        | Server-side quantization   |
+| ------------ | ---------------------------- | ---------------------------------- | ---------------------- | --------------------------------------- | -------------------------- |
+| __Qdrant__   | `qdrant-client`, gRPC        | `qdrant/qdrant:v1.19.1`            | ip, l2, cos, manhattan | `f32`, `f16`, `u8`                      | `none`, `binary`, `scalar` |
+| __Redis__    | `redis`, RESP                | `redis:8.10`                       | ip, l2, cos            | `f32`, `f64`, `f16`, `bf16`, `u8`, `i8` | —                          |
+| __Weaviate__ | `reqwest`, REST              | `semitechnologies/weaviate:1.39.7` | ip, l2, cos            | `f32` only                              | `none`, `binary`           |
+| __LanceDB__  | `lancedb`, in-process, Arrow | —                                  | ip, l2, cos            | `f32` only                              | — (IVF-bucketed only) ¹    |
 
-¹ LanceDB's Rust client — `lancedb 0.27` — exposes graph-based search only via `IvfHnswPq` / `IvfHnswSq`, both IVF-bucketed and PQ k-means-trained. No pure-HNSW variant is offered, so this benchmark leaves LanceDB on plain `f32` + L2/IP/Cos until upstream adds one. Hamming is only available on `IvfFlat`, outside our graph path.
+¹ LanceDB's Rust client — `lancedb 0.37` — exposes graph-based search only via `IvfHnswFlat` / `IvfHnswSq` / `IvfHnswPq`, all behind a k-means-trained IVF layer that cannot be disabled. No pure-HNSW variant is offered, so this benchmark leaves LanceDB on plain `f32` + L2/IP/Cos until upstream adds one. Hamming is only available on `IvfFlat`, outside our graph path.
 
 Redis 8.x is required for `i8`, `u8`, `f16`, and `bf16` — the older `redis/redis-stack` images on Redis 7.4 reject those four types at `FT.CREATE`.
 Qdrant server-side `Float16` and `Uint8` accept f32 upserts and convert on ingest, so the wire payload we send is unchanged.

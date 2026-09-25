@@ -5,7 +5,7 @@ use fork_union::{SyncMutPtr, ThreadPool};
 use memmap2::Mmap;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 
 use crate::error::DatasetError;
 use crate::{Key, VectorSlice, Vectors};

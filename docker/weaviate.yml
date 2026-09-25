@@ -1,8 +1,8 @@
 services:
   weaviate:
-    # Weaviate 1.37.x — HNSW with bq / sq / pq / rq quantization configs.
+    # Weaviate 1.39.x — HNSW with bq / sq / pq / rq quantization configs.
     # We wire BQ only in the first pass (deterministic sign-based).
-    image: semitechnologies/weaviate:1.36.10
+    image: semitechnologies/weaviate:1.39.7
     ports:
       - "8080:8080"
       - "50051:50051"

@@ -64,15 +64,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memmap2 = "0.9"
 glob = "0.3"
-sysinfo = "0.38"
+sysinfo = "0.39"
 indicatif = "0.18"
-rand = "0.9"
+rand = "0.10"
 thiserror = "2"
 
 # USearch backend
 usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", optional = true }
 fork_union = { version = "2" }
-itertools = { version = "0.14", optional = true }
+itertools = { version = "0.15", optional = true }
 
 # FAISS backend — use `faiss-static` feature to bundle FAISS from source,
 # or plain `faiss-backend` to link against a pre-installed libfaiss_c.
@@ -82,32 +82,35 @@ faiss = { version = "0.13", optional = true }
 # (not gated behind a feature) so `src/redis.rs` can route source → wire
 # dtype conversions through `numkong::cast` for `FT.CREATE VECTOR TYPE`
 # payloads (f16 / bf16 / u8 / i8) without a feature-flag scavenger hunt.
-bollard = { version = "0.20", optional = true }
+bollard = { version = "0.21", optional = true }
 futures-util = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
-reqwest = { version = "0.12", optional = true }
+reqwest = { version = "0.13", optional = true }
 
 # Qdrant
 qdrant-client = { version = "1", optional = true }
 
 # Redis
-redis = { version = "0.27", features = ["tokio-comp"], optional = true }
+redis = { version = "1", optional = true }
 
-# LanceDB
-lancedb = { version = "0.27", optional = true }
-arrow-array = { version = "57", optional = true }
-arrow-schema = { version = "57", optional = true }
-
-# Weaviate
-weaviate-community = { version = "0.2", optional = true }
+# LanceDB — 0.38 and 0.39 fail to build without their `remote` feature (lancedb/lancedb#4142).
+lancedb = { version = "0.37", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
 
 # cuVS
 cuvs = { version = "26.4", optional = true }
 cuvs-sys = { version = "26.4", optional = true }
-numkong = { version = "7.6", features = ["parallel"] }
+numkong = { version = "7.8", features = ["parallel"] }
 
 # Dataset download binaries (Parquet readers for USearchMolecules / Cohere Wikipedia)
-parquet = { version = "57", default-features = false, features = ["arrow", "snap", "lz4", "zstd", "brotli"], optional = true }
+parquet = { version = "58", default-features = false, features = [
+    "arrow",
+    "snap",
+    "lz4",
+    "zstd",
+    "brotli",
+], optional = true }
 futures = { version = "0.3", optional = true }
 bytes = { version = "1", optional = true }
 
@@ -126,8 +129,17 @@ tier2 = ["bollard", "futures-util", "tokio", "reqwest", "reqwest/json"]
 qdrant-backend = ["tier2", "qdrant-client"]
 redis-backend = ["tier2", "redis"]
 lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
-weaviate-backend = ["tier2", "weaviate-community"]
+weaviate-backend = ["tier2"]
 cuvs-backend = ["cuvs", "cuvs-sys", "itertools"]
 generate = []
-download = ["parquet", "arrow-array", "arrow-schema", "reqwest", "reqwest/json", "reqwest/rustls-tls", "tokio", "futures", "bytes"]
+download = [
+    "parquet",
+    "arrow-array",
+    "arrow-schema",
+    "reqwest",
+    "reqwest/json",
+    "tokio",
+    "futures",
+    "bytes",
+]
 perf-counters = ["dep:perf-event2"]

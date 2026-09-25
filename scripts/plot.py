@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["plotly", "kaleido==0.2.*"]
+# dependencies = ["plotly>=6.1", "kaleido>=1"]
 # ///
 """
 Generate benchmark plots from JSON result files.
@@ -21,9 +21,16 @@ from typing import Any, Callable
 import plotly.graph_objects as go
 
 COLORS = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-    "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
-    "#bcbd22", "#17becf",
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
 ]
 
 
@@ -64,7 +71,9 @@ def series_key(report: dict[str, Any]) -> str:
     # Self-search parameters take part in the config hash, so two runs differing
     # only in these write separate report files.
     if "self_search_count" in config:
-        parts.append(f"self@{config['self_search_count']}×{config.get('self_search_sample', '?')}")
+        parts.append(
+            f"self@{config['self_search_count']}×{config.get('self_search_sample', '?')}"
+        )
     return " · ".join(parts)
 
 
@@ -110,12 +119,19 @@ def make_plot(
         # Skip it rather than drawing an empty legend entry.
         if not points:
             continue
-        fig.add_trace(go.Scatter(
-            x=[x for x, _ in points], y=[y for _, y in points], mode="lines+markers",
-            name=series_key(report), line={"color": COLORS[i % len(COLORS)]},
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=[x for x, _ in points],
+                y=[y for _, y in points],
+                mode="lines+markers",
+                name=series_key(report),
+                line={"color": COLORS[i % len(COLORS)]},
+            )
+        )
 
-    subtitle = f"<br><sub>{machine_info.get('cpu_model', '')}</sub>" if machine_info else ""
+    subtitle = (
+        f"<br><sub>{machine_info.get('cpu_model', '')}</sub>" if machine_info else ""
+    )
     fig.update_layout(
         title=f"{title}{subtitle}",
         xaxis_title=x_label,
@@ -127,9 +143,15 @@ def make_plot(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot benchmark results from JSON files")
-    parser.add_argument("input", help="Directory containing JSON result files, or a single file")
-    parser.add_argument("--output-dir", default="plots", help="Output directory for PNGs")
+    parser = argparse.ArgumentParser(
+        description="Plot benchmark results from JSON files"
+    )
+    parser.add_argument(
+        "input", help="Directory containing JSON result files, or a single file"
+    )
+    parser.add_argument(
+        "--output-dir", default="plots", help="Output directory for PNGs"
+    )
     args = parser.parse_args()
 
     reports = load_reports(args.input)
@@ -152,37 +174,93 @@ def main() -> None:
     }
     k_label = str(counts.pop()) if len(counts) == 1 else "K"
 
-    make_plot("Construction Speed", reports, add_field("throughput"),
-              "Vectors Indexed", "Vectors / Second",
-              "construction-speed.png", output_dir, machine_info)
+    make_plot(
+        "Construction Speed",
+        reports,
+        add_field("throughput"),
+        "Vectors Indexed",
+        "Vectors / Second",
+        "construction-speed.png",
+        output_dir,
+        machine_info,
+    )
 
-    make_plot("Index Memory", reports, lambda s, _r: s["memory_bytes"] / 1e9,
-              "Vectors Indexed", "Memory (GB)",
-              "construction-memory.png", output_dir, machine_info)
+    make_plot(
+        "Index Memory",
+        reports,
+        lambda s, _r: s["memory_bytes"] / 1e9,
+        "Vectors Indexed",
+        "Memory (GB)",
+        "construction-memory.png",
+        output_dir,
+        machine_info,
+    )
 
-    make_plot("Search Speed", reports, ground_truth_field("throughput"),
-              "Vectors Indexed", "Queries / Second",
-              "search-speed.png", output_dir, machine_info)
+    make_plot(
+        "Search Speed",
+        reports,
+        ground_truth_field("throughput"),
+        "Vectors Indexed",
+        "Queries / Second",
+        "search-speed.png",
+        output_dir,
+        machine_info,
+    )
 
-    make_plot("Recall@1", reports, ground_truth_field("recall_at_1"),
-              "Vectors Indexed", "Recall@1",
-              "recall-at-1.png", output_dir, machine_info)
+    make_plot(
+        "Recall@1",
+        reports,
+        ground_truth_field("recall_at_1"),
+        "Vectors Indexed",
+        "Recall@1",
+        "recall-at-1.png",
+        output_dir,
+        machine_info,
+    )
 
-    make_plot(f"Recall@{k_label}", reports, ground_truth_field("recall_at_k"),
-              "Vectors Indexed", f"Recall@{k_label}",
-              "recall-at-k.png", output_dir, machine_info)
+    make_plot(
+        f"Recall@{k_label}",
+        reports,
+        ground_truth_field("recall_at_k"),
+        "Vectors Indexed",
+        f"Recall@{k_label}",
+        "recall-at-k.png",
+        output_dir,
+        machine_info,
+    )
 
-    make_plot(f"Intersection@{k_label}", reports, ground_truth_field("intersection_at_k"),
-              "Vectors Indexed", f"Intersection@{k_label}",
-              "intersection-at-k.png", output_dir, machine_info)
+    make_plot(
+        f"Intersection@{k_label}",
+        reports,
+        ground_truth_field("intersection_at_k"),
+        "Vectors Indexed",
+        f"Intersection@{k_label}",
+        "intersection-at-k.png",
+        output_dir,
+        machine_info,
+    )
 
-    make_plot(f"NDCG@{k_label}", reports, ground_truth_field("ndcg_at_k"),
-              "Vectors Indexed", f"NDCG@{k_label}",
-              "ndcg-at-k.png", output_dir, machine_info)
+    make_plot(
+        f"NDCG@{k_label}",
+        reports,
+        ground_truth_field("ndcg_at_k"),
+        "Vectors Indexed",
+        f"NDCG@{k_label}",
+        "ndcg-at-k.png",
+        output_dir,
+        machine_info,
+    )
 
-    make_plot("Ground-Truth Coverage", reports, coverage,
-              "Vectors Indexed", "Indexed / Base File",
-              "coverage.png", output_dir, machine_info)
+    make_plot(
+        "Ground-Truth Coverage",
+        reports,
+        coverage,
+        "Vectors Indexed",
+        "Indexed / Base File",
+        "coverage.png",
+        output_dir,
+        machine_info,
+    )
 
     print(f"Plots written to {output_dir}/", file=sys.stderr)
 

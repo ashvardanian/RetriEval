@@ -34,7 +34,7 @@ use clap::Parser;
 use fork_union::{IndexedSplit, SyncMutPtr, ThreadPool};
 use numkong::{MatrixSpan, MatrixView};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use retrieval::error::GroundTruthError;
 use retrieval::packed_distance::PackedDistance;
@@ -111,9 +111,7 @@ pub fn compute_top_k<Metric: PackedDistance>(
         return Err(GroundTruthError::NonContiguousView { which: "queries" });
     }
     if !ground_truth.has_contiguous_rows() {
-        return Err(GroundTruthError::NonContiguousView {
-            which: "ground_truth",
-        });
+        return Err(GroundTruthError::NonContiguousView { which: "ground_truth" });
     }
 
     let base_count = base.shape()[0];
@@ -133,10 +131,7 @@ pub fn compute_top_k<Metric: PackedDistance>(
     }
     let top_k = ground_truth.shape()[1];
     if top_k == 0 || top_k > base_count {
-        return Err(GroundTruthError::TopKTooLarge {
-            top_k,
-            base_count,
-        });
+        return Err(GroundTruthError::TopKTooLarge { top_k, base_count });
     }
     let threads = threads.max(1);
 
@@ -159,22 +154,18 @@ pub fn compute_top_k<Metric: PackedDistance>(
     //
     // TODO(numkong): switch to `PackedMatrix::pack_view(&base)` once upstream.
     let base_storage_count = base_count * base.stride_bytes(0) as usize / std::mem::size_of::<Metric>();
-    let base_slice: &[Metric] =
-        unsafe { std::slice::from_raw_parts(base.as_ptr(), base_storage_count) };
+    let base_slice: &[Metric] = unsafe { std::slice::from_raw_parts(base.as_ptr(), base_storage_count) };
     let base_tensor = numkong::Matrix::<Metric>::from_slice(base_slice, &[base_count, dimensions]);
     let packed_base = numkong::PackedMatrix::pack(&base_tensor);
     drop(base_tensor);
 
-    let mut pool =
-        ThreadPool::try_spawn(threads).map_err(|e| GroundTruthError::ThreadPool(format!("{e}")))?;
+    let mut pool = ThreadPool::try_spawn(threads).map_err(|e| GroundTruthError::ThreadPool(format!("{e}")))?;
 
     // One reusable distance tensor of shape `[batch, base_count]` of
     // `Metric::Distance` scalars. Each per-query batch writes into the
     // first `batch_count` rows.
-    let mut distance_tensor = numkong::Matrix::<Metric::Distance>::try_full(
-        &[batch, base_count],
-        Metric::Distance::default(),
-    )?;
+    let mut distance_tensor =
+        numkong::Matrix::<Metric::Distance>::try_full(&[batch, base_count], Metric::Distance::default())?;
 
     let ground_truth_ptr = SyncMutPtr::new(ground_truth.as_mut_ptr());
     let gt_row_stride = (ground_truth.stride_bytes(0) as usize) / std::mem::size_of::<u32>();
@@ -185,11 +176,9 @@ pub fn compute_top_k<Metric: PackedDistance>(
     // while an attached terminal shows live `{pos}/{len} ({per_sec}, ETA)`.
     let progress = indicatif::ProgressBar::new(query_count as u64);
     progress.set_style(
-        indicatif::ProgressStyle::with_template(
-            "  {msg} [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})",
-        )
-        .unwrap()
-        .progress_chars("##-"),
+        indicatif::ProgressStyle::with_template("  {msg} [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .unwrap()
+            .progress_chars("##-"),
     );
     progress.set_message(format!("ground truth ({})", Metric::metric_name()));
 
@@ -209,8 +198,7 @@ pub fn compute_top_k<Metric: PackedDistance>(
         // view-accepting `PackedMatrix::pack_view` path.
         // TODO(numkong): drop the copy once `PackedMatrix::pack_view` lands.
         let batch_storage_count = batch_count * query_row_stride / std::mem::size_of::<Metric>();
-        let batch_slice: &[Metric] =
-            unsafe { std::slice::from_raw_parts(batch_view.as_ptr(), batch_storage_count) };
+        let batch_slice: &[Metric] = unsafe { std::slice::from_raw_parts(batch_view.as_ptr(), batch_storage_count) };
         let query_tensor = numkong::Matrix::<Metric>::from_slice(batch_slice, &[batch_count, dimensions]);
 
         // NumKong writes the distance matrix in parallel using our pool.
@@ -256,10 +244,7 @@ pub fn compute_top_k<Metric: PackedDistance>(
                 // pointer-arithmetic.
                 let query_idx = batch_start + local_idx;
                 let row: &mut [u32] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        ground_truth_ptr.as_ptr().add(query_idx * gt_row_stride),
-                        top_k,
-                    )
+                    std::slice::from_raw_parts_mut(ground_truth_ptr.as_ptr().add(query_idx * gt_row_stride), top_k)
                 };
                 for rank in (0..top_k).rev() {
                     // SAFETY of `unwrap_unchecked`: at this point the heap

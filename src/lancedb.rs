@@ -242,8 +242,8 @@ fn main() {
             metadata.insert("backend".into(), json!("lancedb"));
             metadata.insert("metric".into(), json!(&cli.metric));
             metadata.insert("data_type".into(), json!("f32"));
-            // No `create_index` call: LanceDB's only graph indexes are
-            // `IvfHnswPq` / `IvfHnswSq`, both IVF-bucketed and k-means trained,
+            // No `create_index` call: every LanceDB graph index (`IvfHnswFlat` /
+            // `IvfHnswSq` / `IvfHnswPq`) sits behind a k-means-trained IVF layer,
             // which the no-learned-codebook rule excludes. Exhaustive scan is
             // the compliant fallback, and its recall of 1.0 means that rather
             // than a perfect graph.
