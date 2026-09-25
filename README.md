@@ -1,7 +1,7 @@
 ![RetriEval benchmarks thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/RetriEval.jpg?raw=true) 
 
 __RetriEval__ is a benchmarking suite designed for Billion-scale Vector Search workloads.
-It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/rapidsai/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
+It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/NVIDIA/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
 It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, and machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
 
 <table>
@@ -457,7 +457,7 @@ The mechanism depends on the backend:
 | :-------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | In-process — USearch, FAISS, cuVS       | The engine exposes its internal allocator or `index.size()` API, giving exact index footprint excluding dataset mmap. USearch: `index.memory_usage()`. FAISS: `index.stats().indexed_vectors * sizeof`.        |
 | Tier 2 Docker — Qdrant, Redis, Weaviate | `docker stats --no-stream --format '{{.MemUsage}}'` is sampled per step against the running container and parsed into bytes. This includes the whole engine process, not just the index, so it's an overcount. |
-| LanceDB — in-process, Arrow IPC         | Filesystem-backed; `memory_bytes` reports the table's on-disk size from `fs::metadata`, not RSS.                                                                                                               |
+| LanceDB — in-process, Arrow IPC         | Not measured; `memory_bytes` is always 0.                                                                                                                                                                      |
 
 The `peak memory` line printed at the end of a run is `steps.iter().map(|s| s.memory_bytes).max()`.
 Process-wide peak RSS — the kernel's accounting of everything including mmapped datasets — is available via `getrusage(RUSAGE_SELF)` but is not currently reported in the JSON.
@@ -470,8 +470,8 @@ They run as Docker containers the benchmark spawns and tears down automatically.
 `src/docker.rs` wraps `bollard`, the async Docker API client, and does:
 
 1. __Pull__ — runs `docker pull qdrant/qdrant:vX.Y.Z` or equivalent if the image isn't cached locally.
-2. __Run__ — creates the container with port bindings and environment variables from the compose file at `docker/<backend>.yml`, then starts it.
-3. __Wait for ready__ — polls an HTTP health endpoint such as `/healthz` or `/health` with 500 ms intervals until the backend accepts connections, or a configurable timeout fires.
+2. __Run__ — creates the container with the port bindings and environment variables hard-coded in each binary, then starts it. The `docker/<backend>.yml` compose files mirror them for starting a server by hand.
+3. __Wait for ready__ — polls Qdrant's `/healthz`, Weaviate's `/v1/.well-known/ready`, or Redis's TCP port every 500 ms until the backend accepts connections, or a configurable timeout fires.
 4. __Run the benchmark__ against the container.
 5. __Stop and remove__ the container regardless of success or failure — RAII-style via `ContainerHandle::Drop`.
 
@@ -531,6 +531,8 @@ src/
     eval.rs                 # Recall@K, NDCG@K
     output.rs               # Report types, JSON writer, machine info
     docker.rs               # Docker container lifecycle (Tier 2 backends)
+    error.rs                # Error types shared across the library and binaries
+    packed_distance.rs      # NumKong packed-distance kernels for ground truth
     usearch.rs              # retri-eval-usearch binary
     faiss.rs                # retri-eval-faiss binary
     cuvs.rs                 # retri-eval-cuvs binary
@@ -562,11 +564,10 @@ Matched shards are natural-sorted (`shard_2.fbin` before `shard_10.fbin`) and va
 
 ### ~1M Scale — Development & Testing
 
-| Dataset                                    | Scalar Type | Dimensions | Metric | Base Size | Ground Truth      |
-| :----------------------------------------- | ----------: | ---------: | -----: | --------: | :---------------- |
-| [Unum UForm Wiki][unum-wiki-1m]            |       `f32` |        256 |     IP |      1 GB | 100K queries, yes |
-| [Unum UForm Creative Captions][unum-cc-3m] |       `f32` |        256 |     IP |      3 GB | 3M queries, yes   |
-| [Arxiv with E5][unum-arxiv-2m]             |       `f32` |        768 |     IP |      6 GB | 2M queries, yes   |
+| Dataset                         | Scalar Type | Dimensions | Metric | Base Size | Ground Truth      |
+| :------------------------------ | ----------: | ---------: | -----: | --------: | :---------------- |
+| [Unum UForm Wiki][unum-wiki-1m] |       `f32` |        256 |     IP |      1 GB | 100K queries, yes |
+| [Arxiv with E5][unum-arxiv-2m]  |       `f32` |        768 |     IP |      7 GB | 2.3M queries, yes |
 
 ### ~10M Scale
 
@@ -607,15 +608,14 @@ Matched shards are natural-sorted (`shard_2.fbin` before `shard_10.fbin`) and va
 | [USearchMolecules Enamine REAL][usm] MACCS |        `b1` |        168 | Hamming |    127 GB | self-sampled ¹    |
 | [USearchMolecules Enamine REAL][usm] ECFP4 |        `b1` |       2048 | Hamming |   1.55 TB | self-sampled ¹    |
 
-[unum-cc-3m]: https://huggingface.co/datasets/unum-cloud/ann-cc-3m
 [unum-wiki-1m]: https://huggingface.co/datasets/unum-cloud/ann-wiki-1m
 [unum-arxiv-2m]: https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m
 [msft-spacev]: https://github.com/ashvardanian/SpaceV
-[msft-turing]: https://learning2hash.github.io/publications/microsoftturinganns1B/
+[msft-turing]: https://big-ann-benchmarks.com/neurips21.html
 [yandex-t2i]: https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search
 [yandex-deep]: https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search
-[meta-bigann]: https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/
-[usm]: https://github.com/ashvardanian/USearchMolecules
+[meta-bigann]: http://corpus-texmex.irisa.fr/
+[usm]: https://github.com/unum-science/USearchMolecules
 [cohere-wiki]: https://huggingface.co/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary
 [wikiverse]: https://huggingface.co/datasets/unum-cloud/WikiVerse
 [usearch-wiki]: https://github.com/unum-cloud/USearchWiki
@@ -646,50 +646,24 @@ retri-eval-usearch \
 
 </details>
 
-### Unum UForm Creative Captions
-
-Conceptual Captions image embeddings from the same UForm model as Wiki.
-Ground truth was computed offline by shuffling the base set as queries and recording the top-100 IP neighbors per row — see `scripts/compute_unum_orphan_gt.py`.
-
-<details>
-<summary>3M — f32, 256d, IP, ~3 GB</summary>
-
-```sh
-mkdir -p data/cc-3m/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/base.fbin -P data/cc-3m/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/query.fbin -P data/cc-3m/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-cc-3m/resolve/main/groundtruth.ibin -P data/cc-3m/
-```
-
-```sh
-retri-eval-usearch \
-    --base-vectors data/cc-3m/base.fbin \
-    --query-vectors data/cc-3m/query.fbin \
-    --query-neighbors data/cc-3m/groundtruth.ibin \
-    --data-type f32,bf16,f16,i8 --metric ip \
-    --output results/cc_3M
-```
-
-</details>
-
 ### Arxiv with E5
 
-Arxiv abstracts embedded with the `intfloat/e5-base` model.
-Same offline GT recipe as Creative Captions: shuffled base as queries, top-100 IP neighbors.
+Arxiv abstracts embedded with the `intfloat/e5-base-v2` model.
+Ground truth was computed offline by shuffling the base set as queries and recording the top-100 IP neighbors per row.
 
 <details>
-<summary>2M — f32, 768d, IP, ~6 GB</summary>
+<summary>2.3M — f32, 768d, IP, ~7 GB</summary>
 
 ```sh
 mkdir -p data/arxiv-2m/ && \
-    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/base.fbin -P data/arxiv-2m/ && \
+    wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/abstract.e5-base-v2.fbin -P data/arxiv-2m/ && \
     wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/query.fbin -P data/arxiv-2m/ && \
     wget -nc https://huggingface.co/datasets/unum-cloud/ann-arxiv-2m/resolve/main/groundtruth.ibin -P data/arxiv-2m/
 ```
 
 ```sh
 retri-eval-usearch \
-    --base-vectors data/arxiv-2m/base.fbin \
+    --base-vectors data/arxiv-2m/abstract.e5-base-v2.fbin \
     --query-vectors data/arxiv-2m/query.fbin \
     --query-neighbors data/arxiv-2m/groundtruth.ibin \
     --data-type f32,bf16,f16,i8 --metric ip \
@@ -952,7 +926,7 @@ Use `--limit N` to take a subset and `--source {pubchem,gdb13,enamine}` to pick 
 cargo install --path . --features download
 retri-download-molecules \
     --source pubchem --fingerprint maccs \
-    --query-count 10000 --count 10 \
+    --query-count 10000 --neighbors 10 \
     --output data/pubchem-maccs/
 ```
 
@@ -973,7 +947,7 @@ retri-eval-usearch \
 ```sh
 retri-download-molecules \
     --source pubchem --fingerprint ecfp4 \
-    --query-count 10000 --count 10 \
+    --query-count 10000 --neighbors 10 \
     --output datasets/pubchem_ecfp4/
 ```
 
@@ -994,7 +968,7 @@ retri-eval-usearch \
 ```sh
 retri-download-molecules \
     --source gdb13 --fingerprint maccs \
-    --query-count 10000 --count 10 \
+    --query-count 10000 --neighbors 10 \
     --output datasets/gdb13_maccs/
 ```
 
@@ -1006,7 +980,7 @@ retri-download-molecules \
 ```sh
 retri-download-molecules \
     --source enamine --fingerprint maccs \
-    --query-count 10000 --count 10 \
+    --query-count 10000 --neighbors 10 \
     --output datasets/enamine_maccs/
 ```
 
@@ -1027,7 +1001,7 @@ The dataset also ships text metadata — title, paragraph body, URL — alongsid
 ```sh
 retri-download-cohere \
     --language en \
-    --query-count 10000 --count 10 \
+    --query-count 10000 --neighbors 10 \
     --output datasets/cohere_en/
 ```
 

@@ -19,7 +19,7 @@
 //! ```sh
 //! pip install libcuvs-cu12
 //! # Symlink into /opt/rapids so relative cmake configs resolve correctly.
-//! # See: https://docs.rapids.ai/install
+//! # See: https://docs.nvidia.com/datascience/install/
 //! ```
 //!
 //! Then create `.cargo/config.toml` (git-ignored) pointing at your CUDA and
