@@ -47,7 +47,7 @@ use parquet::arrow::ProjectionMask;
 use rand::rngs::StdRng;
 use rand::seq::index::sample as sample_without_replacement;
 use rand::SeedableRng;
-use retrieval::generate as ground_truth;
+use retrieval::generate::{binary_view, compute_hamming_top_k, matrix_span};
 
 const SHARD_ROWS: usize = 1_000_000;
 const BUCKET_URL_PREFIX: &str = "https://s3.us-west-2.amazonaws.com/usearch-molecules/data";
@@ -157,7 +157,7 @@ fn validate_source(source: &str) -> Result<&'static str, String> {
     match source {
         "pubchem" => Ok("pubchem"),
         "gdb13" => Ok("gdb13"),
-        "enamine" => Ok("enamine"),
+        "enamine" => Ok("real"),
         other => Err(format!("unknown source: {other} (supported: pubchem, gdb13, enamine)")),
     }
 }
@@ -366,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Memory-map the base for query sampling + ground truth.
     let base_dataset = retrieval::Dataset::load(&base_path)?;
     assert_eq!(base_dataset.rows(), total_rows);
-    let base_bytes = base_dataset.all();
+    let base_bytes = base_dataset.slice(0, total_rows, base_dataset.dimensions(), &mut []);
     let base_slice: &[u8] = match base_bytes.data {
         retrieval::VectorSlice::B1x8(data) => data,
         _ => return Err("unexpected non-binary base after load".into()),
@@ -403,11 +403,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MACCS (166) and PubChem (881) fingerprints round up to full-byte counts;
     // trailing unused bits contribute 0 to Hamming (identical across vectors).
     let storage_bits = info.bytes_per_vector * 8;
-    let base_view = ground_truth::binary_view(base_slice, total_rows, storage_bits);
-    let query_view = ground_truth::binary_view(&query_buffer, query_count, storage_bits);
+    let base_view = binary_view(base_slice, total_rows, storage_bits);
+    let query_view = binary_view(&query_buffer, query_count, storage_bits);
     let mut ground_truth_indices = vec![0u32; query_count * cli.neighbors];
-    let ground_truth_span = ground_truth::matrix_span(&mut ground_truth_indices, query_count, cli.neighbors);
-    ground_truth::compute_hamming_top_k(base_view, query_view, ground_truth_span, cli.batch_size, cli.threads)?;
+    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.neighbors);
+    compute_hamming_top_k(base_view, query_view, ground_truth_span, cli.batch_size, cli.threads)?;
 
     let gt_path = cli.output.join(format!("groundtruth.{query_count}.ibin"));
     let mut gt_file = File::create(&gt_path)?;

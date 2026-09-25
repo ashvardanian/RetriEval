@@ -39,7 +39,7 @@ use parquet::arrow::ProjectionMask;
 use rand::rngs::StdRng;
 use rand::seq::index::sample as sample_without_replacement;
 use rand::SeedableRng;
-use retrieval::generate as ground_truth;
+use retrieval::generate::{binary_view, compute_hamming_top_k, matrix_span};
 use serde_json::Value;
 
 /// 1024-bit (128-byte) packed binary embedding column.
@@ -418,7 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sample queries and compute ground truth via mmapped base.
     let base_dataset = retrieval::Dataset::load(&base_path)?;
     assert_eq!(base_dataset.rows(), total_rows);
-    let base_bytes = base_dataset.all();
+    let base_bytes = base_dataset.slice(0, total_rows, base_dataset.dimensions(), &mut []);
     let base_slice: &[u8] = match base_bytes.data {
         retrieval::VectorSlice::B1x8(data) => data,
         _ => return Err("unexpected non-binary base after load".into()),
@@ -446,11 +446,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Computing brute-force hamming top-{} ground truth (NumKong + ForkUnion)...",
         cli.neighbors
     );
-    let base_view = ground_truth::binary_view(base_slice, total_rows, DIMENSIONS_BITS);
-    let query_view = ground_truth::binary_view(&query_buffer, query_count, DIMENSIONS_BITS);
+    let base_view = binary_view(base_slice, total_rows, DIMENSIONS_BITS);
+    let query_view = binary_view(&query_buffer, query_count, DIMENSIONS_BITS);
     let mut ground_truth_indices = vec![0u32; query_count * cli.neighbors];
-    let ground_truth_span = ground_truth::matrix_span(&mut ground_truth_indices, query_count, cli.neighbors);
-    ground_truth::compute_hamming_top_k(base_view, query_view, ground_truth_span, cli.batch_size, cli.threads)?;
+    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.neighbors);
+    compute_hamming_top_k(base_view, query_view, ground_truth_span, cli.batch_size, cli.threads)?;
 
     let gt_path = cli.output.join(format!("groundtruth.{query_count}.ibin"));
     let mut gt_file = File::create(&gt_path)?;
