@@ -49,6 +49,11 @@ path = "src/turso.rs"
 required-features = ["turso-backend"]
 
 [[bin]]
+name = "retri-eval-surrealdb"
+path = "src/surrealdb.rs"
+required-features = ["surrealdb-backend"]
+
+[[bin]]
 name = "retri-generate"
 path = "src/generate.rs"
 required-features = ["generate"]
@@ -138,6 +143,7 @@ redis-backend = ["tier2", "redis", "itertools"]
 lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
 weaviate-backend = ["tier2", "itertools"]
 turso-backend = ["turso", "tokio"]
+surrealdb-backend = ["tier2", "itertools"]
 cuvs-backend = ["cuvs", "cuvs-sys", "itertools"]
 generate = ["rand"]
 download = [

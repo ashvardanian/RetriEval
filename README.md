@@ -235,13 +235,14 @@ Server-side quantization is managed by the database engine, not the benchmark.
 Binary quantization is deterministic `sign(x)` per dim, and scalar quantization is per-dim min/max — neither trains a codebook, so both stay inside the "no learned logic" constraint the rest of the benchmark holds for the native backends.
 Product quantization is deliberately excluded everywhere.
 
-| Backend      | Client                       | Docker Image                       | Metrics                | Wire dtype sweep                        | Server-side quantization   |
-| ------------ | ---------------------------- | ---------------------------------- | ---------------------- | --------------------------------------- | -------------------------- |
-| __Qdrant__   | `qdrant-client`, gRPC        | `qdrant/qdrant:v1.19.1`            | ip, l2, cos, manhattan | `f32`, `f16`, `u8`                      | `none`, `binary`, `scalar` |
-| __Redis__    | `redis`, RESP                | `redis:8.10`                       | ip, l2, cos            | `f32`, `f64`, `f16`, `bf16`, `u8`, `i8` | —                          |
-| __Weaviate__ | `reqwest`, REST              | `semitechnologies/weaviate:1.39.7` | ip, l2, cos            | `f32` only                              | `none`, `binary`           |
-| __LanceDB__  | `lancedb`, in-process, Arrow | —                                  | ip, l2, cos            | `f32` only                              | — (exact scan) ¹           |
-| __Turso__    | `turso = 0.8.1`, native Rust | —                                  | l2, cos                | `f32` only                              | — (exact scan)             |
+| Backend       | Client                       | Docker Image                       | Metrics                | Wire dtype sweep                        | Server-side quantization   |
+| ------------- | ---------------------------- | ---------------------------------- | ---------------------- | --------------------------------------- | -------------------------- |
+| __Qdrant__    | `qdrant-client`, gRPC        | `qdrant/qdrant:v1.19.1`            | ip, l2, cos, manhattan | `f32`, `f16`, `u8`                      | `none`, `binary`, `scalar` |
+| __Redis__     | `redis`, RESP                | `redis:8.10`                       | ip, l2, cos            | `f32`, `f64`, `f16`, `bf16`, `u8`, `i8` | —                          |
+| __Weaviate__  | `reqwest`, REST              | `semitechnologies/weaviate:1.39.7` | ip, l2, cos            | `f32` only                              | `none`, `binary`           |
+| __LanceDB__   | `lancedb`, in-process, Arrow | —                                  | ip, l2, cos            | `f32` only                              | — (exact scan) ¹           |
+| __Turso__     | `turso = 0.8.1`, native Rust | —                                  | l2, cos                | `f32` only                              | — (exact scan)             |
+| __SurrealDB__ | `reqwest`, HTTP SQL          | `surrealdb/surrealdb:v3.3.0`       | l2, cos                | `f32` only                              | — (HNSW)                   |
 
 ¹ LanceDB's Rust client — `lancedb 0.37` — exposes graph-based search only via `IvfHnswFlat` / `IvfHnswSq` / `IvfHnswPq`, all behind a k-means-trained IVF layer that cannot be disabled.
 No pure-HNSW variant is offered, so this benchmark leaves LanceDB on plain `f32` + L2/IP/Cos until upstream adds one.
@@ -265,6 +266,7 @@ cargo build --release --features lancedb-backend    # LanceDB
 cargo build --release --features weaviate-backend   # Weaviate
 cargo build --release --features cuvs-backend       # cuVS
 cargo build --release --no-default-features --features turso-backend # Turso
+cargo build --release --no-default-features --features surrealdb-backend # SurrealDB
 ```
 
 Or combine multiple:
@@ -280,80 +282,82 @@ The table lists every flag of every binary, with its default.
 Flags marked "sweep" take comma-separated values and run one configuration per combination.
 A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
 
-| Flag                     | Binaries                         | Default                  | Meaning                                                                                              |
-| ------------------------ | -------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `--base-vectors`         | all `retri-eval-*`               | required                 | Base vectors to index (`.fbin`, `.u8bin`, `.i8bin`, `.b1bin`), a path or glob                        |
-| `--base-keys`            | all `retri-eval-*`               | sequential               | Keys for the base vectors (`.i32bin`), one per vector                                                |
-| `--query-vectors`        | all `retri-eval-*`               | required                 | Query vectors to search with                                                                         |
-| `--query-neighbors`      | all `retri-eval-*`               | required                 | Ground-truth neighbors for those queries (`.ibin`)                                                   |
-| `--top-k`                | all `retri-eval-*`               | ground-truth width       | Neighbors per query, the k every metric is taken at; may not exceed the ground-truth width           |
-| `--insertion-order`      | all `retri-eval-*`               | `shuffled`               | `shuffled` by `--seed`, or the file's `original` order                                               |
-| `--seed`                 | all `retri-eval-*`               | `42`                     | 32-bit seed of the shuffled insertion order, or `random`; rejected with `--insertion-order original` |
-| `--steps`                | all `retri-eval-*`               | `10`                     | Measurement steps; the base is inserted in this many equal parts                                     |
-| `--vectors-per-add`      | all `retri-eval-*`               | `10000`                  | Vectors per backend `add` call                                                                       |
-| `--queries-per-search`   | all `retri-eval-*`               | `10000`                  | Queries per backend `search` call                                                                    |
-| `--output`               | all `retri-eval-*`               | none                     | Directory for JSON result files; progress only when unset                                            |
-| `--max-base-vectors`     | all `retri-eval-*`               | all                      | Cap on the base vectors used, for calibration on a slice                                             |
-| `--index`                | usearch, faiss, cuvs             | none                     | Persisted index: loaded and searched if the path exists, else built and saved; needs a single config |
-| `--dims`                 | all `retri-eval-*`               | native                   | Matryoshka truncations, sweep; each at most the native width, and a multiple of 8 for `.b1bin`       |
-| `--self-search`          | all `retri-eval-*`               | off                      | After the last insertion, replay indexed vectors as their own queries                                |
-| `--self-search-top-k`    | all `retri-eval-*`               | `10`                     | Neighbors per self-search query                                                                      |
-| `--self-search-sample`   | all `retri-eval-*`               | all                      | Leading base rows to replay: a count like `50000` or a fraction like `0.1`; needs `--self-search`    |
-| `--data-type`            | usearch                          | `bf16`                   | Sweep of `f64`, `f32`, `bf16`, `f16`, `e5m2`, `e4m3`, `e3m2`, `e2m3`, `i8`, `u8`, `b1`               |
-| `--data-type`            | faiss                            | `bf16`                   | Sweep of `f32`, `f16`, `bf16`, `u8`, `i8`, `b1`                                                      |
-| `--data-type`            | cuvs                             | `f32`                    | Sweep of `f32`, `f16`, `i8`, `u8`                                                                    |
-| `--data-type`            | qdrant                           | `f32`                    | Sweep of storage types `f32`, `f16`, `u8`                                                            |
-| `--data-type`            | redis                            | `f32`                    | Sweep of `f32`, `f64`, `f16`, `bf16`, `u8`, `i8`; `u8` and `i8` need Redis 8                         |
-| `--metric`               | usearch                          | `l2`                     | Sweep of `ip`, `l2`, `cos`, `hamming`, `jaccard`, `sorensen`, `pearson`, `haversine`, `divergence`   |
-| `--metric`               | faiss                            | `l2`                     | Sweep of `ip`, `l2`; `b1` data always uses Hamming                                                   |
-| `--metric`               | cuvs, redis, weaviate            | `l2`                     | Sweep of `l2`, `ip`, `cos`                                                                           |
-| `--metric`               | qdrant                           | `l2`                     | Sweep of `ip`, `cos`, `l2`, `manhattan`                                                              |
-| `--metric`               | lancedb                          | `l2`                     | One of `ip`, `cos`, `l2`                                                                             |
-| `--metric`               | turso                            | `l2`                     | One of `l2`, `cos`                                                                                   |
-| `--quantization`         | qdrant                           | `none`                   | Sweep of server-side `none`, `binary`, `scalar`                                                      |
-| `--quantization`         | weaviate                         | `none`                   | Sweep of server-side `none`, `binary`                                                                |
-| `--connectivity`         | usearch, qdrant, redis, weaviate | `16`                     | HNSW M, sweep                                                                                        |
-| `--connectivity`         | faiss, cuvs                      | `32`                     | HNSW M, or CAGRA's output graph degree, sweep                                                        |
-| `--expansion-add`        | all but cuvs, lancedb, turso     | `128`                    | HNSW construction width, sweep                                                                       |
-| `--expansion-add`        | cuvs                             | `64`                     | CAGRA's intermediate graph degree before pruning, sweep                                              |
-| `--expansion-search`     | all but lancedb, turso           | `64`                     | HNSW search width, or CAGRA's internal top-i list, sweep                                             |
-| `--shards`               | usearch                          | `1`                      | Index shards, sweep                                                                                  |
-| `--threads`              | usearch                          | `0`                      | Threads, `0` for all cores, sweep                                                                    |
-| `--threads`              | faiss                            | `0`                      | OpenMP threads, `0` for all cores                                                                    |
-| `--search-width`         | cuvs                             | `auto`                   | Graph nodes that start each search iteration, or `auto` for cuVS's choice, sweep                     |
-| `--min-iterations`       | cuvs                             | cuVS's choice            | Minimum search iterations                                                                            |
-| `--max-iterations`       | cuvs                             | cuVS's choice            | Maximum search iterations                                                                            |
-| `--num-random-samplings` | cuvs                             | cuVS's choice            | Random sampling rounds for the initial search points                                                 |
-| `--build-algo`           | cuvs                             | `auto`                   | Graph build algorithm, `auto` or `nn_descent`                                                        |
-| `--startup-time-limit`   | qdrant, redis, weaviate          | `120s`                   | Time limit for container start and readiness, like `120s`                                            |
-| `--grpc-port`            | qdrant                           | `6334`                   | Host gRPC port                                                                                       |
-| `--http-port`            | qdrant                           | `6333`                   | Host HTTP port                                                                                       |
-| `--port`                 | redis                            | `6379`                   | Host port                                                                                            |
-| `--port`                 | weaviate                         | `8080`                   | Host HTTP port                                                                                       |
-| `--vectors-per-upsert`   | qdrant                           | `10000`                  | Vectors per upsert request                                                                           |
-| `--vectors-per-upsert`   | redis                            | `1000`                   | Vectors per pipeline flush                                                                           |
-| `--db-path`              | lancedb                          | `/tmp/retrieval-lancedb` | LanceDB storage directory                                                                            |
-| `--db-path`              | turso                            | `:memory:`               | Turso database file, or `:memory:`; only its `bench` table is recreated                              |
-| `--format`               | retri-generate                   | required                 | `b1bin` for clustered binary with Hamming ground truth, or `fbin` for Gaussian `f32` with L2         |
-| `--base-count`           | retri-generate                   | required                 | Base vectors to generate                                                                             |
-| `--query-count`          | retri-generate                   | required                 | Query vectors to generate                                                                            |
-| `--query-count`          | retri-download-*                 | `10000`                  | Queries sampled from the base                                                                        |
-| `--dims`                 | retri-generate                   | required                 | Bits for `b1bin`, a multiple of 8, or scalars for `fbin`                                             |
-| `--clusters`             | retri-generate                   | `256`                    | Cluster centers                                                                                      |
-| `--noise`                | retri-generate                   | `0.1`                    | Bit-flip probability from 0 to 1                                                                     |
-| `--top-k`                | retri-generate, retri-download-* | `10`                     | Neighbors per query in the ground-truth file                                                         |
-| `--ground-truth-batch`   | retri-generate, retri-download-* | from free RAM            | Queries per ground-truth batch                                                                       |
-| `--threads`              | retri-generate, retri-download-* | `0`                      | Ground-truth threads, `0` for all cores                                                              |
-| `--seed`                 | retri-generate, retri-download-* | `42`                     | 32-bit seed of generation or query sampling, or `random`                                             |
-| `--output`               | retri-generate, retri-download-* | required                 | Output directory                                                                                     |
-| `--source`               | retri-download-molecules         | required                 | `pubchem` (115M), `gdb13` (977M) or `enamine` (6.04B)                                                |
-| `--fingerprint`          | retri-download-molecules         | required                 | `maccs` (166 bits), `pubchem` (881), `ecfp4` (2048) or `fcfp4` (2048)                                |
-| `--url-prefix`           | retri-download-molecules         | the public bucket        | S3 or HTTPS prefix of the shards                                                                     |
-| `--language`             | retri-download-cohere            | `en`                     | Language config of the Hugging Face dataset                                                          |
-| `--no-text`              | retri-download-cohere            | off                      | Skip the aligned `titles.txt`, `texts.txt` and `urls.txt`                                            |
-| `--limit`                | retri-download-*                 | all                      | Rows to extract                                                                                      |
-| `--download-concurrency` | retri-download-*                 | `4`                      | Concurrent shard downloads                                                                           |
-| `--keep-parquet`         | retri-download-*                 | off                      | Keep the Parquet shards under `<output>/parquet/`                                                    |
+| Flag                     | Binaries                                    | Default                  | Meaning                                                                                              |
+| ------------------------ | ------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `--base-vectors`         | all `retri-eval-*`                          | required                 | Base vectors to index (`.fbin`, `.u8bin`, `.i8bin`, `.b1bin`), a path or glob                        |
+| `--base-keys`            | all `retri-eval-*`                          | sequential               | Keys for the base vectors (`.i32bin`), one per vector                                                |
+| `--query-vectors`        | all `retri-eval-*`                          | required                 | Query vectors to search with                                                                         |
+| `--query-neighbors`      | all `retri-eval-*`                          | required                 | Ground-truth neighbors for those queries (`.ibin`)                                                   |
+| `--top-k`                | all `retri-eval-*`                          | ground-truth width       | Neighbors per query, the k every metric is taken at; may not exceed the ground-truth width           |
+| `--insertion-order`      | all `retri-eval-*`                          | `shuffled`               | `shuffled` by `--seed`, or the file's `original` order                                               |
+| `--seed`                 | all `retri-eval-*`                          | `42`                     | 32-bit seed of the shuffled insertion order, or `random`; rejected with `--insertion-order original` |
+| `--steps`                | all `retri-eval-*`                          | `10`                     | Measurement steps; the base is inserted in this many equal parts                                     |
+| `--vectors-per-add`      | all `retri-eval-*`                          | `10000`                  | Vectors per backend `add` call                                                                       |
+| `--queries-per-search`   | all `retri-eval-*`                          | `10000`                  | Queries per backend `search` call                                                                    |
+| `--output`               | all `retri-eval-*`                          | none                     | Directory for JSON result files; progress only when unset                                            |
+| `--max-base-vectors`     | all `retri-eval-*`                          | all                      | Cap on the base vectors used, for calibration on a slice                                             |
+| `--index`                | usearch, faiss, cuvs                        | none                     | Persisted index: loaded and searched if the path exists, else built and saved; needs a single config |
+| `--dims`                 | all `retri-eval-*`                          | native                   | Matryoshka truncations, sweep; each at most the native width, and a multiple of 8 for `.b1bin`       |
+| `--self-search`          | all `retri-eval-*`                          | off                      | After the last insertion, replay indexed vectors as their own queries                                |
+| `--self-search-top-k`    | all `retri-eval-*`                          | `10`                     | Neighbors per self-search query                                                                      |
+| `--self-search-sample`   | all `retri-eval-*`                          | all                      | Leading base rows to replay: a count like `50000` or a fraction like `0.1`; needs `--self-search`    |
+| `--data-type`            | usearch                                     | `bf16`                   | Sweep of `f64`, `f32`, `bf16`, `f16`, `e5m2`, `e4m3`, `e3m2`, `e2m3`, `i8`, `u8`, `b1`               |
+| `--data-type`            | faiss                                       | `bf16`                   | Sweep of `f32`, `f16`, `bf16`, `u8`, `i8`, `b1`                                                      |
+| `--data-type`            | cuvs                                        | `f32`                    | Sweep of `f32`, `f16`, `i8`, `u8`                                                                    |
+| `--data-type`            | qdrant                                      | `f32`                    | Sweep of storage types `f32`, `f16`, `u8`                                                            |
+| `--data-type`            | redis                                       | `f32`                    | Sweep of `f32`, `f64`, `f16`, `bf16`, `u8`, `i8`; `u8` and `i8` need Redis 8                         |
+| `--metric`               | usearch                                     | `l2`                     | Sweep of `ip`, `l2`, `cos`, `hamming`, `jaccard`, `sorensen`, `pearson`, `haversine`, `divergence`   |
+| `--metric`               | faiss                                       | `l2`                     | Sweep of `ip`, `l2`; `b1` data always uses Hamming                                                   |
+| `--metric`               | cuvs, redis, weaviate                       | `l2`                     | Sweep of `l2`, `ip`, `cos`                                                                           |
+| `--metric`               | qdrant                                      | `l2`                     | Sweep of `ip`, `cos`, `l2`, `manhattan`                                                              |
+| `--metric`               | lancedb                                     | `l2`                     | One of `ip`, `cos`, `l2`                                                                             |
+| `--metric`               | turso                                       | `l2`                     | One of `l2`, `cos`                                                                                   |
+| `--metric`               | surrealdb                                   | `l2`                     | Sweep of `l2`, `cos`                                                                                 |
+| `--quantization`         | qdrant                                      | `none`                   | Sweep of server-side `none`, `binary`, `scalar`                                                      |
+| `--quantization`         | weaviate                                    | `none`                   | Sweep of server-side `none`, `binary`                                                                |
+| `--connectivity`         | usearch, qdrant, redis, weaviate, surrealdb | `16`                     | HNSW M, sweep                                                                                        |
+| `--connectivity`         | faiss, cuvs                                 | `32`                     | HNSW M, or CAGRA's output graph degree, sweep                                                        |
+| `--expansion-add`        | all but cuvs, lancedb, turso                | `128`                    | HNSW construction width, sweep                                                                       |
+| `--expansion-add`        | cuvs                                        | `64`                     | CAGRA's intermediate graph degree before pruning, sweep                                              |
+| `--expansion-search`     | all but lancedb, turso                      | `64`                     | HNSW search width, or CAGRA's internal top-i list, sweep                                             |
+| `--shards`               | usearch                                     | `1`                      | Index shards, sweep                                                                                  |
+| `--threads`              | usearch                                     | `0`                      | Threads, `0` for all cores, sweep                                                                    |
+| `--threads`              | faiss                                       | `0`                      | OpenMP threads, `0` for all cores                                                                    |
+| `--search-width`         | cuvs                                        | `auto`                   | Graph nodes that start each search iteration, or `auto` for cuVS's choice, sweep                     |
+| `--min-iterations`       | cuvs                                        | cuVS's choice            | Minimum search iterations                                                                            |
+| `--max-iterations`       | cuvs                                        | cuVS's choice            | Maximum search iterations                                                                            |
+| `--num-random-samplings` | cuvs                                        | cuVS's choice            | Random sampling rounds for the initial search points                                                 |
+| `--build-algo`           | cuvs                                        | `auto`                   | Graph build algorithm, `auto` or `nn_descent`                                                        |
+| `--startup-time-limit`   | qdrant, redis, weaviate, surrealdb          | `120s`                   | Time limit for container start and readiness, like `120s`                                            |
+| `--grpc-port`            | qdrant                                      | `6334`                   | Host gRPC port                                                                                       |
+| `--http-port`            | qdrant                                      | `6333`                   | Host HTTP port                                                                                       |
+| `--port`                 | redis                                       | `6379`                   | Host port                                                                                            |
+| `--port`                 | weaviate                                    | `8080`                   | Host HTTP port                                                                                       |
+| `--port`                 | surrealdb                                   | `8000`                   | Host HTTP port                                                                                       |
+| `--vectors-per-upsert`   | qdrant                                      | `10000`                  | Vectors per upsert request                                                                           |
+| `--vectors-per-upsert`   | redis                                       | `1000`                   | Vectors per pipeline flush                                                                           |
+| `--db-path`              | lancedb                                     | `/tmp/retrieval-lancedb` | LanceDB storage directory                                                                            |
+| `--db-path`              | turso                                       | `:memory:`               | Turso database file, or `:memory:`; only its `bench` table is recreated                              |
+| `--format`               | retri-generate                              | required                 | `b1bin` for clustered binary with Hamming ground truth, or `fbin` for Gaussian `f32` with L2         |
+| `--base-count`           | retri-generate                              | required                 | Base vectors to generate                                                                             |
+| `--query-count`          | retri-generate                              | required                 | Query vectors to generate                                                                            |
+| `--query-count`          | retri-download-*                            | `10000`                  | Queries sampled from the base                                                                        |
+| `--dims`                 | retri-generate                              | required                 | Bits for `b1bin`, a multiple of 8, or scalars for `fbin`                                             |
+| `--clusters`             | retri-generate                              | `256`                    | Cluster centers                                                                                      |
+| `--noise`                | retri-generate                              | `0.1`                    | Bit-flip probability from 0 to 1                                                                     |
+| `--top-k`                | retri-generate, retri-download-*            | `10`                     | Neighbors per query in the ground-truth file                                                         |
+| `--ground-truth-batch`   | retri-generate, retri-download-*            | from free RAM            | Queries per ground-truth batch                                                                       |
+| `--threads`              | retri-generate, retri-download-*            | `0`                      | Ground-truth threads, `0` for all cores                                                              |
+| `--seed`                 | retri-generate, retri-download-*            | `42`                     | 32-bit seed of generation or query sampling, or `random`                                             |
+| `--output`               | retri-generate, retri-download-*            | required                 | Output directory                                                                                     |
+| `--source`               | retri-download-molecules                    | required                 | `pubchem` (115M), `gdb13` (977M) or `enamine` (6.04B)                                                |
+| `--fingerprint`          | retri-download-molecules                    | required                 | `maccs` (166 bits), `pubchem` (881), `ecfp4` (2048) or `fcfp4` (2048)                                |
+| `--url-prefix`           | retri-download-molecules                    | the public bucket        | S3 or HTTPS prefix of the shards                                                                     |
+| `--language`             | retri-download-cohere                       | `en`                     | Language config of the Hugging Face dataset                                                          |
+| `--no-text`              | retri-download-cohere                       | off                      | Skip the aligned `titles.txt`, `texts.txt` and `urls.txt`                                            |
+| `--limit`                | retri-download-*                            | all                      | Rows to extract                                                                                      |
+| `--download-concurrency` | retri-download-*                            | `4`                      | Concurrent shard downloads                                                                           |
+| `--keep-parquet`         | retri-download-*                            | off                      | Keep the Parquet shards under `<output>/parquet/`                                                    |
 
 ### Self-Recall
 
@@ -549,6 +553,7 @@ src/
     lancedb.rs              # retri-eval-lancedb binary
     weaviate.rs             # retri-eval-weaviate binary
     turso.rs                # Native Rust engine, exact F32 vector scan
+    surrealdb.rs            # Pinned server, F32 HNSW vector index
     generate.rs             # retri-generate — synthetic dataset generator with GT
     perf_counters.rs        # Linux perf_event_open wrapper for hardware counters
 docker/
@@ -1079,3 +1084,8 @@ Run `scripts/check.sh` for formatting, Clippy, and CPU tests; pass an explicit f
 `retri-eval-turso` (`turso-backend`) benchmarks the native Rust Turso 0.8.1 engine with exact F32 cosine (`--metric cos`) or Euclidean (`--metric l2`) scans.
 It uses an in-memory database by default; `--db-path` selects a file and recreates only its benchmark table.
 This measures exact search, not a libSQL ANN index.
+
+`retri-eval-surrealdb` (`surrealdb-backend`) runs `surrealdb/surrealdb:v3.3.0` with an F32 HNSW index and cosine or Euclidean distance.
+It verifies that EXPLAIN names the HNSW index before measuring queries.
+Inserts use a native array; search statements share one HTTP request per batch.
+The managed server uses in-memory storage.
