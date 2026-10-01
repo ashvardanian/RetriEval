@@ -241,6 +241,7 @@ Product quantization is deliberately excluded everywhere.
 | __Redis__    | `redis`, RESP                | `redis:8.10`                       | ip, l2, cos            | `f32`, `f64`, `f16`, `bf16`, `u8`, `i8` | —                          |
 | __Weaviate__ | `reqwest`, REST              | `semitechnologies/weaviate:1.39.7` | ip, l2, cos            | `f32` only                              | `none`, `binary`           |
 | __LanceDB__  | `lancedb`, in-process, Arrow | —                                  | ip, l2, cos            | `f32` only                              | — (exact scan) ¹           |
+| __Turso__    | `turso = 0.8.1`, native Rust | —                                  | l2, cos                | `f32` only                              | — (exact scan)             |
 
 ¹ LanceDB's Rust client — `lancedb 0.37` — exposes graph-based search only via `IvfHnswFlat` / `IvfHnswSq` / `IvfHnswPq`, all behind a k-means-trained IVF layer that cannot be disabled.
 No pure-HNSW variant is offered, so this benchmark leaves LanceDB on plain `f32` + L2/IP/Cos until upstream adds one.
@@ -263,6 +264,7 @@ cargo build --release --features redis-backend      # Redis
 cargo build --release --features lancedb-backend    # LanceDB
 cargo build --release --features weaviate-backend   # Weaviate
 cargo build --release --features cuvs-backend       # cuVS
+cargo build --release --no-default-features --features turso-backend # Turso
 ```
 
 Or combine multiple:
@@ -307,13 +309,14 @@ A bad value prints `--flag="value" does not parse, expected …` and exits with 
 | `--metric`               | cuvs, redis, weaviate            | `l2`                     | Sweep of `l2`, `ip`, `cos`                                                                           |
 | `--metric`               | qdrant                           | `l2`                     | Sweep of `ip`, `cos`, `l2`, `manhattan`                                                              |
 | `--metric`               | lancedb                          | `l2`                     | One of `ip`, `cos`, `l2`                                                                             |
+| `--metric`               | turso                            | `l2`                     | One of `l2`, `cos`                                                                                   |
 | `--quantization`         | qdrant                           | `none`                   | Sweep of server-side `none`, `binary`, `scalar`                                                      |
 | `--quantization`         | weaviate                         | `none`                   | Sweep of server-side `none`, `binary`                                                                |
 | `--connectivity`         | usearch, qdrant, redis, weaviate | `16`                     | HNSW M, sweep                                                                                        |
 | `--connectivity`         | faiss, cuvs                      | `32`                     | HNSW M, or CAGRA's output graph degree, sweep                                                        |
-| `--expansion-add`        | all but cuvs, lancedb            | `128`                    | HNSW construction width, sweep                                                                       |
+| `--expansion-add`        | all but cuvs, lancedb, turso     | `128`                    | HNSW construction width, sweep                                                                       |
 | `--expansion-add`        | cuvs                             | `64`                     | CAGRA's intermediate graph degree before pruning, sweep                                              |
-| `--expansion-search`     | all but lancedb                  | `64`                     | HNSW search width, or CAGRA's internal top-i list, sweep                                             |
+| `--expansion-search`     | all but lancedb, turso           | `64`                     | HNSW search width, or CAGRA's internal top-i list, sweep                                             |
 | `--shards`               | usearch                          | `1`                      | Index shards, sweep                                                                                  |
 | `--threads`              | usearch                          | `0`                      | Threads, `0` for all cores, sweep                                                                    |
 | `--threads`              | faiss                            | `0`                      | OpenMP threads, `0` for all cores                                                                    |
@@ -330,6 +333,7 @@ A bad value prints `--flag="value" does not parse, expected …` and exits with 
 | `--vectors-per-upsert`   | qdrant                           | `10000`                  | Vectors per upsert request                                                                           |
 | `--vectors-per-upsert`   | redis                            | `1000`                   | Vectors per pipeline flush                                                                           |
 | `--db-path`              | lancedb                          | `/tmp/retrieval-lancedb` | LanceDB storage directory                                                                            |
+| `--db-path`              | turso                            | `:memory:`               | Turso database file, or `:memory:`; only its `bench` table is recreated                              |
 | `--format`               | retri-generate                   | required                 | `b1bin` for clustered binary with Hamming ground truth, or `fbin` for Gaussian `f32` with L2         |
 | `--base-count`           | retri-generate                   | required                 | Base vectors to generate                                                                             |
 | `--query-count`          | retri-generate                   | required                 | Query vectors to generate                                                                            |
@@ -544,6 +548,7 @@ src/
     redis.rs                # retri-eval-redis binary
     lancedb.rs              # retri-eval-lancedb binary
     weaviate.rs             # retri-eval-weaviate binary
+    turso.rs                # Native Rust engine, exact F32 vector scan
     generate.rs             # retri-generate — synthetic dataset generator with GT
     perf_counters.rs        # Linux perf_event_open wrapper for hardware counters
 docker/
@@ -1070,3 +1075,7 @@ The `--base-vectors` glob picks up every English shard in natural-sort order; qu
 
 The repository pins `nightly-2026-09-24`.
 Run `scripts/check.sh` for formatting, Clippy, and CPU tests; pass an explicit feature list for optional native engines.
+
+`retri-eval-turso` (`turso-backend`) benchmarks the native Rust Turso 0.8.1 engine with exact F32 cosine (`--metric cos`) or Euclidean (`--metric l2`) scans.
+It uses an in-memory database by default; `--db-path` selects a file and recreates only its benchmark table.
+This measures exact search, not a libSQL ANN index.

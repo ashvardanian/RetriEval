@@ -100,7 +100,7 @@ uvx ruff format --check scripts/plot.py
 if [ "${1:-}" = "--quick" ]; then
     cargo clippy --all-targets -- -D warnings
 else
-    features="${1:-usearch-backend,redis-backend,qdrant-backend,weaviate-backend,generate}"
+    features="${1:-usearch-backend,redis-backend,qdrant-backend,weaviate-backend,turso-backend,generate}"
     cargo clippy --locked --no-default-features --features "$features" --all-targets -- -D warnings
     cargo test --locked --no-default-features --features "$features" --all-targets
 fi

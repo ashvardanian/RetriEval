@@ -9,7 +9,7 @@ jobs:
       matrix:
         include:
           - name: Native and Server Backends
-            features: usearch-backend,redis-backend,qdrant-backend,weaviate-backend,generate,perf-counters
+            features: usearch-backend,redis-backend,qdrant-backend,weaviate-backend,turso-backend,generate,perf-counters
           - name: Static FAISS
             features: faiss-static
           - name: LanceDB and Downloads
