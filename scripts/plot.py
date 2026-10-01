@@ -15,8 +15,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import plotly.graph_objects as go
 
@@ -64,15 +65,15 @@ def series_key(report: dict[str, Any]) -> str:
     shards = config.get("shards", 1)
     if isinstance(shards, int) and shards > 1:
         parts.append(f"{shards}s")
-    # k varies by dataset and by --search-count, and metrics taken at different
+    # k varies by dataset and by --top-k, and metrics taken at different
     # k are not comparable — without it two such runs draw as one series.
-    if "search_count" in config:
-        parts.append(f"@{config['search_count']}")
+    if "top_k" in config:
+        parts.append(f"@{config['top_k']}")
     # Self-search parameters take part in the config hash, so two runs differing
     # only in these write separate report files.
-    if "self_search_count" in config:
+    if "self_search_top_k" in config:
         parts.append(
-            f"self@{config['self_search_count']}×{config.get('self_search_sample', '?')}"
+            f"self@{config['self_search_top_k']}×{config.get('self_search_sample', '?')}"
         )
     return " · ".join(parts)
 
@@ -168,9 +169,9 @@ def main() -> None:
 
     # k is per-report now, so title it only when every report agrees.
     counts = {
-        (r.get("config") or {}).get("search_count")
+        (r.get("config") or {}).get("top_k")
         for r in reports
-        if (r.get("config") or {}).get("search_count") is not None
+        if (r.get("config") or {}).get("top_k") is not None
     }
     k_label = str(counts.pop()) if len(counts) == 1 else "K"
 
@@ -188,7 +189,7 @@ def main() -> None:
     make_plot(
         "Index Memory",
         reports,
-        lambda s, _r: s["memory_bytes"] / 1e9,
+        lambda s, _r: s["memory_bytes"] / 2**30,
         "Vectors Indexed",
         "Memory (GB)",
         "construction-memory.png",

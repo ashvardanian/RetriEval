@@ -17,7 +17,7 @@
 //!     --fingerprint maccs \
 //!     --limit 10000000 \
 //!     --query-count 10000 \
-//!     --neighbors 100 \
+//!     --top-k 100 \
 //!     --output datasets/pubchem_10M_maccs/
 //! ```
 //!
@@ -28,33 +28,40 @@
 //!     --fingerprint ecfp4 \
 //!     --limit 100000000 \
 //!     --query-count 10000 \
-//!     --neighbors 100 \
+//!     --top-k 100 \
 //!     --output datasets/gdb13_100M_ecfp4/
 //! ```
 
-use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{
+    fmt,
+    fs::File,
+    io::{BufWriter, Seek, SeekFrom, Write},
+    path::PathBuf,
+    time::Duration,
+};
 
 use arrow_array::{Array, FixedSizeBinaryArray};
 use bytes::Bytes;
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ProjectionMask;
-use rand::rngs::StdRng;
-use rand::seq::index::sample as sample_without_replacement;
-use rand::SeedableRng;
-use retrieval::generate::{binary_view, compute_hamming_top_k, matrix_span};
+use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
+use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, SeedableRng};
+
+use retrieval::{
+    generate::{binary_view, compute_hamming_top_k, matrix_span},
+    Seed, Threads,
+};
 
 const SHARD_ROWS: usize = 1_000_000;
 const BUCKET_URL_PREFIX: &str = "https://s3.us-west-2.amazonaws.com/usearch-molecules/data";
 
-/// Output-file BufWriter capacity. 1 MiB amortizes the per-row
+/// Output-file BufWriter capacity. 1 MB amortizes the per-row
 /// `FixedSizeBinaryArray::value(i)` → `write_all` calls over syscall boundaries.
 const OUTPUT_BUFFER_BYTES: usize = 1 << 20;
+
+/// Time limit for each HTTP request, shard downloads included.
+const HTTP_REQUEST_TIME_LIMIT: Duration = Duration::from_secs(600);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,48 +70,48 @@ const OUTPUT_BUFFER_BYTES: usize = 1 << 20;
 )]
 struct Cli {
     /// Dataset source: `pubchem` (115M), `gdb13` (977M), or `enamine` (6.04B).
-    #[arg(long)]
-    source: String,
+    #[arg(long, value_enum)]
+    source: Source,
 
     /// Fingerprint column: `maccs` (166 bits), `pubchem` (881 bits),
     /// `ecfp4` (2048 bits), or `fcfp4` (2048 bits).
-    #[arg(long)]
-    fingerprint: String,
+    #[arg(long, value_enum)]
+    fingerprint: Fingerprint,
 
     /// Maximum molecules to extract (default: all available shards).
-    #[arg(long)]
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
     limit: Option<usize>,
 
     /// Number of query vectors to randomly sample from the base set.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 10_000, value_parser = retrieval::parse_count_flag)]
     query_count: usize,
 
     /// Top-K neighbors to record per query in the ground truth file.
-    #[arg(long, default_value_t = 10)]
-    neighbors: usize,
+    #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
+    top_k: usize,
 
     /// Ground-truth query batch size. Auto-tuned from free RAM when omitted.
-    #[arg(long)]
-    batch_size: Option<usize>,
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
+    ground_truth_batch: Option<usize>,
 
-    /// Threads for the ground-truth pass (default: all logical cores).
-    #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
-    threads: usize,
+    /// Threads for the ground-truth pass, 0 for all cores.
+    #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
+    threads: Threads,
 
     /// Concurrent shard downloads.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 4, value_parser = retrieval::parse_count_flag)]
     download_concurrency: usize,
 
-    /// Random seed for query sampling.
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
+    /// Random seed for query sampling, or `random` to draw one.
+    #[arg(long, default_value = "42", value_parser = retrieval::parse_seed_flag)]
+    seed: Seed,
 
     /// Keep downloaded Parquet shards in `<output>/parquet/` after conversion.
     #[arg(long)]
     keep_parquet: bool,
 
     /// Override the S3/HTTPS URL prefix (defaults to the public bucket).
-    #[arg(long, default_value_t = String::from(BUCKET_URL_PREFIX))]
+    #[arg(long, default_value_t = String::from(BUCKET_URL_PREFIX), value_parser = clap::builder::NonEmptyStringValueParser::new())]
     url_prefix: String,
 
     /// Output directory (created if missing).
@@ -119,46 +126,76 @@ struct FingerprintInfo {
     dimensions_bits: usize,
 }
 
-fn fingerprint_info(name: &str) -> Result<FingerprintInfo, String> {
-    // `dimensions_bits` is the STORAGE bit count (bytes_per_vector * 8).
-    // The logical fingerprint width is smaller for MACCS (166) and PubChem (881),
-    // but the trailing padding bits are always zero and contribute nothing to
-    // Hamming / Jaccard distance. Storing the padded count keeps downstream
-    // tooling (FAISS IndexBinary, NumKong u1x8 tensors) happy — both require
-    // a multiple of 8.
-    match name {
-        "maccs" => Ok(FingerprintInfo {
-            column_name: "maccs",
-            bytes_per_vector: 21,
-            dimensions_bits: 168, // 166 logical + 2 pad
-        }),
-        "pubchem" => Ok(FingerprintInfo {
-            column_name: "pubchem",
-            bytes_per_vector: 111,
-            dimensions_bits: 888, // 881 logical + 7 pad
-        }),
-        "ecfp4" => Ok(FingerprintInfo {
-            column_name: "ecfp4",
-            bytes_per_vector: 256,
-            dimensions_bits: 2048,
-        }),
-        "fcfp4" => Ok(FingerprintInfo {
-            column_name: "fcfp4",
-            bytes_per_vector: 256,
-            dimensions_bits: 2048,
-        }),
-        other => Err(format!(
-            "unknown fingerprint: {other} (supported: maccs, pubchem, ecfp4, fcfp4)"
-        )),
+/// Fingerprint columns, as `--fingerprint` spells them.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Fingerprint {
+    Maccs,
+    Pubchem,
+    Ecfp4,
+    Fcfp4,
+}
+
+impl Fingerprint {
+    fn info(self) -> FingerprintInfo {
+        // `dimensions_bits` is the STORAGE bit count (bytes_per_vector * 8).
+        // The logical fingerprint width is smaller for MACCS (166) and PubChem (881),
+        // but the trailing padding bits are always zero and contribute nothing to
+        // Hamming / Jaccard distance. Storing the padded count keeps downstream
+        // tooling (FAISS IndexBinary, NumKong u1x8 tensors) happy — both require
+        // a multiple of 8.
+        match self {
+            Self::Maccs => FingerprintInfo {
+                column_name: "maccs",
+                bytes_per_vector: 21,
+                dimensions_bits: 168, // 166 logical + 2 pad
+            },
+            Self::Pubchem => FingerprintInfo {
+                column_name: "pubchem",
+                bytes_per_vector: 111,
+                dimensions_bits: 888, // 881 logical + 7 pad
+            },
+            Self::Ecfp4 => FingerprintInfo {
+                column_name: "ecfp4",
+                bytes_per_vector: 256,
+                dimensions_bits: 2048,
+            },
+            Self::Fcfp4 => FingerprintInfo {
+                column_name: "fcfp4",
+                bytes_per_vector: 256,
+                dimensions_bits: 2048,
+            },
+        }
     }
 }
 
-fn validate_source(source: &str) -> Result<&'static str, String> {
-    match source {
-        "pubchem" => Ok("pubchem"),
-        "gdb13" => Ok("gdb13"),
-        "enamine" => Ok("real"),
-        other => Err(format!("unknown source: {other} (supported: pubchem, gdb13, enamine)")),
+impl fmt::Display for Fingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
+    }
+}
+
+/// USearchMolecules sources, as `--source` spells them.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Pubchem,
+    Gdb13,
+    Enamine,
+}
+
+impl Source {
+    /// The source's directory in the bucket.
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Pubchem => "pubchem",
+            Self::Gdb13 => "gdb13",
+            Self::Enamine => "real",
+        }
+    }
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
     }
 }
 
@@ -255,9 +292,27 @@ fn extract_and_append<W: Write>(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    let source = validate_source(&cli.source)?;
-    let info = fingerprint_info(&cli.fingerprint)?;
+    let cli: Cli = retrieval::parse_cli();
+    eprintln!("- Source: {}", cli.source);
+    eprintln!("- Fingerprint: {}", cli.fingerprint);
+    match cli.limit {
+        Some(limit) => eprintln!("- Limit: {limit}"),
+        None => eprintln!("- Limit: all"),
+    }
+    eprintln!("- Query count: {}", cli.query_count);
+    eprintln!("- Top k: {}", cli.top_k);
+    match cli.ground_truth_batch {
+        Some(batch) => eprintln!("- Ground-truth batch: {batch}"),
+        None => eprintln!("- Ground-truth batch: auto"),
+    }
+    eprintln!("- Threads: {}", cli.threads);
+    eprintln!("- Download concurrency: {}", cli.download_concurrency);
+    eprintln!("- Seed: {}", cli.seed);
+    eprintln!("- Keep Parquet: {}", cli.keep_parquet);
+    eprintln!("- URL prefix: {}", cli.url_prefix);
+    eprintln!("- Output: {}", cli.output.display());
+    let source = cli.source.directory();
+    let info = cli.fingerprint.info();
 
     std::fs::create_dir_all(&cli.output)?;
     let parquet_dir = cli.output.join("parquet");
@@ -265,7 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&parquet_dir)?;
     }
 
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?;
+    let client = reqwest::Client::builder().timeout(HTTP_REQUEST_TIME_LIMIT).build()?;
 
     // Shard planning: request enough shards to cover `--limit`; if omitted,
     // walk shards until we hit a 403/404. We still need an upper bound to
@@ -295,9 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Concurrent download with ordered processing: we need rows in shard order
     // for deterministic output. `buffered(n)` preserves request order.
-    let urls: Vec<(usize, String)> = (0..max_shards)
-        .map(|shard_index| (shard_index, shard_url(&cli.url_prefix, source, shard_index)))
-        .collect();
+    let urls = (0..max_shards).map(|shard_index| (shard_index, shard_url(&cli.url_prefix, source, shard_index)));
 
     let mut total_rows: usize = 0;
     let mut stream = stream::iter(urls)
@@ -336,7 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         progress.set_position((shard_index + 1) as u64);
         progress.set_message(format!(
             "{total_rows} rows ({:.1} GB)",
-            (total_rows * info.bytes_per_vector) as f64 / 1e9
+            (total_rows * info.bytes_per_vector) as f64 / (1u64 << 30) as f64
         ));
         if total_rows >= limit {
             break;
@@ -349,7 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!(
         "Downloaded {total_rows} molecules ({:.2} GB base data)",
-        (total_rows * info.bytes_per_vector) as f64 / 1e9
+        (total_rows * info.bytes_per_vector) as f64 / (1u64 << 30) as f64
     );
 
     // Flush BufWriter, patch the header in place.
@@ -374,13 +427,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Sample query indices without replacement.
     let query_count = cli.query_count.min(total_rows);
-    let mut rng = StdRng::seed_from_u64(cli.seed);
+    let mut rng = StdRng::seed_from_u64(cli.seed.into());
     let query_indices = sample_without_replacement(&mut rng, total_rows, query_count).into_vec();
     let mut sorted_indices = query_indices.clone();
     sorted_indices.sort_unstable();
 
     // Copy queries into a contiguous buffer that doubles as the ground-truth input.
-    let mut query_buffer = vec![0u8; query_count * info.bytes_per_vector];
+    let mut query_buffer = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(query_count * info.bytes_per_vector, 0u8);
+        values
+    };
     for (output_index, &base_index) in query_indices.iter().enumerate() {
         let source_offset = base_index * info.bytes_per_vector;
         let dest_offset = output_index * info.bytes_per_vector;
@@ -397,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ground truth.
     eprintln!(
         "Computing brute-force hamming top-{} ground truth (NumKong + ForkUnion)...",
-        cli.neighbors
+        cli.top_k
     );
     // NumKong's u1x8 storage requires bit dimensions to be multiples of 8.
     // MACCS (166) and PubChem (881) fingerprints round up to full-byte counts;
@@ -405,13 +462,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_bits = info.bytes_per_vector * 8;
     let base_view = binary_view(base_slice, total_rows, storage_bits);
     let query_view = binary_view(&query_buffer, query_count, storage_bits);
-    let mut ground_truth_indices = vec![0u32; query_count * cli.neighbors];
-    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.neighbors);
-    compute_hamming_top_k(base_view, query_view, ground_truth_span, cli.batch_size, cli.threads)?;
+    let mut ground_truth_indices = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(query_count * cli.top_k, 0u32);
+        values
+    };
+    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.top_k);
+    compute_hamming_top_k(
+        base_view,
+        query_view,
+        ground_truth_span,
+        cli.ground_truth_batch,
+        cli.threads,
+    )?;
 
     let gt_path = cli.output.join(format!("groundtruth.{query_count}.ibin"));
     let mut gt_file = File::create(&gt_path)?;
-    write_bin_header(&mut gt_file, query_count as u32, cli.neighbors as u32)?;
+    write_bin_header(&mut gt_file, query_count as u32, cli.top_k as u32)?;
     // SAFETY: `u32` is POD.
     gt_file.write_all(unsafe { retrieval::pod_slice_as_bytes(&ground_truth_indices) })?;
     eprintln!("Wrote {}", gt_path.display());
@@ -420,9 +487,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_dir_all(&parquet_dir);
     }
 
-    eprintln!(
-        "Done: {} base x {} queries, top-{}",
-        total_rows, query_count, cli.neighbors
-    );
+    eprintln!("Done: {} base x {} queries, top-{}", total_rows, query_count, cli.top_k);
     Ok(())
 }

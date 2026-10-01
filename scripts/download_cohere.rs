@@ -20,34 +20,40 @@
 //!     --language en \
 //!     --limit 10000000 \
 //!     --query-count 10000 \
-//!     --neighbors 100 \
+//!     --top-k 100 \
 //!     --output datasets/cohere_en_10M/
 //! ```
 
-use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{
+    fs::File,
+    io::{BufWriter, Seek, SeekFrom, Write},
+    path::PathBuf,
+    time::Duration,
+};
 
 use arrow_array::{Array, FixedSizeListArray, LargeStringArray, ListArray, RecordBatchReader, StringArray, UInt8Array};
 use bytes::Bytes;
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ProjectionMask;
-use rand::rngs::StdRng;
-use rand::seq::index::sample as sample_without_replacement;
-use rand::SeedableRng;
-use retrieval::generate::{binary_view, compute_hamming_top_k, matrix_span};
+use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
+use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, SeedableRng};
 use serde_json::Value;
+
+use retrieval::{
+    generate::{binary_view, compute_hamming_top_k, matrix_span},
+    Seed, Threads,
+};
 
 /// 1024-bit (128-byte) packed binary embedding column.
 const BYTES_PER_VECTOR: usize = 128;
 const DIMENSIONS_BITS: usize = 1024;
 
-/// Output-file BufWriter capacity, 1 MiB. Matches the molecules binary.
+/// Output-file BufWriter capacity, 1 MB. Matches the molecules binary.
 const OUTPUT_BUFFER_BYTES: usize = 1 << 20;
+
+/// Time limit for each HTTP request, shard downloads included.
+const HTTP_REQUEST_TIME_LIMIT: Duration = Duration::from_secs(600);
 
 const HF_API_TREE: &str =
     "https://huggingface.co/api/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary/tree/main";
@@ -61,42 +67,42 @@ const HF_RESOLVE: &str =
 )]
 struct Cli {
     /// Language config under the HF dataset (e.g. `en`, `de`, `fr`, ...).
-    #[arg(long, default_value = "en")]
+    #[arg(long, default_value = "en", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     language: String,
 
     /// Maximum rows to extract (default: all rows in that language).
-    #[arg(long)]
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
     limit: Option<usize>,
 
     /// Number of query vectors to randomly sample from the base set.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 10_000, value_parser = retrieval::parse_count_flag)]
     query_count: usize,
 
     /// Top-K neighbors to record per query in the ground truth file.
-    #[arg(long, default_value_t = 10)]
-    neighbors: usize,
+    #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
+    top_k: usize,
 
     /// Ground-truth query batch size. Auto-tuned from free RAM when omitted.
-    #[arg(long)]
-    batch_size: Option<usize>,
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
+    ground_truth_batch: Option<usize>,
 
-    /// Threads for the ground-truth pass (default: all logical cores).
-    #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
-    threads: usize,
+    /// Threads for the ground-truth pass, 0 for all cores.
+    #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
+    threads: Threads,
 
     /// Concurrent shard downloads.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 4, value_parser = retrieval::parse_count_flag)]
     download_concurrency: usize,
 
-    /// Also extract `title` / `text` / `url` columns into aligned newline-
+    /// Skip extracting the `title` / `text` / `url` columns into aligned newline-
     /// delimited files. Newlines inside the text column are escaped as `\\n`
     /// to preserve 1:1 row ↔ line correspondence with `base.b1bin`.
-    #[arg(long, default_value_t = true)]
-    with_text: bool,
+    #[arg(long)]
+    no_text: bool,
 
-    /// Random seed for query sampling.
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
+    /// Random seed for query sampling, or `random` to draw one.
+    #[arg(long, default_value = "42", value_parser = retrieval::parse_seed_flag)]
+    seed: Seed,
 
     /// Keep downloaded Parquet shards under `<output>/parquet/`.
     #[arg(long)]
@@ -126,30 +132,31 @@ fn escape_line(source: &str, out: &mut String) {
 }
 
 /// List the shard URLs for `<language>/` via the HF tree API (sorted by filename).
-async fn list_shard_urls(client: &reqwest::Client, language: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+async fn list_shard_urls(
+    client: &reqwest::Client,
+    language: &str,
+) -> Result<Vec<String, std::alloc::System>, Box<dyn std::error::Error>> {
     let url = format!("{HF_API_TREE}/{language}");
     let response = client.get(&url).send().await?;
     if !response.status().is_success() {
         return Err(format!("GET {url} -> {}", response.status()).into());
     }
     let entries: Vec<Value> = response.json().await?;
-    let mut shard_paths: Vec<String> = entries
-        .into_iter()
-        .filter_map(|entry| {
-            let path = entry.get("path")?.as_str()?.to_string();
-            let entry_type = entry.get("type")?.as_str()?;
-            if entry_type == "file" && path.ends_with(".parquet") {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut shard_paths = Vec::new_in(std::alloc::System);
+    shard_paths.extend(entries.into_iter().filter_map(|entry| {
+        let path = entry.get("path")?.as_str()?.to_string();
+        let entry_type = entry.get("type")?.as_str()?;
+        if entry_type == "file" && path.ends_with(".parquet") {
+            Some(path)
+        } else {
+            None
+        }
+    }));
     shard_paths.sort();
-    Ok(shard_paths
-        .into_iter()
-        .map(|path| format!("{HF_RESOLVE}/{path}"))
-        .collect())
+    for path in &mut shard_paths {
+        *path = format!("{HF_RESOLVE}/{path}");
+    }
+    Ok(shard_paths)
 }
 
 async fn download_shard(client: &reqwest::Client, url: &str) -> Result<Bytes, Box<dyn std::error::Error>> {
@@ -171,10 +178,11 @@ fn extract_and_append<B: Write>(
     let builder = ParquetRecordBatchReaderBuilder::try_new(shard_bytes)?;
     let parquet_schema = builder.parquet_schema();
 
-    let mut columns_wanted: Vec<&str> = vec!["emb_ubinary"];
-    if text_out.is_some() {
-        columns_wanted.extend_from_slice(&["title", "text", "url"]);
-    }
+    let columns_wanted: &[&str] = if text_out.is_some() {
+        &["emb_ubinary", "title", "text", "url"]
+    } else {
+        &["emb_ubinary"]
+    };
     let mask = ProjectionMask::columns(parquet_schema, columns_wanted.iter().copied());
     let reader = builder.with_projection(mask).build()?;
 
@@ -297,14 +305,31 @@ struct TextWriters {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let cli: Cli = retrieval::parse_cli();
+    eprintln!("- Language: {}", cli.language);
+    match cli.limit {
+        Some(limit) => eprintln!("- Limit: {limit}"),
+        None => eprintln!("- Limit: all"),
+    }
+    eprintln!("- Query count: {}", cli.query_count);
+    eprintln!("- Top k: {}", cli.top_k);
+    match cli.ground_truth_batch {
+        Some(batch) => eprintln!("- Ground-truth batch: {batch}"),
+        None => eprintln!("- Ground-truth batch: auto"),
+    }
+    eprintln!("- Threads: {}", cli.threads);
+    eprintln!("- Download concurrency: {}", cli.download_concurrency);
+    eprintln!("- No text: {}", cli.no_text);
+    eprintln!("- Seed: {}", cli.seed);
+    eprintln!("- Keep Parquet: {}", cli.keep_parquet);
+    eprintln!("- Output: {}", cli.output.display());
     std::fs::create_dir_all(&cli.output)?;
     let parquet_dir = cli.output.join("parquet");
     if cli.keep_parquet {
         std::fs::create_dir_all(&parquet_dir)?;
     }
 
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?;
+    let client = reqwest::Client::builder().timeout(HTTP_REQUEST_TIME_LIMIT).build()?;
 
     // Resolve shard URLs for the requested language via HF's tree API.
     eprintln!("Listing shards for language `{}`...", cli.language);
@@ -322,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut base_file = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, base_file_handle);
     write_bin_header(&mut base_file, 0, DIMENSIONS_BITS as u32)?;
 
-    let mut text_writers = if cli.with_text {
+    let mut text_writers = if !cli.no_text {
         Some(TextWriters {
             titles: BufWriter::new(File::create(cli.output.join("titles.txt"))?),
             texts: BufWriter::new(File::create(cli.output.join("texts.txt"))?),
@@ -337,9 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ProgressStyle::with_template("  {spinner} downloading shards: {pos}/{len} [{elapsed_precise}] {msg}").unwrap(),
     );
 
-    let shard_indices_and_urls: Vec<(usize, String)> = shard_urls.into_iter().enumerate().collect();
-
-    let mut stream = stream::iter(shard_indices_and_urls)
+    let mut stream = stream::iter(shard_urls.into_iter().enumerate())
         .map(|(shard_index, url)| {
             let client = client.clone();
             async move {
@@ -372,7 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         progress.set_position((shard_index + 1) as u64);
         progress.set_message(format!(
             "{total_rows} rows ({:.1} GB)",
-            (total_rows * BYTES_PER_VECTOR) as f64 / 1e9
+            (total_rows * BYTES_PER_VECTOR) as f64 / (1u64 << 30) as f64
         ));
         if total_rows >= limit {
             break;
@@ -385,7 +408,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!(
         "Downloaded {total_rows} rows ({:.2} GB base data)",
-        (total_rows * BYTES_PER_VECTOR) as f64 / 1e9
+        (total_rows * BYTES_PER_VECTOR) as f64 / (1u64 << 30) as f64
     );
 
     // Flush + patch base header.
@@ -425,10 +448,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let query_count = cli.query_count.min(total_rows);
-    let mut rng = StdRng::seed_from_u64(cli.seed);
+    let mut rng = StdRng::seed_from_u64(cli.seed.into());
     let query_indices = sample_without_replacement(&mut rng, total_rows, query_count).into_vec();
 
-    let mut query_buffer = vec![0u8; query_count * BYTES_PER_VECTOR];
+    let mut query_buffer = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(query_count * BYTES_PER_VECTOR, 0u8);
+        values
+    };
     for (output_index, &base_index) in query_indices.iter().enumerate() {
         let source_offset = base_index * BYTES_PER_VECTOR;
         let dest_offset = output_index * BYTES_PER_VECTOR;
@@ -444,17 +471,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "Computing brute-force hamming top-{} ground truth (NumKong + ForkUnion)...",
-        cli.neighbors
+        cli.top_k
     );
     let base_view = binary_view(base_slice, total_rows, DIMENSIONS_BITS);
     let query_view = binary_view(&query_buffer, query_count, DIMENSIONS_BITS);
-    let mut ground_truth_indices = vec![0u32; query_count * cli.neighbors];
-    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.neighbors);
-    compute_hamming_top_k(base_view, query_view, ground_truth_span, cli.batch_size, cli.threads)?;
+    let mut ground_truth_indices = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(query_count * cli.top_k, 0u32);
+        values
+    };
+    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.top_k);
+    compute_hamming_top_k(
+        base_view,
+        query_view,
+        ground_truth_span,
+        cli.ground_truth_batch,
+        cli.threads,
+    )?;
 
     let gt_path = cli.output.join(format!("groundtruth.{query_count}.ibin"));
     let mut gt_file = File::create(&gt_path)?;
-    write_bin_header(&mut gt_file, query_count as u32, cli.neighbors as u32)?;
+    write_bin_header(&mut gt_file, query_count as u32, cli.top_k as u32)?;
     // SAFETY: `u32` is POD.
     gt_file.write_all(unsafe { retrieval::pod_slice_as_bytes(&ground_truth_indices) })?;
     eprintln!("Wrote {}", gt_path.display());
@@ -463,6 +500,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_dir_all(&parquet_dir);
     }
 
-    eprintln!("Done: {total_rows} base × {query_count} queries, top-{}", cli.neighbors);
+    eprintln!("Done: {total_rows} base × {query_count} queries, top-{}", cli.top_k);
     Ok(())
 }

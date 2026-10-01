@@ -21,45 +21,59 @@
 //!     --output results/
 //! ```
 
-use std::time::Duration;
+use std::{
+    fmt::{self, Write},
+    time::Duration,
+};
 
 use clap::Parser;
 use itertools::iproduct;
-use retrieval::docker::ContainerHandle;
-use retrieval::{
-    bail, try_run_config, Backend, BenchState, CommonArgs, Distance, Key, SweepSummary, UnwrapOrBail, Vectors,
-};
 use serde_json::{json, Value};
+
+use retrieval::{
+    bail, docker::ContainerHandle, spell_duration, spell_list, try_run_config, Backend, BenchState, CommonArgs,
+    Distance, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+};
 
 const CLASS_NAME: &str = "Bench";
 
-/// CLI metric -> the distance name Weaviate's REST schema expects.
-fn parse_weaviate_distance(s: &str) -> Result<&'static str, String> {
-    match s {
-        "ip" => Ok("dot"),
-        "cos" => Ok("cosine"),
-        "l2sq" | "l2" => Ok("l2-squared"),
-        _ => Err(format!(
-            "unknown Weaviate metric: {s} (supported: ip, cos, l2; Hamming needs bit-packed vectors \
-             which Weaviate doesn't natively store)"
-        )),
+/// Weaviate distances, as `--metric` spells them; Hamming needs bit-packed vectors Weaviate doesn't store.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Metric {
+    Ip,
+    Cos,
+    #[value(alias = "l2sq")]
+    L2,
+}
+
+impl Metric {
+    /// The distance name Weaviate's REST schema expects.
+    fn schema_name(self) -> &'static str {
+        match self {
+            Self::Ip => "dot",
+            Self::Cos => "cosine",
+            Self::L2 => "l2-squared",
+        }
     }
 }
 
-fn parse_weaviate_quantization(s: &str) -> Result<WeaviateQuant, String> {
-    match s {
-        "none" => Ok(WeaviateQuant::None),
-        "binary" => Ok(WeaviateQuant::Binary),
-        _ => Err(format!(
-            "unknown Weaviate quantization: {s} (supported: none, binary; sq/pq not in this pass)"
-        )),
+impl fmt::Display for Metric {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
     }
 }
 
-#[derive(Clone, Copy)]
+/// Server-side quantization, as `--quantization` spells it.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum WeaviateQuant {
     None,
     Binary,
+}
+
+impl fmt::Display for WeaviateQuant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -68,36 +82,39 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Distance metric (comma-separated for sweep): ip, cos, l2
-    #[arg(long, value_delimiter = ',', default_value = "l2")]
-    metric: Vec<String>,
+    /// Distance metrics (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    metric: Vec<Metric>,
 
-    /// Server-side quantization (comma-separated for sweep): none, binary
-    #[arg(long, value_delimiter = ',', default_value = "none")]
-    quantization: Vec<String>,
+    /// Server-side quantization (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', value_enum, default_value = "none")]
+    quantization: Vec<WeaviateQuant>,
 
     /// HNSW connectivity M (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "16")]
+    #[arg(long, value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// HNSW expansion factor during indexing (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "128")]
+    #[arg(long, value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// HNSW expansion factor during search (comma-separated for sweep).
     /// Class-level on Weaviate, so each value rebuilds the class.
-    #[arg(long, value_delimiter = ',', default_value = "64")]
+    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
-    #[arg(long, default_value_t = 120)]
-    docker_timeout: u64,
+    /// Time limit for container start and readiness, like 120s
+    #[arg(long, default_value = "120s", value_parser = retrieval::parse_duration_flag)]
+    startup_time_limit: Duration,
 
     /// Weaviate HTTP port
-    #[arg(long, default_value_t = 8080)]
-    port: u16,
+    #[arg(long, default_value = "8080", value_parser = retrieval::parse_port)]
+    port: Port,
 }
 
 struct WeaviateBackend {
+    scratch: Vec<f32, std::alloc::System>,
+    query: String,
     http: reqwest::Client,
     http_base: String,
     container: Option<ContainerHandle>,
@@ -116,65 +133,84 @@ impl Backend for WeaviateBackend {
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let data = vectors.data.to_f32();
-        let url = format!("{}/v1/objects", self.http_base);
-        self.runtime.block_on(async {
-            for (row, &key) in data.chunks_exact(vectors.dimensions).zip(keys) {
-                let object = json!({ "class": CLASS_NAME, "properties": { "idx": key as i64 }, "vector": row });
-                post_json(&self.http, &url, &object)
-                    .await
-                    .map_err(|e| format!("Weaviate insert failed: {e}"))?;
+        let data = vectors.data.to_f32_in(&mut self.scratch)?;
+        let objects: Vec<_> = data
+            .chunks_exact(vectors.dimensions)
+            .zip(keys)
+            .map(|(row, &key)| json!({"class": CLASS_NAME, "properties": {"idx": key}, "vector": row}))
+            .collect();
+        let response = self.runtime.block_on(post_json(
+            &self.http,
+            &format!("{}/v1/batch/objects", self.http_base),
+            &json!({"objects": objects}),
+        ))?;
+        let results = response.as_array().ok_or("Weaviate batch response is not an array")?;
+        if results.len() != keys.len() {
+            return Err("Weaviate batch response length mismatch".into());
+        }
+        for result in results {
+            if result.pointer("/result/status").and_then(Value::as_str) != Some("SUCCESS") {
+                return Err(format!("Weaviate batch insert failed: {result}"));
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     fn search(
-        &self,
+        &mut self,
         queries: Vectors,
         count: usize,
         out_keys: &mut [Key],
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String> {
-        let data = queries.data.to_f32();
-        let url = format!("{}/v1/graphql", self.http_base);
-
-        self.runtime.block_on(async {
-            for (query_index, query) in data.chunks_exact(queries.dimensions).enumerate() {
-                let gql = format!(
-                    "{{ Get {{ {CLASS_NAME}(nearVector: {{ vector: {query:?} }} limit: {count}) \
-                     {{ idx _additional {{ distance }} }} }} }}"
-                );
-                let response = post_json(&self.http, &url, &json!({ "query": gql }))
-                    .await
-                    .map_err(|e| format!("Weaviate query failed: {e}"))?;
-                // GraphQL reports a failed query as 200 OK with an `errors` array.
-                if let Some(errors) = response.get("errors") {
-                    return Err(format!("Weaviate query failed: {errors}"));
-                }
-
-                let offset = query_index * count;
-                let items = response
-                    .pointer(&format!("/data/Get/{CLASS_NAME}"))
-                    .and_then(|v| v.as_array());
-                let hits = items.into_iter().flatten().filter_map(|item| {
-                    let stored_index = item.get("idx").and_then(|v| v.as_i64())?;
-                    let key = u32::try_from(stored_index).ok()?;
-                    let distance = item
-                        .pointer("/_additional/distance")
-                        .and_then(|d| d.as_f64())
-                        .unwrap_or(f64::INFINITY) as Distance;
-                    Some((key as Key, distance))
-                });
-                out_counts[query_index] = retrieval::write_row(
-                    hits,
-                    &mut out_keys[offset..offset + count],
-                    &mut out_distances[offset..offset + count],
-                );
+        let data = queries.data.to_f32_in(&mut self.scratch)?;
+        self.query.clear();
+        self.query.push_str("{ Get {");
+        for (i, row) in data.chunks_exact(queries.dimensions).enumerate() {
+            write!(self.query, "q{i}: {CLASS_NAME}(nearVector: {{ vector: {row:?} }} limit: {count}) {{ idx _additional {{ distance }} }} ").unwrap();
+        }
+        self.query.push_str("} }");
+        let response = self.runtime.block_on(post_json(
+            &self.http,
+            &format!("{}/v1/graphql", self.http_base),
+            &json!({"query": self.query}),
+        ))?;
+        if let Some(errors) = response.get("errors") {
+            return Err(format!("Weaviate query failed: {errors}"));
+        }
+        for (i, output_count) in out_counts.iter_mut().enumerate() {
+            let name = format!("q{i}");
+            let items = response
+                .get("data")
+                .and_then(|v| v.get("Get"))
+                .and_then(|v| v.get(&name))
+                .and_then(Value::as_array)
+                .ok_or("Weaviate query response missing results")?;
+            let keys = &mut out_keys[i * count..(i + 1) * count];
+            let distances = &mut out_distances[i * count..(i + 1) * count];
+            keys.fill(Key::MAX);
+            distances.fill(Distance::INFINITY);
+            if items.len() > count {
+                return Err("Weaviate returned too many results".into());
             }
-            Ok::<(), String>(())
-        })
+            for (j, item) in items.iter().enumerate() {
+                keys[j] = item
+                    .get("idx")
+                    .and_then(Value::as_u64)
+                    .and_then(|k| Key::try_from(k).ok())
+                    .ok_or("Weaviate returned invalid key")?;
+                distances[j] = item
+                    .pointer("/_additional/distance")
+                    .and_then(Value::as_f64)
+                    .ok_or("Weaviate returned invalid distance")? as Distance;
+                if !distances[j].is_finite() {
+                    return Err("Weaviate returned nonfinite distance".into());
+                }
+            }
+            *output_count = items.len();
+        }
+        Ok(())
     }
 
     fn memory_bytes(&self) -> usize {
@@ -246,11 +282,6 @@ async fn create_class(
 
 /// Reject argument combinations Weaviate will refuse, before a container starts.
 fn validate(cli: &Cli) -> Result<(), String> {
-    for &expansion_search in &cli.expansion_search {
-        if expansion_search == 0 {
-            return Err("--expansion-search must be greater than 0".into());
-        }
-    }
     for &connectivity in &cli.connectivity {
         for &expansion_add in &cli.expansion_add {
             if expansion_add < connectivity {
@@ -265,31 +296,24 @@ fn validate(cli: &Cli) -> Result<(), String> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli: Cli = retrieval::parse_cli();
     validate(&cli).unwrap_or_bail("invalid arguments");
 
     if cli.common.index.is_some() {
         bail("--index is not supported for this backend");
     }
 
-    for m in &cli.metric {
-        parse_weaviate_distance(m).unwrap_or_bail("metric");
-    }
-    for quantization in &cli.quantization {
-        parse_weaviate_quantization(quantization).unwrap_or_bail("quantization");
-    }
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio");
-    let timeout = Duration::from_secs(cli.docker_timeout);
+    let timeout = cli.startup_time_limit;
 
     let handle = runtime.block_on(async {
         let handle = ContainerHandle::start(
             "semitechnologies/weaviate:1.39.7",
             "retrieval-weaviate",
-            &vec![(cli.port, 8080), (50051, 50051)],
+            &[(cli.port.into(), 8080), (50051, 50051)],
             &[
                 "QUERY_DEFAULTS_LIMIT=25".into(),
                 "AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true".into(),
@@ -297,6 +321,7 @@ fn main() {
                 "DEFAULT_VECTORIZER_MODULE=none".into(),
                 "CLUSTER_HOSTNAME=node1".into(),
             ],
+            &[],
             timeout,
         )
         .await
@@ -315,43 +340,37 @@ fn main() {
         eprintln!("Failed to load benchmark state: {e}");
         std::process::exit(1);
     });
-    if cli.common.dimensions.len() > 1 {
-        retrieval::bail(
-            "--dimensions sweep with >1 value isn't supported on Weaviate; rerun the binary per dimensions",
-        );
+    eprintln!("- Metrics: {}", spell_list(&cli.metric));
+    eprintln!("- Quantization: {}", spell_list(&cli.quantization));
+    eprintln!("- Connectivity: {}", spell_list(&cli.connectivity));
+    eprintln!("- Expansion add: {}", spell_list(&cli.expansion_add));
+    eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
+    eprintln!("- Startup time limit: {}", spell_duration(cli.startup_time_limit));
+    eprintln!("- Port: {}", cli.port);
+    if cli.common.dims.len() > 1 {
+        retrieval::bail("--dims sweep with >1 value isn't supported on Weaviate; rerun the binary per dimensions");
     }
-    let dimensions = cli
-        .common
-        .dimensions
-        .first()
-        .copied()
-        .unwrap_or_else(|| state.dimensions());
-    state
-        .check_dimensions(dimensions)
-        .unwrap_or_bail("invalid --dimensions");
+    let dimensions = cli.common.dims.first().copied().unwrap_or_else(|| state.dimensions());
+    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dims");
 
     let mut container_slot = Some(handle);
-    let configs: Vec<_> = iproduct!(
+    let configs = iproduct!(
         &cli.metric,
         &cli.quantization,
         &cli.connectivity,
         &cli.expansion_add,
         &cli.expansion_search
-    )
-    .collect();
-    let num_configs = configs.len();
+    );
+    let num_configs = configs.clone().count();
     let mut summary = SweepSummary::default();
-    for (idx, (metric_str, quant_str, connectivity, expansion_add, expansion_search)) in configs.into_iter().enumerate()
-    {
+    for (idx, (&metric, &quant, connectivity, expansion_add, expansion_search)) in configs.enumerate() {
         let is_last = idx + 1 == num_configs;
-        let metric = parse_weaviate_distance(metric_str).expect("validated above");
-        let quant = parse_weaviate_quantization(quant_str).expect("validated above");
 
         runtime.block_on(async {
             create_class(
                 &http,
                 &http_base,
-                metric,
+                metric.schema_name(),
                 quant,
                 *connectivity as u64,
                 *expansion_add as u64,
@@ -364,10 +383,12 @@ fn main() {
         let container_for_this_run = if is_last { container_slot.take() } else { None };
 
         let description = format!(
-            "weaviate · {metric_str} · quant={quant_str} · \
+            "weaviate · {metric} · quant={quant} · \
              M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"
         );
         let backend = WeaviateBackend {
+            scratch: Vec::new_in(std::alloc::System),
+            query: String::new(),
             http: http.clone(),
             http_base: http_base.clone(),
             container: container_for_this_run,
@@ -376,8 +397,8 @@ fn main() {
             metadata: {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("backend".into(), json!("weaviate"));
-                metadata.insert("metric".into(), json!(metric_str));
-                metadata.insert("quantization".into(), json!(quant_str));
+                metadata.insert("metric".into(), json!(metric.to_string()));
+                metadata.insert("quantization".into(), json!(quant.to_string()));
                 metadata.insert("connectivity".into(), json!(connectivity));
                 metadata.insert("expansion_add".into(), json!(expansion_add));
                 metadata.insert("expansion_search".into(), json!(expansion_search));

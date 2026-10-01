@@ -36,13 +36,13 @@
 //! `io::ErrorKind::Unsupported`. Non-Linux JSON output simply omits the
 //! counter fields (they're `skip_serializing_if = "Option::is_none"`).
 
-use serde::Serialize;
 use std::io;
 
 #[cfg(all(target_os = "linux", feature = "perf-counters"))]
 use perf_event::events::Hardware;
 #[cfg(all(target_os = "linux", feature = "perf-counters"))]
 use perf_event::{Builder, Group};
+use serde::Serialize;
 
 /// A set of counters the kernel schedules together and reads atomically.
 ///
@@ -77,7 +77,7 @@ pub struct CounterSample {
 /// per-step fd churn.
 #[cfg(all(target_os = "linux", feature = "perf-counters"))]
 pub struct PerfCounters {
-    per_cpu: Vec<CpuCounters>,
+    per_cpu: Vec<CpuCounters, std::alloc::System>,
 }
 
 #[cfg(all(target_os = "linux", feature = "perf-counters"))]
@@ -95,7 +95,7 @@ impl PerfCounters {
     pub fn new() -> io::Result<Self> {
         let logical_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
-        let mut per_cpu = Vec::with_capacity(logical_cpus);
+        let mut per_cpu = Vec::with_capacity_in(logical_cpus, std::alloc::System);
         for cpu in 0..logical_cpus {
             match open_cpu_counters(cpu) {
                 Ok(entry) => per_cpu.push(entry),

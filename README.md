@@ -166,10 +166,10 @@ Each search reports two recall conventions, because they answer different questi
 `intersection_at_k` is __K-recall@K__ (`|top-K ∩ ground-truth-K| / K`), order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
 1-recall@K ≥ K-recall@K for the same run, so the two are never interchangeable.
 
-K is `--search-count`, which defaults to the ground-truth file's width — 10 on the Wiki sets, 100 on the BigANN ones.
+K is `--top-k`, which defaults to the ground-truth file's width — 10 on the Wiki sets, 100 on the BigANN ones.
 That matters because 1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
 `intersection_at_k` is what stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix, so both are stricter at wide K than the same-named numbers at K=10.
-Pass `--search-count 10` for figures comparable across datasets of differing ground-truth width.
+Pass `--top-k 10` for figures comparable across datasets of differing ground-truth width.
 
 ## Quick Start
 
@@ -240,9 +240,11 @@ Product quantization is deliberately excluded everywhere.
 | __Qdrant__   | `qdrant-client`, gRPC        | `qdrant/qdrant:v1.19.1`            | ip, l2, cos, manhattan | `f32`, `f16`, `u8`                      | `none`, `binary`, `scalar` |
 | __Redis__    | `redis`, RESP                | `redis:8.10`                       | ip, l2, cos            | `f32`, `f64`, `f16`, `bf16`, `u8`, `i8` | —                          |
 | __Weaviate__ | `reqwest`, REST              | `semitechnologies/weaviate:1.39.7` | ip, l2, cos            | `f32` only                              | `none`, `binary`           |
-| __LanceDB__  | `lancedb`, in-process, Arrow | —                                  | ip, l2, cos            | `f32` only                              | — (IVF-bucketed only) ¹    |
+| __LanceDB__  | `lancedb`, in-process, Arrow | —                                  | ip, l2, cos            | `f32` only                              | — (exact scan) ¹           |
 
-¹ LanceDB's Rust client — `lancedb 0.37` — exposes graph-based search only via `IvfHnswFlat` / `IvfHnswSq` / `IvfHnswPq`, all behind a k-means-trained IVF layer that cannot be disabled. No pure-HNSW variant is offered, so this benchmark leaves LanceDB on plain `f32` + L2/IP/Cos until upstream adds one. Hamming is only available on `IvfFlat`, outside our graph path.
+¹ LanceDB's Rust client — `lancedb 0.37` — exposes graph-based search only via `IvfHnswFlat` / `IvfHnswSq` / `IvfHnswPq`, all behind a k-means-trained IVF layer that cannot be disabled.
+No pure-HNSW variant is offered, so this benchmark leaves LanceDB on plain `f32` + L2/IP/Cos until upstream adds one.
+Hamming is only available on `IvfFlat`, outside our graph path.
 
 Redis 8.x is required for `i8`, `u8`, `f16`, and `bf16` — the older `redis/redis-stack` images on Redis 7.4 reject those four types at `FT.CREATE`.
 Qdrant server-side `Float16` and `Uint8` accept f32 upserts and convert on ingest, so the wire payload we send is unchanged.
@@ -271,37 +273,83 @@ cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
 
 ## CLI Reference
 
-Each backend is a separate binary. Common flags shared by all:
+Each backend is a separate binary.
+The table lists every flag of every binary, with its default.
+Flags marked "sweep" take comma-separated values and run one configuration per combination.
+A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
 
-```
---base-vectors <PATH|GLOB>    # Base vectors to index (.fbin, .u8bin, .i8bin, .b1bin)
---base-keys <PATH|GLOB>       # Optional keys for those vectors (.i32bin), one per vector
---query-vectors <PATH|GLOB>   # Query vectors to search with
---query-neighbors <PATH|GLOB> # Ground-truth neighbors for those queries (.ibin)
---search-count <K>            # Neighbors per query — the k every metric is taken at.
-                              # Defaults to the ground-truth file's width; may not exceed it.
---steps <N>                # Measurement steps (dataset split into N parts, default: 10)
---no-shuffle               # Disable random insertion order (shuffle is on by default)
---output <DIR>             # Output directory for JSON result files (omit for progress-only)
---index <PATH>             # Persisted index handle. If the path exists, the run skips the
-                           # add phase, loads, and search-only-runs; otherwise the run
-                           # builds, then saves to that path. Requires a single-config sweep.
-                           # USearch / FAISS / cuVS only; rejected by the server backends.
---dimensions <LIST>        # Matryoshka truncations to evaluate (e.g. 128,256,512,1024).
-                           # Empty → use the file's native dim. Each value must be ≤ native;
-                           # for `.b1bin` files each must be a multiple of 8.
---self-search              # After the last insertion, replay indexed vectors as their own
-                           # queries and report the share that retrieve themselves. Needs no
-                           # ground truth — a vector in the index is its own nearest neighbor.
-                           # Reported separately from the recall curve.
---self-search-count <N>    # Neighbors per self-search query. Independent of --search-count:
-                           # this is a load knob, since self-recall@k ≈ self-recall@1 always
-                           # (a vector's distance to itself is zero). Default: 10.
---self-search-sample <S>   # Base vectors to replay: a bare integer is an absolute count, a
-                           # value with a decimal point (≤ 1.0) is a fraction of the base
-                           # (1.0 = all). Default: all. Takes the leading N rows, not a
-                           # random draw — see the caveat below.
-```
+| Flag                     | Binaries                         | Default                  | Meaning                                                                                              |
+| ------------------------ | -------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `--base-vectors`         | all `retri-eval-*`               | required                 | Base vectors to index (`.fbin`, `.u8bin`, `.i8bin`, `.b1bin`), a path or glob                        |
+| `--base-keys`            | all `retri-eval-*`               | sequential               | Keys for the base vectors (`.i32bin`), one per vector                                                |
+| `--query-vectors`        | all `retri-eval-*`               | required                 | Query vectors to search with                                                                         |
+| `--query-neighbors`      | all `retri-eval-*`               | required                 | Ground-truth neighbors for those queries (`.ibin`)                                                   |
+| `--top-k`                | all `retri-eval-*`               | ground-truth width       | Neighbors per query, the k every metric is taken at; may not exceed the ground-truth width           |
+| `--insertion-order`      | all `retri-eval-*`               | `shuffled`               | `shuffled` by `--seed`, or the file's `original` order                                               |
+| `--seed`                 | all `retri-eval-*`               | `42`                     | 32-bit seed of the shuffled insertion order, or `random`; rejected with `--insertion-order original` |
+| `--steps`                | all `retri-eval-*`               | `10`                     | Measurement steps; the base is inserted in this many equal parts                                     |
+| `--vectors-per-add`      | all `retri-eval-*`               | `10000`                  | Vectors per backend `add` call                                                                       |
+| `--queries-per-search`   | all `retri-eval-*`               | `10000`                  | Queries per backend `search` call                                                                    |
+| `--output`               | all `retri-eval-*`               | none                     | Directory for JSON result files; progress only when unset                                            |
+| `--max-base-vectors`     | all `retri-eval-*`               | all                      | Cap on the base vectors used, for calibration on a slice                                             |
+| `--index`                | usearch, faiss, cuvs             | none                     | Persisted index: loaded and searched if the path exists, else built and saved; needs a single config |
+| `--dims`                 | all `retri-eval-*`               | native                   | Matryoshka truncations, sweep; each at most the native width, and a multiple of 8 for `.b1bin`       |
+| `--self-search`          | all `retri-eval-*`               | off                      | After the last insertion, replay indexed vectors as their own queries                                |
+| `--self-search-top-k`    | all `retri-eval-*`               | `10`                     | Neighbors per self-search query                                                                      |
+| `--self-search-sample`   | all `retri-eval-*`               | all                      | Leading base rows to replay: a count like `50000` or a fraction like `0.1`; needs `--self-search`    |
+| `--data-type`            | usearch                          | `bf16`                   | Sweep of `f64`, `f32`, `bf16`, `f16`, `e5m2`, `e4m3`, `e3m2`, `e2m3`, `i8`, `u8`, `b1`               |
+| `--data-type`            | faiss                            | `bf16`                   | Sweep of `f32`, `f16`, `bf16`, `u8`, `i8`, `b1`                                                      |
+| `--data-type`            | cuvs                             | `f32`                    | Sweep of `f32`, `f16`, `i8`, `u8`                                                                    |
+| `--data-type`            | qdrant                           | `f32`                    | Sweep of storage types `f32`, `f16`, `u8`                                                            |
+| `--data-type`            | redis                            | `f32`                    | Sweep of `f32`, `f64`, `f16`, `bf16`, `u8`, `i8`; `u8` and `i8` need Redis 8                         |
+| `--metric`               | usearch                          | `l2`                     | Sweep of `ip`, `l2`, `cos`, `hamming`, `jaccard`, `sorensen`, `pearson`, `haversine`, `divergence`   |
+| `--metric`               | faiss                            | `l2`                     | Sweep of `ip`, `l2`; `b1` data always uses Hamming                                                   |
+| `--metric`               | cuvs, redis, weaviate            | `l2`                     | Sweep of `l2`, `ip`, `cos`                                                                           |
+| `--metric`               | qdrant                           | `l2`                     | Sweep of `ip`, `cos`, `l2`, `manhattan`                                                              |
+| `--metric`               | lancedb                          | `l2`                     | One of `ip`, `cos`, `l2`                                                                             |
+| `--quantization`         | qdrant                           | `none`                   | Sweep of server-side `none`, `binary`, `scalar`                                                      |
+| `--quantization`         | weaviate                         | `none`                   | Sweep of server-side `none`, `binary`                                                                |
+| `--connectivity`         | usearch, qdrant, redis, weaviate | `16`                     | HNSW M, sweep                                                                                        |
+| `--connectivity`         | faiss, cuvs                      | `32`                     | HNSW M, or CAGRA's output graph degree, sweep                                                        |
+| `--expansion-add`        | all but cuvs, lancedb            | `128`                    | HNSW construction width, sweep                                                                       |
+| `--expansion-add`        | cuvs                             | `64`                     | CAGRA's intermediate graph degree before pruning, sweep                                              |
+| `--expansion-search`     | all but lancedb                  | `64`                     | HNSW search width, or CAGRA's internal top-i list, sweep                                             |
+| `--shards`               | usearch                          | `1`                      | Index shards, sweep                                                                                  |
+| `--threads`              | usearch                          | `0`                      | Threads, `0` for all cores, sweep                                                                    |
+| `--threads`              | faiss                            | `0`                      | OpenMP threads, `0` for all cores                                                                    |
+| `--search-width`         | cuvs                             | `auto`                   | Graph nodes that start each search iteration, or `auto` for cuVS's choice, sweep                     |
+| `--min-iterations`       | cuvs                             | cuVS's choice            | Minimum search iterations                                                                            |
+| `--max-iterations`       | cuvs                             | cuVS's choice            | Maximum search iterations                                                                            |
+| `--num-random-samplings` | cuvs                             | cuVS's choice            | Random sampling rounds for the initial search points                                                 |
+| `--build-algo`           | cuvs                             | `auto`                   | Graph build algorithm, `auto` or `nn_descent`                                                        |
+| `--startup-time-limit`   | qdrant, redis, weaviate          | `120s`                   | Time limit for container start and readiness, like `120s`                                            |
+| `--grpc-port`            | qdrant                           | `6334`                   | Host gRPC port                                                                                       |
+| `--http-port`            | qdrant                           | `6333`                   | Host HTTP port                                                                                       |
+| `--port`                 | redis                            | `6379`                   | Host port                                                                                            |
+| `--port`                 | weaviate                         | `8080`                   | Host HTTP port                                                                                       |
+| `--vectors-per-upsert`   | qdrant                           | `10000`                  | Vectors per upsert request                                                                           |
+| `--vectors-per-upsert`   | redis                            | `1000`                   | Vectors per pipeline flush                                                                           |
+| `--db-path`              | lancedb                          | `/tmp/retrieval-lancedb` | LanceDB storage directory                                                                            |
+| `--format`               | retri-generate                   | required                 | `b1bin` for clustered binary with Hamming ground truth, or `fbin` for Gaussian `f32` with L2         |
+| `--base-count`           | retri-generate                   | required                 | Base vectors to generate                                                                             |
+| `--query-count`          | retri-generate                   | required                 | Query vectors to generate                                                                            |
+| `--query-count`          | retri-download-*                 | `10000`                  | Queries sampled from the base                                                                        |
+| `--dims`                 | retri-generate                   | required                 | Bits for `b1bin`, a multiple of 8, or scalars for `fbin`                                             |
+| `--clusters`             | retri-generate                   | `256`                    | Cluster centers                                                                                      |
+| `--noise`                | retri-generate                   | `0.1`                    | Bit-flip probability from 0 to 1                                                                     |
+| `--top-k`                | retri-generate, retri-download-* | `10`                     | Neighbors per query in the ground-truth file                                                         |
+| `--ground-truth-batch`   | retri-generate, retri-download-* | from free RAM            | Queries per ground-truth batch                                                                       |
+| `--threads`              | retri-generate, retri-download-* | `0`                      | Ground-truth threads, `0` for all cores                                                              |
+| `--seed`                 | retri-generate, retri-download-* | `42`                     | 32-bit seed of generation or query sampling, or `random`                                             |
+| `--output`               | retri-generate, retri-download-* | required                 | Output directory                                                                                     |
+| `--source`               | retri-download-molecules         | required                 | `pubchem` (115M), `gdb13` (977M) or `enamine` (6.04B)                                                |
+| `--fingerprint`          | retri-download-molecules         | required                 | `maccs` (166 bits), `pubchem` (881), `ecfp4` (2048) or `fcfp4` (2048)                                |
+| `--url-prefix`           | retri-download-molecules         | the public bucket        | S3 or HTTPS prefix of the shards                                                                     |
+| `--language`             | retri-download-cohere            | `en`                     | Language config of the Hugging Face dataset                                                          |
+| `--no-text`              | retri-download-cohere            | off                      | Skip the aligned `titles.txt`, `texts.txt` and `urls.txt`                                            |
+| `--limit`                | retri-download-*                 | all                      | Rows to extract                                                                                      |
+| `--download-concurrency` | retri-download-*                 | `4`                      | Concurrent shard downloads                                                                           |
+| `--keep-parquet`         | retri-download-*                 | off                      | Keep the Parquet shards under `<output>/parquet/`                                                    |
 
 ### Self-Recall
 
@@ -325,60 +373,14 @@ And `--self-search-sample` replays the _leading_ N rows rather than a random dra
 On a base whose row order carries structure, only the default full sweep is unbiased.
 
 Note also that a self-search's `recall_at_k` is very nearly redundant with its `recall_at_1`: a vector's own distance to itself is zero, which is minimal, so if the index retrieves it at all it lands at rank 1.
-Raising `--self-search-count` therefore changes how much search work each query does — which is the point when you are measuring throughput — but not the recall value.
+Raising `--self-search-top-k` therefore changes how much search work each query does — which is the point when you are measuring throughput — but not the recall value.
 
-`--base-vectors` / `--query-vectors` / `--query-neighbors` / `--base-keys` accept shell glob patterns
-(`*`, `?`, `[…]`). Matched shards are natural-sorted (`shard_2.fbin` before
-`shard_10.fbin`) and validated for matching dim and scalar format — useful for
-multi-shard datasets like USearchWiki.
-
-__retri-eval-usearch__ additionally supports comma-separated sweeps:
-
-```
---data-type <LIST>         # f32, f16, bf16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1
---metric <LIST>            # ip, l2, cos, hamming, jaccard, sorensen, pearson, haversine, divergence
---connectivity <LIST>      # HNSW M parameter (default: 0 = auto)
---expansion-add <LIST>     # expansion factor during indexing (default: 0 = auto)
---expansion-search <LIST>  # expansion factor during search (default: 0 = auto)
---shards <LIST>            # Index shards (default: 1)
---threads <LIST>           # Thread count (default: available cores)
-```
-
-__retri-eval-cuvs__ — requires `--features cuvs-backend` and an NVIDIA GPU:
-
-```
---data-type <LIST>          # f32, f16, u8                  (default: f32)
---metric <LIST>             # l2, ip, cos (default: l2)
---connectivity <LIST>       # CAGRA output graph degree (default: 32)
---expansion-add <LIST>      # CAGRA intermediate graph degree (default: 64)
---expansion-search <LIST>   # CAGRA search-time top-i list (default: 64)
-```
+`--base-vectors` / `--query-vectors` / `--query-neighbors` / `--base-keys` accept shell glob patterns (`*`, `?`, `[…]`).
+Matched shards are natural-sorted (`shard_2.fbin` before `shard_10.fbin`) and validated for matching dim and scalar format — useful for multi-shard datasets like USearchWiki.
 
 cuVS reuses the shared `--connectivity` / `--expansion-add` / `--expansion-search` names, and emits the matching JSON keys, so its runs plot on the same axes as the HNSW backends.
 The mapping is an analogy, not an identity — `--expansion-add` is CAGRA's pre-prune candidate width rather than `ef_construction`, and `--expansion-search` is its internal top-i list rather than `ef_search`.
 Read iso-`expansion` points across engines as comparable, not equal.
-
-__retri-eval-qdrant__ extends the common flags with:
-
-```
---data-type <LIST>      # f32, f16, u8                  (default: f32)
---quantization <LIST>   # none, binary, scalar          (default: none)
---metric <LIST>         # ip, l2, cos, manhattan        (default: l2)
-```
-
-__retri-eval-redis__ extends the common flags with:
-
-```
---data-type <LIST>      # f32, f64, f16, bf16, u8, i8   (default: f32)
---metric <LIST>         # ip, l2, cos                   (default: l2)
-```
-
-__retri-eval-weaviate__ extends the common flags with:
-
-```
---quantization <LIST>   # none, binary                  (default: none)
---metric <LIST>         # ip, l2, cos                   (default: l2)
-```
 
 ## Observability
 
@@ -453,11 +455,11 @@ This covers the whole process lifetime including dataset-load and ground-truth I
 `StepEntry.memory_bytes` is populated per step by asking the backend what it's currently using.
 The mechanism depends on the backend:
 
-| Backend                                 | How `memory_bytes` is measured                                                                                                                                                                                 |
-| :-------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| In-process — USearch, FAISS, cuVS       | The engine exposes its internal allocator or `index.size()` API, giving exact index footprint excluding dataset mmap. USearch: `index.memory_usage()`. FAISS: `index.stats().indexed_vectors * sizeof`.        |
-| Tier 2 Docker — Qdrant, Redis, Weaviate | `docker stats --no-stream --format '{{.MemUsage}}'` is sampled per step against the running container and parsed into bytes. This includes the whole engine process, not just the index, so it's an overcount. |
-| LanceDB — in-process, Arrow IPC         | Not measured; `memory_bytes` is always 0.                                                                                                                                                                      |
+| Backend                                 | How `memory_bytes` is measured                                                                                                                                                                          |
+| :-------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| In-process — USearch, FAISS, cuVS       | The engine exposes its internal allocator or `index.size()` API, giving exact index footprint excluding dataset mmap. USearch: `index.memory_usage()`. FAISS: `index.stats().indexed_vectors * sizeof`. |
+| Tier 2 Docker — Qdrant, Redis, Weaviate | The Docker stats API is sampled per step against the running container. This includes the whole engine process, not just the index, so it's an overcount.                                               |
+| LanceDB — in-process, Arrow IPC         | Not measured; `memory_bytes` is always 0.                                                                                                                                                               |
 
 The `peak memory` line printed at the end of a run is `steps.iter().map(|s| s.memory_bytes).max()`.
 Process-wide peak RSS — the kernel's accounting of everything including mmapped datasets — is available via `getrusage(RUSAGE_SELF)` but is not currently reported in the JSON.
@@ -470,10 +472,12 @@ They run as Docker containers the benchmark spawns and tears down automatically.
 `src/docker.rs` wraps `bollard`, the async Docker API client, and does:
 
 1. __Pull__ — runs `docker pull qdrant/qdrant:vX.Y.Z` or equivalent if the image isn't cached locally.
-2. __Run__ — creates the container with the port bindings and environment variables hard-coded in each binary, then starts it. The `docker/<backend>.yml` compose files mirror them for starting a server by hand.
-3. __Wait for ready__ — polls Qdrant's `/healthz`, Weaviate's `/v1/.well-known/ready`, or Redis's TCP port every 500 ms until the backend accepts connections, or a configurable timeout fires.
+2. __Run__ — creates the container with the port bindings and environment variables hard-coded in each binary, then starts it.
+   The `docker/<backend>.yml` compose files mirror them for starting a server by hand.
+3. __Wait for ready__ — polls Qdrant's `/healthz`, Weaviate's `/v1/.well-known/ready`, and Redis's TCP port followed by a successful PING, until the backend answers or the startup timeout fires.
 4. __Run the benchmark__ against the container.
-5. __Stop and remove__ the container regardless of success or failure — RAII-style via `ContainerHandle::Drop`.
+5. __Stop and remove__ the container when the backend owning its handle is dropped.
+   Startup failures before ownership transfers, forced termination, or aborted processes can leave a container for manual removal.
 
 Per-step memory for these backends comes from the Docker stats API.
 `memory_bytes` reflects the container's resident set including the engine process, its heap, page cache attributed to it, and so on.
@@ -492,20 +496,20 @@ Files are auto-named `<backend>-<hash>.json`.
   "machine": { "cpu_model": "Intel Xeon 6776P", "physical_cores": 96, ... },
   "dataset": { "base_vectors_path": "...", "vectors_count": 10000000, "dimensions": 100, ... },
   "config": { "backend": "usearch", "data_type": "f32", "metric": "l2", "connectivity": 16,
-              "dimensions": 100, "vectors_count": 10000000, "search_count": 10, ... },
+              "dimensions": 100, "vectors_count": 10000000, "top_k": 10, ... },
   "steps": [
     {
       "vectors_indexed": 1000000,
       "memory_bytes": 412000000,
       "add": { "elapsed": 12.3, "throughput": 81300 },
       "ground_truth_search": {
-        "queries": 100000, "neighbor_count": 10,
+        "queries": 100000, "top_k": 10,
         "elapsed": 0.45, "throughput": 222000,
         "recall_at_1": 0.0942, "recall_at_k": 0.2815,
         "intersection_at_k": 0.2604, "ndcg_at_k": 0.1847
       },
       "self_search": {
-        "queries": 1000000, "neighbor_count": 10,
+        "queries": 1000000, "top_k": 10,
         "elapsed": 1.6, "throughput": 627541,
         "recall_at_1": 0.9958, "recall_at_k": 0.9961
       }
@@ -519,7 +523,7 @@ A step pairs the index state (`vectors_indexed`, `memory_bytes`) with the phases
 Its metrics drop the `self_` prefix because the container already says it, and it carries no `intersection_at_k` or `ndcg_at_k`: identity truth is a single key per query, so neither a set overlap nor a ranked gain says anything beyond `recall_at_1`.
 
 `dataset` describes the input files and `config` describes the run, so `dataset.vectors_count` is the base file's row count while `config.vectors_count` is what `--max-base-vectors` actually indexed; divide `steps[].vectors_indexed` by the former for the share of the ground truth a step could possibly have found.
-`dataset.dimensions` is likewise the file's width, and `config.dimensions` the width a `--dimensions` sweep truncated to.
+`dataset.dimensions` is likewise the file's width, and `config.dimensions` the width a `--dims` sweep truncated to.
 
 ## Project Structure
 
@@ -926,7 +930,7 @@ Use `--limit N` to take a subset and `--source {pubchem,gdb13,enamine}` to pick 
 cargo install --path . --features download
 retri-download-molecules \
     --source pubchem --fingerprint maccs \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --top-k 10 \
     --output data/pubchem-maccs/
 ```
 
@@ -947,7 +951,7 @@ retri-eval-usearch \
 ```sh
 retri-download-molecules \
     --source pubchem --fingerprint ecfp4 \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --top-k 10 \
     --output datasets/pubchem_ecfp4/
 ```
 
@@ -968,7 +972,7 @@ retri-eval-usearch \
 ```sh
 retri-download-molecules \
     --source gdb13 --fingerprint maccs \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --top-k 10 \
     --output datasets/gdb13_maccs/
 ```
 
@@ -980,20 +984,20 @@ retri-download-molecules \
 ```sh
 retri-download-molecules \
     --source enamine --fingerprint maccs \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --top-k 10 \
     --output datasets/enamine_maccs/
 ```
 
 </details>
 
 Substitute `--fingerprint ecfp4` for the 2048-bit variant, which multiplies the base-file size by roughly 12× at each scale.
-Ground-truth time dominates at billion scale; set `--batch-size` explicitly if you have a lot of RAM and want larger query batches.
+Ground-truth time dominates at billion scale; set `--ground-truth-batch` explicitly if you have a lot of RAM and want larger query batches.
 
 ### Cohere Wikipedia Multilingual
 
 247M Wikipedia paragraphs embedded with Cohere Embed v3 and bit-packed into 1024-bit `emb_ubinary` columns at 128 bytes per vector.
 The dataset also ships text metadata — title, paragraph body, URL — alongside the vectors.
-`--with-text` extracts them into aligned newline-delimited files for downstream semantic-search demos.
+They are extracted into aligned newline-delimited files for downstream semantic-search demos, unless `--no-text` is given.
 
 <details>
 <summary>English subset 41.5M — b1, 1024 bits, Hamming, ~5.3 GB</summary>
@@ -1001,7 +1005,7 @@ The dataset also ships text metadata — title, paragraph body, URL — alongsid
 ```sh
 retri-download-cohere \
     --language en \
-    --query-count 10000 --neighbors 10 \
+    --query-count 10000 --top-k 10 \
     --output datasets/cohere_en/
 ```
 
@@ -1061,3 +1065,8 @@ The `--base-vectors` glob picks up every English shard in natural-sort order; qu
 </details>
 
 [finewiki]: https://huggingface.co/datasets/HuggingFaceFW/finewiki
+
+## Development
+
+The repository pins `nightly-2026-09-24`.
+Run `scripts/check.sh` for formatting, Clippy, and CPU tests; pass an explicit feature list for optional native engines.

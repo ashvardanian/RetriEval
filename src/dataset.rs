@@ -1,34 +1,29 @@
-use std::fs::File;
-use std::path::Path;
+//! Memory-mapped vector datasets, key mappings, and ground truth.
+
+use std::{alloc::System, fs::File, path::Path};
 
 use fork_union::{SyncMutPtr, ThreadPool};
 use memmap2::Mmap;
-use rand::rngs::SmallRng;
-use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
 
-use crate::error::DatasetError;
-use crate::{Key, VectorSlice, Vectors};
+use crate::{error::DatasetError, stream_key, Key, Seed, SplitMix64, VectorSlice, Vectors};
 
 /// Below this many elements the thread-pool spin-up cost outweighs any
-/// parallelism benefit; the shuffle falls back to the serial `SliceRandom`
-/// path. Measured at ~70 µs pool launch on a 192-thread Xeon 6776P, which
+/// parallelism benefit; the shuffle runs serially as one chunk.
+/// Measured at ~70 µs pool launch on a 192-thread Xeon 6776P, which
 /// is slower than shuffling 65 K elements serially.
 const PERMUTATION_SERIAL_THRESHOLD: usize = 65_536;
 
-/// Mixes the user's seed with the thread index to give each worker its own
-/// deterministic `SmallRng`. Value is the fractional part of the golden ratio
-/// times 2^64 — a standard choice (same constant fxhash et al. use) whose
-/// avalanche properties won't cluster seeds for adjacent thread indices.
-const THREAD_SEED_MIXER: u64 = 0x9E3779B97F4A7C15;
+/// Chunks the parallel shuffle splits into; fixed, so the permutation never depends on the core count.
+const PERMUTATION_CHUNKS: usize = 256;
 
-/// In-place Fisher–Yates on a `&mut [usize]`. Pure safe code — the
-/// unsafe-slice-reconstruction lives at the caller (see
-/// [`Permutation::shuffled`]). Kept out of line so the parallel shuffle
-/// closure reads as three lines instead of ten.
-fn fisher_yates_shuffle(slice: &mut [usize], rng: &mut SmallRng) {
+/// In-place Fisher–Yates over chunk `chunk_index`'s own SplitMix64 stream, so
+/// the permutation is the same on every platform and `rand` version.
+fn fisher_yates_shuffle(slice: &mut [usize], seed: Seed, chunk_index: usize) {
+    let mut generator = SplitMix64 {
+        state: stream_key(seed, "permutation", chunk_index as u64),
+    };
     for swap_target_ceiling in (1..slice.len()).rev() {
-        let swap_target = (rng.next_u64() as usize) % (swap_target_ceiling + 1);
+        let swap_target = generator.below(swap_target_ceiling as u64 + 1) as usize;
         slice.swap(swap_target_ceiling, swap_target);
     }
 }
@@ -53,9 +48,9 @@ enum NaturalSegment<'a> {
 /// Decompose a filename into alternating text/number runs for natural sort.
 /// `shard_2.fbin` ranks before `shard_10.fbin` because the numeric runs
 /// compare as 2 < 10 instead of `'1','0'` lex-comparing against `'2'`.
-fn natural_key(s: &str) -> Vec<NaturalSegment<'_>> {
+fn natural_key(s: &str) -> Vec<NaturalSegment<'_>, System> {
     let bytes = s.as_bytes();
-    let mut out = Vec::new();
+    let mut out = Vec::new_in(System);
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i].is_ascii_digit() {
@@ -83,12 +78,15 @@ fn natural_key(s: &str) -> Vec<NaturalSegment<'_>> {
 /// glob metacharacters (`*`, `?`, `[`) is returned as-is — single-file
 /// callers stay on the zero-glob fast path. Globbed expansions are sorted
 /// with `natural_key` so `shard_2.fbin` comes before `shard_10.fbin`.
-fn expand_glob(pattern: &str) -> std::io::Result<Vec<std::path::PathBuf>> {
+fn expand_glob(pattern: &str) -> std::io::Result<Vec<std::path::PathBuf, System>> {
     if !pattern.contains(['*', '?', '[']) {
-        return Ok(vec![std::path::PathBuf::from(pattern)]);
+        let mut paths = Vec::with_capacity_in(1, System);
+        paths.push(std::path::PathBuf::from(pattern));
+        return Ok(paths);
     }
     let entries = glob::glob(pattern).map_err(|e| std::io::Error::other(format!("glob({pattern}): {e}")))?;
-    let mut paths: Vec<std::path::PathBuf> = entries.filter_map(Result::ok).collect();
+    let mut paths = Vec::new_in(System);
+    paths.extend(entries.filter_map(Result::ok));
     if paths.is_empty() {
         return Err(std::io::Error::other(format!("glob({pattern}) matched no files")));
     }
@@ -111,19 +109,19 @@ const HEADER_BYTES: usize = 8;
 /// `HEADER_BYTES + within_shard_index * stride_bytes`. A single-file dataset
 /// holds exactly one mmap; glob expansions hold many.
 pub struct Shards {
-    mmaps: Vec<Mmap>,
+    mmaps: Vec<Mmap, System>,
     /// Cumulative per-shard row-count prefix sum. `offsets[i]` rows live in
     /// shards `0..i`. Length = `mmaps.len() + 1`, last element = total rows.
-    offsets: Vec<usize>,
+    offsets: Vec<usize, System>,
     /// Byte stride between consecutive rows within each shard.
     stride_bytes: usize,
 }
 
 impl Shards {
     /// Build from already-validated mmaps and their per-shard row counts.
-    fn new(mmaps: Vec<Mmap>, shard_rows: &[usize], stride_bytes: usize) -> Self {
+    fn new(mmaps: Vec<Mmap, System>, shard_rows: &[usize], stride_bytes: usize) -> Self {
         debug_assert_eq!(mmaps.len(), shard_rows.len());
-        let mut offsets = Vec::with_capacity(shard_rows.len() + 1);
+        let mut offsets = Vec::with_capacity_in(shard_rows.len() + 1, System);
         let mut acc = 0usize;
         offsets.push(0);
         for &n in shard_rows {
@@ -226,8 +224,8 @@ impl Dataset {
         let pattern = path.to_string_lossy();
         let shard_paths = expand_glob(&pattern)?;
 
-        let mut mmaps: Vec<Mmap> = Vec::with_capacity(shard_paths.len());
-        let mut shard_rows: Vec<usize> = Vec::with_capacity(shard_paths.len());
+        let mut mmaps: Vec<Mmap, System> = Vec::with_capacity_in(shard_paths.len(), System);
+        let mut shard_rows: Vec<usize, System> = Vec::with_capacity_in(shard_paths.len(), System);
         let mut format: Option<ScalarFormat> = None;
         let mut native_dimensions: Option<usize> = None;
 
@@ -408,71 +406,64 @@ impl Dataset {
 
 /// A shuffled permutation of `[0..n]` for randomizing insertion order.
 pub struct Permutation {
-    indices: Vec<usize>,
+    indices: Vec<usize, System>,
 }
 
 impl Permutation {
     /// Create a shuffled permutation of `[0..n]` with a deterministic seed,
     /// parallelized across the ForkUnion thread pool.
     ///
-    /// The output is uniformly random *within each chunk* of `ceil(n/threads)`
+    /// The output is uniformly random *within each chunk* of `ceil(n/256)`
     /// consecutive positions. Across chunks, element ranges remain ordered
-    /// (chunk 0 holds some subset of `[0, n/threads)`, chunk 1 holds a subset
-    /// of `[n/threads, 2n/threads)`, etc.). This is sufficient for ANN
+    /// (chunk 0 holds some subset of `[0, n/256)`, chunk 1 holds a subset
+    /// of `[n/256, 2n/256)`, etc.). This is sufficient for ANN
     /// benchmarking — it eliminates natural orderings (e.g. sorted molecules)
     /// and gives HNSW construction ~`chunk`-sized random windows to see a
     /// representative sample before moving on. A fully-uniform parallel
     /// shuffle would require parallel sort by random keys, which we skip to
     /// avoid adding a rayon/sort dep.
-    pub fn shuffled(n: usize, seed: u64) -> Self {
-        let mut indices: Vec<usize> = (0..n).collect();
+    pub fn shuffled(n: usize, seed: Seed) -> Self {
+        let mut indices: Vec<usize, System> = {
+            let mut values = Vec::with_capacity_in(n, System);
+            values.extend(0..n);
+            values
+        };
         if n < PERMUTATION_SERIAL_THRESHOLD {
-            let mut rng = SmallRng::seed_from_u64(seed);
-            indices.shuffle(&mut rng);
+            fisher_yates_shuffle(&mut indices, seed, 0);
             return Self { indices };
         }
 
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1);
+        let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+        let chunk = n.div_ceil(PERMUTATION_CHUNKS);
         let mut pool = match ThreadPool::try_spawn(threads) {
             Ok(pool) => pool,
             Err(_) => {
-                let mut rng = SmallRng::seed_from_u64(seed);
-                indices.shuffle(&mut rng);
+                for (chunk_index, chunk_slice) in indices.chunks_mut(chunk).enumerate() {
+                    fisher_yates_shuffle(chunk_slice, seed, chunk_index);
+                }
                 return Self { indices };
             }
         };
-
-        let chunk = n.div_ceil(threads);
         let shared_base = SyncMutPtr::new(indices.as_mut_ptr());
 
-        // Per-chunk Fisher–Yates. Each thread only writes to its own
-        // `[thread_index * chunk, (thread_index+1) * chunk)` range, so
-        // there are no cross-thread races. Seeds per thread are derived
-        // from `seed ^ mixer(thread_index)` for reproducibility.
-        //
-        // ForkUnion's `for_threads` takes a shared-ref closure (`Fn`), so
-        // we can't capture `&mut [usize]` directly. We pass the disjoint
-        // ranges via a `SyncMutPtr` and rebuild each thread's own
-        // `&mut [usize]` inside the closure — one `from_raw_parts_mut`
-        // call per thread, then safe `slice.swap(i, j)` in the hot loop.
-        pool.for_threads(|thread_index, _| {
-            let range_start = thread_index * chunk;
+        // ForkUnion's `for_n` takes a shared-ref closure (`Fn`), so we can't
+        // capture `&mut [usize]` directly. We pass the disjoint ranges via a
+        // `SyncMutPtr` and rebuild each chunk's own `&mut [usize]` inside the
+        // closure, then run safe `slice.swap(i, j)` in the hot loop.
+        pool.for_n(PERMUTATION_CHUNKS, |prong| {
+            let range_start = prong.task_index * chunk;
             if range_start >= n {
                 return;
             }
             let range_end = (range_start + chunk).min(n);
             // SAFETY: the chunks are disjoint by construction
-            // (`thread_index * chunk` is a monotonic multiple), so the
+            // (`task_index * chunk` is a monotonic multiple), so the
             // `&mut [usize]` rebuilt here never aliases with any other
-            // thread's slice.
+            // task's slice.
             let chunk_slice: &mut [usize] = unsafe {
                 std::slice::from_raw_parts_mut(shared_base.as_ptr().add(range_start), range_end - range_start)
             };
-            let mut rng = SmallRng::seed_from_u64(seed ^ (thread_index as u64).wrapping_mul(THREAD_SEED_MIXER));
-            fisher_yates_shuffle(chunk_slice, &mut rng);
+            fisher_yates_shuffle(chunk_slice, seed, prong.task_index);
         });
 
         Self { indices }
@@ -481,7 +472,11 @@ impl Permutation {
     /// Identity permutation (no shuffle).
     pub fn identity(n: usize) -> Self {
         Self {
-            indices: (0..n).collect(),
+            indices: {
+                let mut values = Vec::with_capacity_in(n, System);
+                values.extend(0..n);
+                values
+            },
         }
     }
 
@@ -510,8 +505,8 @@ impl Keys {
         let shard_paths = expand_glob(&pattern)?;
 
         let stride_bytes = std::mem::size_of::<Key>();
-        let mut mmaps: Vec<Mmap> = Vec::with_capacity(shard_paths.len());
-        let mut shard_rows: Vec<usize> = Vec::with_capacity(shard_paths.len());
+        let mut mmaps: Vec<Mmap, System> = Vec::with_capacity_in(shard_paths.len(), System);
+        let mut shard_rows: Vec<usize, System> = Vec::with_capacity_in(shard_paths.len(), System);
 
         for shard_path in &shard_paths {
             let file = File::open(shard_path)?;
@@ -605,8 +600,8 @@ impl GroundTruth {
         let pattern = path.to_string_lossy();
         let shard_paths = expand_glob(&pattern)?;
 
-        let mut mmaps: Vec<Mmap> = Vec::with_capacity(shard_paths.len());
-        let mut shard_queries: Vec<usize> = Vec::with_capacity(shard_paths.len());
+        let mut mmaps: Vec<Mmap, System> = Vec::with_capacity_in(shard_paths.len(), System);
+        let mut shard_queries: Vec<usize, System> = Vec::with_capacity_in(shard_paths.len(), System);
         let mut neighbors_per_query: Option<usize> = None;
 
         for shard_path in &shard_paths {

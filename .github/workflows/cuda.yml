@@ -1,0 +1,15 @@
+name: CUDA Checks
+on: workflow_dispatch
+jobs:
+  check:
+    name: Check cuVS Backend on CUDA Worker
+    runs-on: [self-hosted, linux, x64, cuda]
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v4
+      - name: Set Up uv
+        uses: astral-sh/setup-uv@v6
+      - name: Install Nightly Rust with Rustfmt and Clippy
+        run: rustup toolchain install nightly-2026-09-24 --profile minimal --component rustfmt,clippy
+      - name: Format, Lint and Test cuVS Backend
+        run: scripts/check.sh cuvs-backend

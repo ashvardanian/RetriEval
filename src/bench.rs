@@ -3,11 +3,9 @@
 //! This is the library root. Backend binaries (`usearch.rs`, `faiss.rs`, etc.)
 //! import from here and provide their own `main()`.
 
-// `generate.rs` is compiled twice — once as the `retri-generate` binary (its
-// own crate) and once as `pub mod generate` inside this library. The alias
-// below lets items inside `generate.rs` write `retrieval::pod_slice_as_bytes`
-// in both compilation contexts: the binary resolves via the extern crate
-// dependency, the library resolves via this self-alias.
+#![feature(btreemap_alloc)]
+
+// The generator is also compiled as a standalone binary.
 extern crate self as retrieval;
 
 pub mod dataset;
@@ -22,22 +20,28 @@ pub mod output;
 pub mod packed_distance;
 pub mod perf_counters;
 
-#[cfg(feature = "download")]
-pub use error::DownloadError;
-pub use error::{DatasetError, GroundTruthError, PerfCountersError};
-
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Instant;
+use std::{
+    alloc::{Allocator, System},
+    collections::HashMap,
+    fmt,
+    hash::{BuildHasher, Hasher},
+    num::{NonZeroU16, NonZeroUsize},
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 
-pub use dataset::{Dataset, GroundTruth, Keys};
-pub use output::{
-    collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo, PhaseCounters,
-    StepAddEntry, StepEntry, StepSearchEntry,
+#[cfg(feature = "download")]
+pub use crate::error::DownloadError;
+pub use crate::{
+    dataset::{Dataset, GroundTruth, Keys},
+    error::{DatasetError, GroundTruthError, PerfCountersError},
+    output::{
+        collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo, PhaseCounters,
+        StepAddEntry, StepEntry, StepSearchEntry,
+    },
 };
 
 // #region Core types
@@ -65,13 +69,18 @@ pub enum VectorSlice<'a> {
 }
 
 impl VectorSlice<'_> {
-    pub fn to_f32(&self) -> Cow<'_, [Distance]> {
-        match self {
-            VectorSlice::F32(d) => Cow::Borrowed(d),
-            VectorSlice::I8(d) => Cow::Owned(d.iter().map(|&x| x as Distance).collect()),
-            VectorSlice::U8(d) => Cow::Owned(d.iter().map(|&x| x as Distance).collect()),
-            VectorSlice::B1x8(d) => Cow::Owned(d.iter().map(|&x| x as Distance).collect()),
+    pub fn to_f32_in<'a, A: Allocator>(&'a self, scratch: &'a mut Vec<f32, A>) -> Result<&'a [f32], &'static str> {
+        if let Self::F32(values) = self {
+            return Ok(values);
         }
+        scratch.clear();
+        match self {
+            Self::I8(values) => scratch.extend(values.iter().map(|&v| v as f32)),
+            Self::U8(values) => scratch.extend(values.iter().map(|&v| v as f32)),
+            Self::B1x8(_) => return Err("Packed binary input cannot be converted to dense F32 without a bit metric"),
+            Self::F32(_) => unreachable!(),
+        }
+        Ok(scratch)
     }
 }
 
@@ -107,7 +116,7 @@ pub trait Backend: Send {
     fn metadata(&self) -> HashMap<String, Value>;
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String>;
     fn search(
-        &self,
+        &mut self,
         queries: Vectors,
         count: usize,
         out_keys: &mut [Key],
@@ -143,10 +152,10 @@ pub trait Backend: Send {
 /// knobs alongside; naming the fields is what stops `metric` and `data_type`,
 /// or the run of `usize` graph knobs, from being transposed at a call site.
 #[derive(Clone, Copy)]
-pub struct IndexConfig<'a> {
+pub struct IndexConfig<DataType, Metric> {
     pub dimensions: usize,
-    pub data_type: &'a str,
-    pub metric: &'a str,
+    pub data_type: DataType,
+    pub metric: Metric,
     pub connectivity: usize,
     pub expansion_add: usize,
     pub expansion_search: usize,
@@ -178,6 +187,27 @@ pub fn write_row(
         out_distances[slot] = Distance::INFINITY;
     }
     found
+}
+
+/// Reusable owned search storage; adapters receive only borrowed output slices.
+pub struct SearchBuffers<A: Allocator = System> {
+    pub keys: Vec<Key, A>,
+    pub distances: Vec<Distance, A>,
+    pub counts: Vec<usize, A>,
+}
+impl<A: Allocator + Clone> SearchBuffers<A> {
+    pub fn new_in(allocator: A) -> Self {
+        Self {
+            keys: Vec::new_in(allocator.clone()),
+            distances: Vec::new_in(allocator.clone()),
+            counts: Vec::new_in(allocator),
+        }
+    }
+    pub fn resize(&mut self, queries: usize, count: usize) {
+        self.keys.resize(queries * count, Key::MAX);
+        self.distances.resize(queries * count, Distance::INFINITY);
+        self.counts.resize(queries, 0);
+    }
 }
 
 // #region Utilities
@@ -233,24 +263,28 @@ pub struct CommonArgs {
 
     /// Neighbors to request per query — the k every metric is taken at.
     /// Defaults to the ground-truth file's width, and may not exceed it.
-    #[arg(long)]
-    pub search_count: Option<usize>,
+    #[arg(long, value_parser = parse_count_flag)]
+    pub top_k: Option<usize>,
 
-    /// Disable shuffling of insertion order (shuffle is on by default)
-    #[arg(long, default_value_t = false)]
-    pub no_shuffle: bool,
+    /// Order in which base vectors are inserted: `shuffled` by `--seed`, or the file's `original` order
+    #[arg(long, value_enum, default_value = "shuffled")]
+    pub insertion_order: InsertionOrder,
+
+    /// Seed of the shuffled insertion order, or `random` to draw one; 42 when unset
+    #[arg(long, value_parser = parse_seed_flag)]
+    pub seed: Option<Seed>,
 
     /// Number of measurement steps (dataset is split into this many equal parts)
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = parse_count_flag)]
     pub steps: usize,
 
     /// Vectors per backend add() call
-    #[arg(long, default_value_t = 10_000)]
-    pub batch_size_add: usize,
+    #[arg(long, default_value_t = 10_000, value_parser = parse_count_flag)]
+    pub vectors_per_add: usize,
 
     /// Queries per backend search() call
-    #[arg(long, default_value_t = 10_000)]
-    pub batch_size_search: usize,
+    #[arg(long, default_value_t = 10_000, value_parser = parse_count_flag)]
+    pub queries_per_search: usize,
 
     /// Output directory for JSON result files
     #[arg(long)]
@@ -258,7 +292,7 @@ pub struct CommonArgs {
 
     /// Cap the number of base vectors used (for calibration on a slice of a larger file).
     /// Queries and ground truth are unaffected; only the add/permutation range shrinks.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_count_flag)]
     pub max_base_vectors: Option<usize>,
 
     /// Persisted-index handle. For embedded backends (USearch, FAISS, cuVS): a
@@ -267,11 +301,11 @@ pub struct CommonArgs {
     /// backends: a collection / table / index name (not yet implemented).
     /// Requires a single-config sweep — multi-valued sweep axes are rejected
     /// at startup when `--index` is set.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub index: Option<String>,
 
     /// Replay indexed vectors as their own queries and report the fraction that
-    /// retrieve themselves within the top-`--self-search-count` ("self-recall").
+    /// retrieve themselves within the top-`--self-search-top-k` ("self-recall").
     /// Runs once, after the last insertion, and needs no ground truth — a vector
     /// in the index is its own nearest neighbor. Because it can sweep the whole
     /// base rather than a short query file, it is also the only phase that
@@ -281,8 +315,8 @@ pub struct CommonArgs {
 
     /// Neighbors requested per query during the self-recall sweep (the `k` in
     /// self-recall@k). No effect without `--self-search`.
-    #[arg(long, default_value_t = 10)]
-    pub self_search_count: usize,
+    #[arg(long, default_value_t = 10, value_parser = parse_count_flag)]
+    pub self_search_top_k: usize,
 
     /// How many base vectors the self-recall sweep replays. A bare integer ≥ 1
     /// is an absolute count; a value with a decimal point (≤ 1.0) is a fraction
@@ -295,26 +329,44 @@ pub struct CommonArgs {
     /// figure stays clean. On a base whose row order carries structure (sorted,
     /// clustered, or concatenated shards) a partial sweep is therefore not a
     /// representative sample; only the default full sweep is unbiased.
-    #[arg(long, value_name = "N|FRACTION")]
-    pub self_search_sample: Option<String>,
+    #[arg(long, value_name = "N|FRACTION", value_parser = parse_self_search_sample, requires = "self_search")]
+    pub self_search_sample: Option<SelfSearchSample>,
 
     /// Matryoshka-style embedding-dimension truncations to evaluate
     /// (comma-separated). Empty → use the file's native dimensions. Each value must
     /// be ≤ the native dimensions; for `.b1bin` files each must be a multiple of 8.
-    #[arg(long, value_delimiter = ',')]
-    pub dimensions: Vec<usize>,
+    #[arg(long, value_delimiter = ',', value_parser = parse_count_flag)]
+    pub dims: Vec<usize>,
 }
 
+/// Order in which base vectors are inserted.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertionOrder {
+    Shuffled,
+    Original,
+}
+
+impl fmt::Display for InsertionOrder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        spell_value(self, formatter)
+    }
+}
+
+/// Seed of the shuffled insertion order when `--seed` is unset.
+const DEFAULT_SEED: Seed = Seed(42);
+
 impl CommonArgs {
-    /// Resolve `--dimensions` into a sweep list. Empty CLI input expands to a
+    /// Resolve `--dims` into a sweep list. Empty CLI input expands to a
     /// single-element list at the file's native dimensions, so binaries can iterate
     /// uniformly without special-casing the no-truncation path.
-    pub fn dimensions_sweep(&self, native: usize) -> Vec<usize> {
-        if self.dimensions.is_empty() {
-            vec![native]
+    pub fn dimensions_sweep(&self, native: usize) -> Vec<usize, System> {
+        let mut dimensions = Vec::new_in(System);
+        dimensions.extend_from_slice(if self.dims.is_empty() {
+            std::slice::from_ref(&native)
         } else {
-            self.dimensions.clone()
-        }
+            &self.dims
+        });
+        dimensions
     }
 
     /// When `--index` is set, the sweep must collapse to a single config —
@@ -346,50 +398,38 @@ pub struct BenchState {
     pub query_dataset: Dataset,
     pub ground_truth: GroundTruth,
     pub perm: dataset::Permutation,
-    /// Resolved `--search-count`: the search width and the k every metric uses.
-    pub count: usize,
+    /// Seed of the shuffled insertion order, `None` for the original order.
+    pub seed: Option<Seed>,
+    /// Resolved `--top-k`: the search width and the k every metric uses.
+    pub top_k: usize,
     pub steps: usize,
-    pub batch_size_add: usize,
-    pub batch_size_search: usize,
+    pub vectors_per_add: usize,
+    pub queries_per_search: usize,
     pub self_search: bool,
-    pub self_search_count: usize,
-    pub self_search_sample: Option<String>,
+    pub self_search_top_k: usize,
+    pub self_search_sample: Option<SelfSearchSample>,
     pub output_dir: Option<PathBuf>,
     pub machine_info: MachineInfo,
     pub dataset_info: DatasetInfo,
-    out_keys: Vec<Key>,
-    out_distances: Vec<Distance>,
-    out_counts: Vec<usize>,
-    key_scratch: Vec<Key>,
+    search_buffers: SearchBuffers,
+    key_scratch: Vec<Key, System>,
     /// Shared scratch for `Dataset::gather` (during add) and `Dataset::slice`
     /// (during search). Add and search are sequential within a step, so a
     /// single buffer sized at the upper bound is enough. Sized to fit
-    /// `max(batch_size_add, batch_size_search) * native_vector_bytes` —
+    /// `max(vectors_per_add, queries_per_search) * native_vector_bytes` —
     /// covers any truncation since truncated bytes ≤ native.
-    scratch_buf: Vec<u8>,
+    scratch_buf: Vec<u8, System>,
 }
 
 impl BenchState {
     pub fn load(args: &CommonArgs) -> Result<Self, Box<dyn std::error::Error>> {
-        if args.steps == 0 {
-            return Err("--steps must be greater than 0".into());
-        }
-        if args.batch_size_add == 0 {
-            return Err("--batch-size-add must be greater than 0".into());
-        }
-        if args.self_search {
-            if args.self_search_count == 0 {
-                return Err("--self-search-count must be greater than 0".into());
+        let seed = match (args.insertion_order, args.seed) {
+            (InsertionOrder::Shuffled, seed) => Some(seed.unwrap_or(DEFAULT_SEED)),
+            (InsertionOrder::Original, None) => None,
+            (InsertionOrder::Original, Some(_)) => {
+                return Err("--seed applies only to --insertion-order shuffled".into())
             }
-            // Validate the sample spec's grammar now (before the base size is
-            // known); the actual vector count is resolved per-run in
-            // `resolve_self_search_sample`.
-            if let Some(spec) = &args.self_search_sample {
-                parse_self_search_sample(spec)?;
-            }
-        } else if args.self_search_sample.is_some() {
-            return Err("--self-search-sample has no effect without --self-search".into());
-        }
+        };
 
         // Create output directory if specified
         if let Some(dir) = &args.output {
@@ -476,24 +516,45 @@ impl BenchState {
             ground_truth.neighbors_per_query(),
         );
 
-        let perm = if args.no_shuffle {
-            dataset::Permutation::identity(total_vectors)
-        } else {
-            eprintln!("Shuffling insertion order...");
-            dataset::Permutation::shuffled(total_vectors, 42)
-        };
-
         let ground_truth_width = ground_truth.neighbors_per_query();
-        let count = args.search_count.unwrap_or(ground_truth_width);
-        if count == 0 {
-            return Err("--search-count must be greater than 0".into());
+        let top_k = args.top_k.unwrap_or(ground_truth_width);
+        if top_k > ground_truth_width {
+            return Err(
+                format!("--top-k {top_k} exceeds the ground truth's {ground_truth_width} neighbors per query").into(),
+            );
         }
-        if count > ground_truth_width {
-            return Err(format!(
-                "--search-count {count} exceeds the ground truth's {ground_truth_width} neighbors per query"
-            )
-            .into());
+
+        eprintln!("- Insertion order: {}", args.insertion_order);
+        if let Some(seed) = seed {
+            eprintln!("- Seed: {seed}");
         }
+        eprintln!("- Top k: {top_k}");
+        eprintln!("- Dims: {}", spell_list(&args.dimensions_sweep(dimensions)));
+        eprintln!("- Steps: {}", args.steps);
+        eprintln!("- Vectors per add: {}", args.vectors_per_add);
+        eprintln!("- Queries per search: {}", args.queries_per_search);
+        match args.max_base_vectors {
+            Some(count) => eprintln!("- Max base vectors: {count}"),
+            None => eprintln!("- Max base vectors: all"),
+        }
+        eprintln!("- Index: {}", args.index.as_deref().unwrap_or("none"));
+        eprintln!("- Self-search: {}", args.self_search);
+        if args.self_search {
+            eprintln!("- Self-search top k: {}", args.self_search_top_k);
+            match args.self_search_sample {
+                Some(sample) => eprintln!("- Self-search sample: {sample}"),
+                None => eprintln!("- Self-search sample: all"),
+            }
+        }
+        match &args.output {
+            Some(path) => eprintln!("- Output: {}", path.display()),
+            None => eprintln!("- Output: none"),
+        }
+
+        let perm = match seed {
+            None => dataset::Permutation::identity(total_vectors),
+            Some(seed) => dataset::Permutation::shuffled(total_vectors, seed),
+        };
 
         let dataset_info = DatasetInfo {
             base_vectors_path: args.base_vectors.display().to_string(),
@@ -508,24 +569,35 @@ impl BenchState {
         Ok(Self {
             total_vectors,
             perm,
-            count,
+            seed,
+            top_k,
             steps: args.steps,
-            batch_size_add: args.batch_size_add,
-            batch_size_search: args.batch_size_search,
+            vectors_per_add: args.vectors_per_add,
+            queries_per_search: args.queries_per_search,
             self_search: args.self_search,
-            self_search_count: args.self_search_count,
-            self_search_sample: args.self_search_sample.clone(),
+            self_search_top_k: args.self_search_top_k,
+            self_search_sample: args.self_search_sample,
             output_dir: args.output.clone(),
             machine_info,
             dataset_info,
-            out_keys: vec![0 as Key; num_queries * count],
-            out_distances: vec![0.0 as Distance; num_queries * count],
-            out_counts: vec![0usize; num_queries],
-            key_scratch: vec![0 as Key; args.batch_size_add],
+            search_buffers: {
+                let mut buffers = SearchBuffers::new_in(System);
+                buffers.resize(num_queries, top_k);
+                buffers
+            },
+            key_scratch: {
+                let mut values = Vec::new_in(System);
+                values.resize(args.vectors_per_add, 0 as Key);
+                values
+            },
             scratch_buf: {
-                let max_batch = args.batch_size_add.max(args.batch_size_search);
+                let max_batch = args.vectors_per_add.max(args.queries_per_search);
                 let max_row_bytes = dataset.vector_bytes().max(query_dataset.vector_bytes());
-                vec![0u8; max_batch * max_row_bytes]
+                {
+                    let mut values = Vec::new_in(System);
+                    values.resize(max_batch * max_row_bytes, 0u8);
+                    values
+                }
             },
             dataset,
             keys,
@@ -595,7 +667,7 @@ struct StepSlice {
     dimensions: usize,
 }
 
-/// Insert one step's slice in `batch_size_add` chunks, capturing perf counters
+/// Insert one step's slice in `vectors_per_add` chunks, capturing perf counters
 /// across the phase. Advances `vectors_indexed` to the new cumulative count.
 fn run_add_phase(
     backend: &mut dyn Backend,
@@ -611,7 +683,7 @@ fn run_add_phase(
         dimensions,
     } = slice;
     let total_vectors = state.total_vectors;
-    let batch_size_add = state.batch_size_add;
+    let vectors_per_add = state.vectors_per_add;
 
     let progress = ProgressBar::new(total_vectors as u64);
     progress.set_style(progress_style.clone());
@@ -621,7 +693,7 @@ fn run_add_phase(
     let add_start = Instant::now();
     let mut added = 0;
     while added < step_count {
-        let batch = batch_size_add.min(step_count - added);
+        let batch = vectors_per_add.min(step_count - added);
         let logical_offset = step_start + added;
         let indices = state.perm.range(logical_offset, batch);
 
@@ -674,7 +746,7 @@ fn run_add_phase(
 /// only affects normalization; `is_final_step` drops the `~` from the progress
 /// line once the index is complete.
 fn run_search_phase(
-    backend: &dyn Backend,
+    backend: &mut dyn Backend,
     state: &mut BenchState,
     perf: &mut Option<perf_counters::PerfCounters>,
     progress_style: &ProgressStyle,
@@ -683,7 +755,7 @@ fn run_search_phase(
     is_final_step: bool,
 ) -> BenchResult<StepSearchEntry> {
     let num_queries = state.query_dataset.rows();
-    let count = state.count;
+    let count = state.top_k;
 
     let progress = ProgressBar::new(num_queries as u64);
     progress.set_style(progress_style.clone());
@@ -693,7 +765,7 @@ fn run_search_phase(
     let search_start = Instant::now();
     let mut searched = 0usize;
     while searched < num_queries {
-        let batch_rows = state.batch_size_search.min(num_queries - searched);
+        let batch_rows = state.queries_per_search.min(num_queries - searched);
         let batch_queries = state
             .query_dataset
             .slice(searched, batch_rows, dimensions, &mut state.scratch_buf);
@@ -703,9 +775,9 @@ fn run_search_phase(
         backend.search(
             batch_queries,
             count,
-            &mut state.out_keys[key_offset..key_end],
-            &mut state.out_distances[key_offset..key_end],
-            &mut state.out_counts[searched..searched + batch_rows],
+            &mut state.search_buffers.keys[key_offset..key_end],
+            &mut state.search_buffers.distances[key_offset..key_end],
+            &mut state.search_buffers.counts[searched..searched + batch_rows],
         )?;
 
         searched += batch_rows;
@@ -731,11 +803,34 @@ fn run_search_phase(
     } else {
         0
     };
-    let recall_at_1 = eval::recall_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, 1);
-    let recall_at_k = eval::recall_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, count);
-    let intersection_at_k =
-        eval::intersection_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, count);
-    let ndcg_at_k = eval::ndcg_at_k(&state.out_keys, &state.out_counts, count, &state.ground_truth, count);
+    let recall_at_1 = eval::recall_at_k(
+        &state.search_buffers.keys,
+        &state.search_buffers.counts,
+        count,
+        &state.ground_truth,
+        1,
+    );
+    let recall_at_k = eval::recall_at_k(
+        &state.search_buffers.keys,
+        &state.search_buffers.counts,
+        count,
+        &state.ground_truth,
+        count,
+    );
+    let intersection_at_k = eval::intersection_at_k(
+        &state.search_buffers.keys,
+        &state.search_buffers.counts,
+        count,
+        &state.ground_truth,
+        count,
+    );
+    let ndcg_at_k = eval::ndcg_at_k(
+        &state.search_buffers.keys,
+        &state.search_buffers.counts,
+        count,
+        &state.ground_truth,
+        count,
+    );
 
     // Metrics are raw. A step that holds only part of the base cannot find the
     // ground truth it does not hold, so the coverage share is printed alongside
@@ -755,7 +850,7 @@ fn run_search_phase(
 
     Ok(StepSearchEntry {
         queries: num_queries,
-        neighbor_count: count,
+        top_k: count,
         elapsed: elapsed_secs,
         throughput: throughput_per_sec,
         recall_at_1,
@@ -776,7 +871,7 @@ fn run_search_phase(
 /// of host buffers to hold an answer we reduce to a single counter. Requesting
 /// `count` neighbors also yields self-recall@1 for free, so both are reported.
 fn run_self_search_phase(
-    backend: &dyn Backend,
+    backend: &mut dyn Backend,
     state: &mut BenchState,
     perf: &mut Option<perf_counters::PerfCounters>,
     progress_style: &ProgressStyle,
@@ -784,11 +879,27 @@ fn run_self_search_phase(
     num_queries: usize,
     dimensions: usize,
 ) -> BenchResult<StepSearchEntry> {
-    let batch_size = state.batch_size_search.min(num_queries).max(1);
-    let mut batch_keys = vec![0 as Key; batch_size * count];
-    let mut batch_distances = vec![0.0 as Distance; batch_size * count];
-    let mut batch_counts = vec![0usize; batch_size];
-    let mut expected_scratch = vec![0 as Key; batch_size];
+    let batch_size = state.queries_per_search.min(num_queries).max(1);
+    let mut batch_keys = {
+        let mut values = Vec::new_in(System);
+        values.resize(batch_size * count, 0 as Key);
+        values
+    };
+    let mut batch_distances = {
+        let mut values = Vec::new_in(System);
+        values.resize(batch_size * count, 0.0 as Distance);
+        values
+    };
+    let mut batch_counts = {
+        let mut values = Vec::new_in(System);
+        values.resize(batch_size, 0usize);
+        values
+    };
+    let mut expected_scratch = {
+        let mut values = Vec::new_in(System);
+        values.resize(batch_size, 0 as Key);
+        values
+    };
 
     let progress = ProgressBar::new(num_queries as u64);
     progress.set_style(progress_style.clone());
@@ -853,7 +964,7 @@ fn run_self_search_phase(
 
     Ok(StepSearchEntry {
         queries: num_queries,
-        neighbor_count: count,
+        top_k: count,
         elapsed,
         throughput,
         recall_at_1,
@@ -868,60 +979,55 @@ fn run_self_search_phase(
 
 /// Parsed form of `--self-search-sample`. A value containing a decimal point is
 /// a fraction of the base (`≤ 1.0`); a bare integer is an absolute vector count.
-enum SelfSearchSample {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SelfSearchSample {
     Fraction(f64),
     Absolute(usize),
 }
 
-/// Validate the grammar of a `--self-search-sample` spec. The base size isn't
-/// known at CLI-parse time, so resolution to a concrete count is deferred to
-/// `resolve_self_search_sample`.
-fn parse_self_search_sample(spec: &str) -> Result<SelfSearchSample, String> {
-    let trimmed = spec.trim();
-    if trimmed.contains('.') {
-        let fraction: f64 = trimmed
-            .parse()
-            .map_err(|_| format!("--self-search-sample: invalid fraction `{spec}`"))?;
-        if !(fraction > 0.0 && fraction <= 1.0) {
-            return Err(format!(
-                "--self-search-sample fraction must be in (0.0, 1.0], got {fraction}"
-            ));
+impl fmt::Display for SelfSearchSample {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fraction(fraction) => write!(formatter, "{fraction:?}"),
+            Self::Absolute(count) => write!(formatter, "{count}"),
         }
-        Ok(SelfSearchSample::Fraction(fraction))
-    } else {
-        let count: usize = trimmed
-            .parse()
-            .map_err(|_| format!("--self-search-sample: invalid count `{spec}`"))?;
-        if count == 0 {
-            return Err("--self-search-sample count must be greater than 0".into());
-        }
-        Ok(SelfSearchSample::Absolute(count))
     }
+}
+
+/// Parse a `--self-search-sample` spec. The base size isn't known at CLI-parse
+/// time, so resolution to a concrete count is deferred to `resolve_self_search_sample`.
+fn parse_self_search_sample(spec: &str) -> Result<SelfSearchSample, String> {
+    let sample = if spec.contains('.') {
+        let digits = spec.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.');
+        digits
+            .then(|| spec.parse().ok())
+            .flatten()
+            .filter(|fraction| *fraction > 0.0 && *fraction <= 1.0)
+            .map(SelfSearchSample::Fraction)
+    } else {
+        parse_count(spec).map(SelfSearchSample::Absolute)
+    };
+    sample.ok_or_else(|| "expected a positive count like 1000 or a fraction like 0.1".into())
 }
 
 /// Resolve a sample spec against the number of indexed vectors. `None` → all.
 /// A fraction rounds to at least one vector; an absolute count is clamped to
 /// what is actually in the index.
-fn resolve_self_search_sample(spec: Option<&str>, vectors_indexed: usize) -> Result<usize, String> {
-    Ok(match spec {
+fn resolve_self_search_sample(sample: Option<SelfSearchSample>, vectors_indexed: usize) -> usize {
+    match sample {
         None => vectors_indexed,
-        Some(spec) => match parse_self_search_sample(spec)? {
-            SelfSearchSample::Fraction(fraction) => ((vectors_indexed as f64 * fraction).round() as usize).max(1),
-            SelfSearchSample::Absolute(count) => count.min(vectors_indexed),
-        },
-    })
+        Some(SelfSearchSample::Fraction(fraction)) => ((vectors_indexed as f64 * fraction).round() as usize).max(1),
+        Some(SelfSearchSample::Absolute(count)) => count.min(vectors_indexed),
+    }
 }
 
 /// Resolve how many vectors the self-recall sweep should replay, given how many
-/// are actually in the index. `None` when `--self-search` was not passed. The
-/// sample grammar is validated in `BenchState::load`, so resolution here is
-/// infallible in practice.
+/// are actually in the index. `None` when `--self-search` was not passed.
 fn self_search_query_count(state: &BenchState, vectors_indexed: usize) -> Option<usize> {
     if !state.self_search {
         return None;
     }
-    let resolved = resolve_self_search_sample(state.self_search_sample.as_deref(), vectors_indexed)
-        .expect("self-recall sample spec validated at load");
+    let resolved = resolve_self_search_sample(state.self_search_sample, vectors_indexed);
     (resolved > 0).then_some(resolved)
 }
 
@@ -946,17 +1052,18 @@ fn save_report(
     };
 
     // Every harness-level flag that changes what was measured belongs in the
-    // hash, centrally: leaving it to each backend is how `--dimensions` came to
+    // hash, centrally: leaving it to each backend is how `--dims` came to
     // be missing on two of them, silently overwriting result files. Backends
     // contribute only their engine-specific knobs.
     metadata.insert("dimensions".into(), Value::from(dimensions));
     metadata.insert("vectors_count".into(), Value::from(state.total_vectors));
+    metadata.insert("seed".into(), Value::from(state.seed.map(|seed| seed.0)));
     metadata.insert("steps".into(), Value::from(state.steps));
-    metadata.insert("batch_size_add".into(), Value::from(state.batch_size_add));
-    metadata.insert("batch_size_search".into(), Value::from(state.batch_size_search));
-    metadata.insert("search_count".into(), Value::from(state.count));
+    metadata.insert("vectors_per_add".into(), Value::from(state.vectors_per_add));
+    metadata.insert("queries_per_search".into(), Value::from(state.queries_per_search));
+    metadata.insert("top_k".into(), Value::from(state.top_k));
     if let Some(entry) = steps.last().and_then(|step| step.self_search.as_ref()) {
-        metadata.insert("self_search_count".into(), Value::from(entry.neighbor_count));
+        metadata.insert("self_search_top_k".into(), Value::from(entry.top_k));
         metadata.insert("self_search_sample".into(), Value::from(entry.queries));
     }
     let backend_name = metadata.get("backend").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -1073,7 +1180,7 @@ pub fn run(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize)
             state,
             &mut perf,
             &self_search_style(),
-            state.self_search_count,
+            state.self_search_top_k,
             queries,
             dimensions,
         )?;
@@ -1085,7 +1192,7 @@ pub fn run(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize)
     let peak_memory = steps.iter().map(|s| s.memory_bytes).max().unwrap_or(0);
     save_report(state, metadata, dimensions, steps)?;
 
-    eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / 1e9);
+    eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / (1u64 << 30) as f64);
     eprintln!();
     Ok(())
 }
@@ -1094,7 +1201,7 @@ pub fn run(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize)
 /// add phase. Emits a single `StepEntry` whose `add_*` fields are zero /
 /// `None`. `dimensions` is the per-vector dimensionality the loaded index expects
 /// (queries are sliced at this dimensions before being handed to `search`).
-pub fn run_search_only(backend: &dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
+pub fn run_search_only(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
     // A loaded index need not cover the same slice of the base as this run's
     // `--max-base-vectors` implies — it was built by an earlier invocation with
     // its own flags. Prefer the backend's own count; self-recall in particular
@@ -1156,7 +1263,7 @@ pub fn run_search_only(backend: &dyn Backend, state: &mut BenchState, dimensions
             state,
             &mut perf,
             &self_search_style(),
-            state.self_search_count,
+            state.self_search_top_k,
             queries,
             dimensions,
         )?);
@@ -1165,7 +1272,7 @@ pub fn run_search_only(backend: &dyn Backend, state: &mut BenchState, dimensions
     let peak_memory = step.memory_bytes;
     save_report(state, metadata, dimensions, vec![step])?;
 
-    eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / 1e9);
+    eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / (1u64 << 30) as f64);
     eprintln!();
     Ok(())
 }
@@ -1243,7 +1350,7 @@ where
     if load_existing {
         let h = handle.unwrap();
         match load(h) {
-            Ok(idx) => match run_search_only(&idx, state, dimensions) {
+            Ok(mut idx) => match run_search_only(&mut idx, state, dimensions) {
                 Ok(()) => ConfigOutcome::Ran,
                 Err(err) => {
                     eprintln!("\n── {description} (loaded) — failed ──\n  {err}");
@@ -1317,6 +1424,206 @@ pub fn bail(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Parses the command line; a bad value prints `--name="value" does not parse, expected ...` and exits with 1.
+pub fn parse_cli<T: clap::Parser>() -> T {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    let error = match T::try_parse() {
+        Ok(cli) => return cli,
+        Err(error) if !error.use_stderr() => error.exit(),
+        Err(error) => error,
+    };
+    let context = |kind| match error.get(kind) {
+        Some(ContextValue::String(text)) => text.as_str(),
+        _ => "",
+    };
+    let expected = match (
+        error.kind(),
+        std::error::Error::source(&error),
+        error.get(ContextKind::ValidValue),
+    ) {
+        (ErrorKind::ValueValidation, Some(expected), _) => expected.to_string(),
+        (ErrorKind::InvalidValue, _, Some(ContextValue::Strings(values))) if !values.is_empty() => {
+            format!("expected one of {}", values.join(", "))
+        }
+        (ErrorKind::InvalidValue, _, _) => "expected a non-empty value".into(),
+        _ => {
+            eprint!("{error}");
+            std::process::exit(1)
+        }
+    };
+    let flag = context(ContextKind::InvalidArg).split(' ').next().unwrap_or_default();
+    eprintln!(
+        "{flag}=\"{}\" does not parse, {expected}",
+        context(ContextKind::InvalidValue)
+    );
+    std::process::exit(1)
+}
+
+/// Parses a 32-bit unsigned integer, or `random` as 32 bits from the OS entropy source.
+pub fn parse_seed(text: &str) -> Option<Seed> {
+    if text == "random" {
+        return Some(Seed(std::hash::RandomState::new().build_hasher().finish() as u32));
+    }
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    digits.then(|| text.parse().ok().map(Seed)).flatten()
+}
+
+/// Parses a thread count like `8`, or `0` as `all_cores`.
+pub fn parse_threads(text: &str, all_cores: NonZeroUsize) -> Option<Threads> {
+    match text {
+        "0" => Some(Threads(all_cores)),
+        _ => parse_count(text).and_then(NonZeroUsize::new).map(Threads),
+    }
+}
+
+/// Parses a positive whole number in ASCII digits, like `128`; zero is `None`.
+pub fn parse_count(text: &str) -> Option<usize> {
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    digits.then(|| text.parse().ok()).flatten().filter(|&count| count != 0)
+}
+
+/// Parses a duration like `200ms` or `10s`; a bare number, a fraction or zero is `None`.
+pub fn parse_duration(text: &str) -> Option<Duration> {
+    match text.strip_suffix("ms") {
+        Some(count) => parse_count(count).map(|count| Duration::from_millis(count as u64)),
+        None => parse_count(text.strip_suffix('s')?).map(|count| Duration::from_secs(count as u64)),
+    }
+}
+
+/// Spells a duration the way `parse_duration` reads it: `1s`, `1500ms`.
+pub fn spell_duration(duration: Duration) -> String {
+    let milliseconds = duration.as_millis();
+    match milliseconds % 1000 {
+        0 => format!("{}s", milliseconds / 1000),
+        _ => format!("{milliseconds}ms"),
+    }
+}
+
+/// A 32-bit run seed, an integer or drawn from the OS for `random`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seed(pub u32);
+
+impl From<Seed> for u64 {
+    fn from(seed: Seed) -> u64 {
+        u64::from(seed.0)
+    }
+}
+
+impl fmt::Display for Seed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// A thread count; `0` in the variable resolves to every core when read, so it is never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Threads(pub NonZeroUsize);
+
+impl Threads {
+    pub const ONE: Threads = Threads(NonZeroUsize::MIN);
+}
+
+impl fmt::Display for Threads {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// SplitMix64's increment, the golden ratio in 64 bits.
+const SPLITMIX64_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// SplitMix64's finalizer, a bijection that spreads every input bit over the whole output.
+pub fn mix(value: u64) -> u64 {
+    let value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// The key of stream `index` of `name`, two mixes away from `seed`, so neighboring seeds and indices never meet.
+pub fn stream_key(seed: Seed, name: &str, index: u64) -> u64 {
+    let hashed = name.bytes().fold(0xCBF2_9CE4_8422_2325, |hash: u64, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
+    });
+    mix(mix(u64::from(seed) ^ hashed).wrapping_add(index))
+}
+
+/// A SplitMix64 stream seeded with a `stream_key`, bit-identical to the C++ `splitmix64_t`.
+pub struct SplitMix64 {
+    pub state: u64,
+}
+
+impl SplitMix64 {
+    /// The next 64 random bits.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(SPLITMIX64_GAMMA);
+        mix(self.state)
+    }
+
+    /// A draw below `bound`: the high half of a draw times `bound`, with a bias of at most `bound` over 2^64.
+    pub fn below(&mut self, bound: u64) -> u64 {
+        ((u128::from(self.next()) * u128::from(bound)) >> 64) as u64
+    }
+}
+
+/// A TCP port; `0` is rejected at parse time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Port(pub NonZeroU16);
+
+impl From<Port> for u16 {
+    fn from(port: Port) -> u16 {
+        port.0.get()
+    }
+}
+
+impl fmt::Display for Port {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// `parse_count` for clap.
+pub fn parse_count_flag(text: &str) -> Result<usize, String> {
+    parse_count(text).ok_or_else(|| "expected a positive count".into())
+}
+
+/// `parse_threads` for clap, with `0` resolved to every available core.
+pub fn parse_threads_flag(text: &str) -> Result<Threads, String> {
+    let all_cores = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+    parse_threads(text, all_cores).ok_or_else(|| "expected a count, 0 for all cores".into())
+}
+
+/// `parse_seed` for clap.
+pub fn parse_seed_flag(text: &str) -> Result<Seed, String> {
+    parse_seed(text).ok_or_else(|| "expected an unsigned integer or random".into())
+}
+
+/// `parse_duration` for clap.
+pub fn parse_duration_flag(text: &str) -> Result<Duration, String> {
+    parse_duration(text).ok_or_else(|| "expected a duration like 200ms or 10s".into())
+}
+
+/// Parses a TCP port from 1 to 65535.
+pub fn parse_port(text: &str) -> Result<Port, String> {
+    parse_count(text)
+        .and_then(|port| u16::try_from(port).ok())
+        .and_then(NonZeroU16::new)
+        .map(Port)
+        .ok_or_else(|| "expected a port from 1 to 65535".into())
+}
+
+/// Writes a `clap::ValueEnum` value the way its flag spells it, for `Display` impls.
+pub fn spell_value<T: clap::ValueEnum>(value: &T, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let possible = value.to_possible_value().expect("every variant has a name");
+    formatter.write_str(possible.get_name())
+}
+
+/// Spells a list the way a comma-separated sweep flag reads it: `16,32`.
+pub fn spell_list<T: fmt::Display>(values: &[T]) -> String {
+    values.iter().map(T::to_string).collect::<Vec<_>>().join(",")
+}
+
 /// Sugar for the recurring `result.unwrap_or_else(|e| bail(&format!("{prefix}: {e}")))`
 /// pattern that flows up out of `BenchState::load`, `state.check_dimensions(...)`,
 /// and the various backend constructors. The error variant is rendered with
@@ -1339,45 +1646,83 @@ impl<T, E: std::fmt::Display> UnwrapOrBail<T> for Result<T, E> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_self_search_sample, SelfSearchSample};
+    use std::alloc::System;
+
+    use super::{
+        parse_self_search_sample, resolve_self_search_sample, SearchBuffers, SelfSearchSample, SplitMix64, VectorSlice,
+    };
+
+    #[test]
+    fn owned_search_and_conversion_buffers_reuse_allocations() {
+        let mut buffers = SearchBuffers::new_in(System);
+        buffers.resize(8, 4);
+        let pointers = (
+            buffers.keys.as_ptr(),
+            buffers.distances.as_ptr(),
+            buffers.counts.as_ptr(),
+        );
+        buffers.resize(3, 4);
+        assert_eq!(
+            pointers,
+            (
+                buffers.keys.as_ptr(),
+                buffers.distances.as_ptr(),
+                buffers.counts.as_ptr()
+            )
+        );
+        let mut scratch = Vec::new_in(System);
+        assert_eq!(VectorSlice::I8(&[-2, 3]).to_f32_in(&mut scratch).unwrap(), [-2.0, 3.0]);
+        let pointer = scratch.as_ptr();
+        assert_eq!(VectorSlice::U8(&[7]).to_f32_in(&mut scratch).unwrap(), [7.0]);
+        assert_eq!(pointer, scratch.as_ptr());
+        let source = [2.0, 4.0];
+        assert_eq!(
+            VectorSlice::F32(&source).to_f32_in(&mut scratch).unwrap().as_ptr(),
+            source.as_ptr()
+        );
+    }
 
     #[test]
     fn self_recall_sample_none_is_all() {
-        assert_eq!(resolve_self_search_sample(None, 1000).unwrap(), 1000);
+        assert_eq!(resolve_self_search_sample(None, 1000), 1000);
     }
 
     #[test]
     fn self_recall_sample_absolute_is_clamped() {
-        assert_eq!(resolve_self_search_sample(Some("250"), 1000).unwrap(), 250);
-        assert_eq!(resolve_self_search_sample(Some("5000"), 1000).unwrap(), 1000);
+        let resolve = |spec| resolve_self_search_sample(Some(parse_self_search_sample(spec).unwrap()), 1000);
+        assert_eq!(resolve("250"), 250);
+        assert_eq!(resolve("5000"), 1000);
     }
 
     #[test]
     fn self_recall_sample_fraction_rounds_and_floors_at_one() {
-        assert_eq!(resolve_self_search_sample(Some("0.1"), 1000).unwrap(), 100);
-        assert_eq!(resolve_self_search_sample(Some("1.0"), 1000).unwrap(), 1000);
+        let resolve = |spec| resolve_self_search_sample(Some(parse_self_search_sample(spec).unwrap()), 1000);
+        assert_eq!(resolve("0.1"), 100);
+        assert_eq!(resolve("1.0"), 1000);
         // A fraction so small it would round to zero still yields one vector.
-        assert_eq!(resolve_self_search_sample(Some("0.0001"), 1000).unwrap(), 1);
+        assert_eq!(resolve("0.0001"), 1);
     }
 
     #[test]
     fn self_recall_sample_one_vs_one_point_zero_disambiguate() {
         // `1` is an absolute count; `1.0` is the whole base.
-        assert!(matches!(
-            super::parse_self_search_sample("1").unwrap(),
-            SelfSearchSample::Absolute(1)
-        ));
-        assert!(matches!(
-            super::parse_self_search_sample("1.0").unwrap(),
-            SelfSearchSample::Fraction(_)
-        ));
+        assert_eq!(parse_self_search_sample("1").unwrap(), SelfSearchSample::Absolute(1));
+        assert_eq!(
+            parse_self_search_sample("1.0").unwrap(),
+            SelfSearchSample::Fraction(1.0)
+        );
+        assert_eq!(SelfSearchSample::Fraction(1.0).to_string(), "1.0");
     }
 
     #[test]
-    fn self_recall_sample_rejects_zero_and_out_of_range() {
-        assert!(resolve_self_search_sample(Some("0"), 1000).is_err());
-        assert!(resolve_self_search_sample(Some("0.0"), 1000).is_err());
-        assert!(resolve_self_search_sample(Some("1.5"), 1000).is_err());
-        assert!(resolve_self_search_sample(Some("abc"), 1000).is_err());
+    fn self_recall_sample_rejects_zero_signs_and_out_of_range() {
+        for spec in ["0", "0.0", "1.5", "abc", "+5", "+0.5", "-0.5", "1e-3"] {
+            assert!(parse_self_search_sample(spec).is_err(), "{spec}");
+        }
+    }
+
+    #[test]
+    fn splitmix64_matches_the_shared_test_vector() {
+        assert_eq!(SplitMix64 { state: 42 }.next(), 0xbdd7_3226_2feb_6e95);
     }
 }

@@ -37,21 +37,23 @@
 //!     --query-vectors datasets/binary_1M/query.10K.b1bin \
 //!     --query-neighbors datasets/binary_1M/groundtruth.10K.ibin \
 //!     --data-type b1 \
-//!     --metric hamming \
 //!     --output results/binary_1M
 //! ```
 
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use clap::Parser;
-use faiss::index::io::{read_index, write_index};
-use faiss::Index as _;
-use itertools::iproduct;
-use retrieval::{
-    run_config, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary, UnwrapOrBail, Vectors,
+use faiss::{
+    index::io::{read_index, write_index},
+    Index as _,
 };
+use itertools::iproduct;
 use serde_json::{json, Value};
+
+use retrieval::{
+    run_config, spell_list, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary, Threads,
+    UnwrapOrBail, Vectors,
+};
 
 extern "C" {
     fn omp_set_num_threads(num_threads: i32);
@@ -136,53 +138,84 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Comma-separated quantization types: f32, f16, bf16, u8, i8, b1
-    #[arg(long, value_delimiter = ',', default_value = "bf16")]
-    data_type: Vec<String>,
+    /// Quantization types (comma-separated for sweep)
+    #[arg(long, value_delimiter = ',', value_enum, default_value = "bf16")]
+    data_type: Vec<DataType>,
 
-    /// Comma-separated distance metrics: ip, l2
-    #[arg(long, value_delimiter = ',', default_value = "l2")]
-    metric: Vec<String>,
+    /// Distance metrics (comma-separated for sweep); binary data always uses Hamming
+    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    metric: Vec<Metric>,
 
     /// HNSW connectivity parameter (M), comma-separated for sweep
-    #[arg(long, value_delimiter = ',', default_value = "32")]
+    #[arg(long, value_delimiter = ',', default_value = "32", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// HNSW expansion factor during indexing, comma-separated for sweep
-    #[arg(long, value_delimiter = ',', default_value = "128")]
+    #[arg(long, value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// HNSW expansion factor during search, comma-separated for sweep
-    #[arg(long, value_delimiter = ',', default_value = "64")]
+    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
     /// Number of threads (sets OMP_NUM_THREADS)
-    #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
-    threads: usize,
+    #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
+    threads: Threads,
 }
 
-fn parse_metric(s: &str) -> Result<(&'static str, faiss::MetricType), String> {
-    match s {
-        "ip" => Ok(("ip", faiss::MetricType::InnerProduct)),
-        "l2" | "l2sq" => Ok(("l2", faiss::MetricType::L2)),
-        _ => Err(format!("unknown FAISS metric: {s}. FAISS HNSW supports: ip, l2")),
+/// FAISS storage types, as `--data-type` spells them.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum DataType {
+    F32,
+    F16,
+    Bf16,
+    U8,
+    I8,
+    B1,
+}
+
+impl fmt::Display for DataType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
     }
 }
 
-fn index_factory_string(data_type: &str, connectivity: usize) -> Result<String, String> {
+/// FAISS HNSW metrics, as `--metric` spells them.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Metric {
+    Ip,
+    #[value(alias = "l2sq")]
+    L2,
+}
+
+impl From<Metric> for faiss::MetricType {
+    fn from(metric: Metric) -> Self {
+        match metric {
+            Metric::Ip => Self::InnerProduct,
+            Metric::L2 => Self::L2,
+        }
+    }
+}
+
+impl fmt::Display for Metric {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
+    }
+}
+
+fn index_factory_string(data_type: DataType, connectivity: usize) -> String {
     // `IDMap,…` wraps the inner index so FAISS persists our keys natively
     // alongside the vectors — `add_with_ids` / `read_index` round-trip the
     // (key, vector) pairs without us shadowing them in a sidecar.
     // Binary HNSW has no `IDMapBinary` analogue exposed via faiss-sys 0.7,
     // so the binary path keeps the bare factory and a translation table.
     match data_type {
-        "f32" => Ok(format!("IDMap,HNSW{connectivity},Flat")),
-        "f16" => Ok(format!("IDMap,HNSW{connectivity},SQfp16")),
-        "bf16" => Ok(format!("IDMap,HNSW{connectivity},SQbf16")),
-        "u8" => Ok(format!("IDMap,HNSW{connectivity},SQ8_direct")),
-        "i8" => Ok(format!("IDMap,HNSW{connectivity},SQ8_direct_signed")),
-        "b1" => Ok(format!("BHNSW{connectivity}")),
-        _ => Err(format!("unknown FAISS data_type: {data_type}")),
+        DataType::F32 => format!("IDMap,HNSW{connectivity},Flat"),
+        DataType::F16 => format!("IDMap,HNSW{connectivity},SQfp16"),
+        DataType::Bf16 => format!("IDMap,HNSW{connectivity},SQbf16"),
+        DataType::U8 => format!("IDMap,HNSW{connectivity},SQ8_direct"),
+        DataType::I8 => format!("IDMap,HNSW{connectivity},SQ8_direct_signed"),
+        DataType::B1 => format!("BHNSW{connectivity}"),
     }
 }
 
@@ -191,10 +224,6 @@ fn metric_label_for(metric: faiss::MetricType) -> &'static str {
         faiss::MetricType::InnerProduct => "ip",
         faiss::MetricType::L2 => "l2",
     }
-}
-
-fn is_binary(data_type: &str) -> bool {
-    data_type == "b1"
 }
 
 /// Buffers one query batch's results, translating FAISS's internal sequential
@@ -239,42 +268,40 @@ fn unpack_search_results<D: Copy>(
 }
 
 enum FaissIndex {
-    Float(UnsafeCell<faiss::index::IndexImpl>),
-    Binary(UnsafeCell<faiss::index::BinaryIndexImpl>),
+    Float(faiss::index::IndexImpl),
+    Binary(faiss::index::BinaryIndexImpl),
 }
 
 struct FaissBackend {
+    scratch: Vec<f32, std::alloc::System>,
+    ids: Vec<faiss::Idx, std::alloc::System>,
     index: FaissIndex,
     /// Translation table from FAISS internal sequential ID → our Key. Only
     /// populated for binary indexes — float indexes use the `IDMap` factory
     /// prefix, so FAISS persists keys natively and search returns them in
     /// `result.labels` directly.
-    binary_key_map: Option<Vec<Key>>,
+    binary_key_map: Option<Vec<Key, std::alloc::System>>,
     description: String,
     metadata: HashMap<String, Value>,
 }
 
-// SAFETY: FAISS manages its own thread safety via OpenMP.
-unsafe impl Send for FaissBackend {}
-unsafe impl Sync for FaissBackend {}
-
 impl FaissBackend {
-    fn new(config: IndexConfig<'_>, threads: usize) -> Result<Self, String> {
+    fn new(config: IndexConfig<DataType, Metric>, threads: Threads) -> Result<Self, String> {
         let IndexConfig {
             dimensions,
-            data_type: data_type_name,
-            metric: metric_name,
+            data_type,
+            metric,
             connectivity,
             expansion_add,
             expansion_search,
         } = config;
 
         unsafe {
-            omp_set_num_threads(threads as i32);
+            omp_set_num_threads(threads.0.get() as i32);
         }
 
-        let factory = index_factory_string(data_type_name, connectivity)?;
-        let binary = is_binary(data_type_name);
+        let factory = index_factory_string(data_type, connectivity);
+        let binary = data_type == DataType::B1;
 
         // For binary indices, dimensions is already in bits (from .b1bin header).
         // For float indices, dimensions is the scalar count.
@@ -283,12 +310,11 @@ impl FaissBackend {
         let (metric_label, index) = if binary {
             let index = faiss::index::index_binary_factory(dimensions, &factory)
                 .map_err(|e| format!("failed to create FAISS binary index: {e}"))?;
-            ("hamming", FaissIndex::Binary(UnsafeCell::new(index)))
+            ("hamming", FaissIndex::Binary(index))
         } else {
-            let (label, faiss_metric) = parse_metric(metric_name)?;
-            let index = faiss::index::index_factory(dimensions, &factory, faiss_metric)
+            let index = faiss::index::index_factory(dimensions, &factory, metric.into())
                 .map_err(|e| format!("failed to create FAISS index: {e}"))?;
-            (label, FaissIndex::Float(UnsafeCell::new(index)))
+            (metric_label_for(metric.into()), FaissIndex::Float(index))
         };
 
         // Apply efConstruction / efSearch via FAISS ParameterSpace. Binary HNSW has no dispatcher in
@@ -297,8 +323,8 @@ impl FaissBackend {
         // for `--data-type b1`, but only the float HNSW path actually tunes them.
         if !binary {
             let inner_index_ptr = match &index {
-                FaissIndex::Float(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
-                FaissIndex::Binary(cell) => unsafe { (*cell.get()).inner_ptr() as *mut std::ffi::c_void },
+                FaissIndex::Float(cell) => cell.inner_ptr() as *mut std::ffi::c_void,
+                FaissIndex::Binary(cell) => cell.inner_ptr() as *mut std::ffi::c_void,
             };
             let parameter_string = format!("efConstruction={expansion_add} efSearch={expansion_search}");
             let mut parameter_space = FaissParameterSpace::new()?;
@@ -308,23 +334,29 @@ impl FaissBackend {
         }
 
         let description = format!(
-            "faiss · {data_type_name} · {metric_label} · M={connectivity} · \
+            "faiss · {data_type} · {metric_label} · M={connectivity} · \
              ef={expansion_add}/{expansion_search} · {threads} threads",
         );
 
         let mut metadata = HashMap::new();
         metadata.insert("backend".into(), json!("faiss"));
         metadata.insert("library_version".into(), json!(faiss_version()));
-        metadata.insert("data_type".into(), json!(data_type_name));
+        metadata.insert("data_type".into(), json!(data_type.to_string()));
         metadata.insert("metric".into(), json!(metric_label));
         metadata.insert("connectivity".into(), json!(connectivity));
         metadata.insert("expansion_add".into(), json!(expansion_add));
         metadata.insert("expansion_search".into(), json!(expansion_search));
-        metadata.insert("threads".into(), json!(threads));
+        metadata.insert("threads".into(), json!(threads.0.get()));
 
         Ok(Self {
+            scratch: Vec::new_in(std::alloc::System),
+            ids: Vec::new_in(std::alloc::System),
             index,
-            binary_key_map: if binary { Some(Vec::new()) } else { None },
+            binary_key_map: if binary {
+                Some(Vec::new_in(std::alloc::System))
+            } else {
+                None
+            },
             description,
             metadata,
         })
@@ -336,9 +368,9 @@ impl FaissBackend {
     /// load because faiss-sys 0.7 doesn't bind any HNSW introspection symbols.
     /// Only the float (`IDMap,…`) path is supported — binary HNSW lacks
     /// `IDMapBinary` in faiss-sys, so its keys can't be persisted natively.
-    pub fn load(handle: &str, expansion_search: usize, threads: usize) -> Result<Self, String> {
+    pub fn load(handle: &str, expansion_search: usize, threads: Threads) -> Result<Self, String> {
         unsafe {
-            omp_set_num_threads(threads as i32);
+            omp_set_num_threads(threads.0.get() as i32);
         }
 
         let idx = read_index(handle).map_err(|e| {
@@ -350,12 +382,12 @@ impl FaissBackend {
         })?;
         let metric_type = idx.metric_type();
         let dimensions = idx.d();
-        let index = FaissIndex::Float(UnsafeCell::new(idx));
+        let index = FaissIndex::Float(idx);
 
         // efSearch is the only post-load tunable; binary HNSW would have no
         // dispatcher anyway and we already errored out for it.
         let inner_ptr = match &index {
-            FaissIndex::Float(c) => unsafe { (*c.get()).inner_ptr() as *mut std::ffi::c_void },
+            FaissIndex::Float(c) => c.inner_ptr() as *mut std::ffi::c_void,
             FaissIndex::Binary(_) => unreachable!(),
         };
         let parameter_string = format!("efSearch={expansion_search}");
@@ -374,7 +406,7 @@ impl FaissBackend {
         metadata.insert("library_version".into(), json!(faiss_version()));
         metadata.insert("metric".into(), json!(metric_label));
         metadata.insert("expansion_search".into(), json!(expansion_search));
-        metadata.insert("threads".into(), json!(threads));
+        metadata.insert("threads".into(), json!(threads.0.get()));
         metadata.insert("loaded_from".into(), json!(handle));
         // faiss-sys binds no HNSW introspection, so these are genuinely unknown
         // on the load path. Emitted as null rather than omitted: absent would
@@ -384,6 +416,8 @@ impl FaissBackend {
         metadata.insert("expansion_add".into(), Value::Null);
 
         Ok(Self {
+            scratch: Vec::new_in(std::alloc::System),
+            ids: Vec::new_in(std::alloc::System),
             index,
             binary_key_map: None,
             description,
@@ -401,13 +435,13 @@ impl Backend for FaissBackend {
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        // SAFETY: `add` has exclusive `&mut self` access.
-        match &self.index {
+        match &mut self.index {
             FaissIndex::Float(index) => {
-                let data = vectors.data.to_f32();
-                let xids: Vec<faiss::Idx> = keys.iter().map(|&k| faiss::Idx::new(k as u64)).collect();
-                unsafe { &mut *index.get() }
-                    .add_with_ids(&data, &xids)
+                let data = vectors.data.to_f32_in(&mut self.scratch)?;
+                self.ids.clear();
+                self.ids.extend(keys.iter().map(|&k| faiss::Idx::new(k as u64)));
+                index
+                    .add_with_ids(data, &self.ids)
                     .map_err(|e| format!("FAISS add_with_ids failed: {e}"))
             }
             FaissIndex::Binary(index) => {
@@ -421,29 +455,25 @@ impl Backend for FaissBackend {
                     .as_mut()
                     .expect("binary index must carry a key_map")
                     .extend_from_slice(keys);
-                unsafe { &mut *index.get() }
-                    .add(data)
-                    .map_err(|e| format!("FAISS binary add failed: {e}"))
+                index.add(data).map_err(|e| format!("FAISS binary add failed: {e}"))
             }
         }
     }
 
     fn search(
-        &self,
+        &mut self,
         queries: Vectors,
         count: usize,
         out_keys: &mut [Key],
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String> {
-        // SAFETY: `run` never calls `search` and `add` concurrently; search is
-        // the only reader and FAISS is internally thread-safe via OpenMP.
-        match &self.index {
+        match &mut self.index {
             FaissIndex::Float(index) => {
-                let data = queries.data.to_f32();
+                let data = queries.data.to_f32_in(&mut self.scratch)?;
 
-                let result = unsafe { &mut *index.get() }
-                    .search(&data, count)
+                let result = index
+                    .search(data, count)
                     .map_err(|e| format!("FAISS search failed: {e}"))?;
 
                 // IDMap stored our keys natively, so an empty `key_map` means
@@ -468,7 +498,7 @@ impl Backend for FaissBackend {
                     _ => return Err("FAISS binary index requires B1x8 data".into()),
                 };
 
-                let result = unsafe { &mut *index.get() }
+                let result = index
                     .search(data, count)
                     .map_err(|e| format!("FAISS binary search failed: {e}"))?;
 
@@ -499,9 +529,8 @@ impl Backend for FaissBackend {
 
     fn save(&self, handle: &str) -> Result<(), String> {
         match &self.index {
-            FaissIndex::Float(c) => {
-                let idx = unsafe { &*c.get() };
-                write_index(idx, handle).map_err(|e| format!("FAISS write_index({handle}): {e}"))
+            FaissIndex::Float(index) => {
+                write_index(index, handle).map_err(|e| format!("FAISS write_index({handle}): {e}"))
             }
             FaissIndex::Binary(_) => Err("FAISS binary HNSW save is not supported — faiss-sys 0.7 doesn't bind \
                  IndexBinaryIDMap, so keys can't be persisted natively"
@@ -515,6 +544,7 @@ impl Backend for FaissBackend {
 /// probe, not from FAISS). We don't duplicate that guess here.
 fn faiss_version() -> String {
     use std::ffi::CStr;
+
     extern "C" {
         fn faiss_get_version() -> *const std::os::raw::c_char;
     }
@@ -529,11 +559,17 @@ fn faiss_version() -> String {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli: Cli = retrieval::parse_cli();
 
-    eprintln!("faiss v{}", faiss_version());
+    eprintln!("FAISS {}", faiss_version());
 
     let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
+    eprintln!("- Data types: {}", spell_list(&cli.data_type));
+    eprintln!("- Metrics: {}", spell_list(&cli.metric));
+    eprintln!("- Connectivity: {}", spell_list(&cli.connectivity));
+    eprintln!("- Expansion add: {}", spell_list(&cli.expansion_add));
+    eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
+    eprintln!("- Threads: {}", cli.threads);
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     cli.common.ensure_single_config(&[
@@ -546,7 +582,7 @@ fn main() {
     ]);
 
     let mut summary = SweepSummary::default();
-    for (&dimensions, data_type, metric, &connectivity, &expansion_add, &expansion_search) in iproduct!(
+    for (&dimensions, &data_type, &metric, &connectivity, &expansion_add, &expansion_search) in iproduct!(
         &dimensions_sweep,
         &cli.data_type,
         &cli.metric,
@@ -554,9 +590,7 @@ fn main() {
         &cli.expansion_add,
         &cli.expansion_search
     ) {
-        state
-            .check_dimensions(dimensions)
-            .unwrap_or_bail("invalid --dimensions");
+        state.check_dimensions(dimensions).unwrap_or_bail("invalid --dims");
 
         let description =
             format!("faiss · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search}");
@@ -584,4 +618,54 @@ fn main() {
     }
 
     summary.print();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use retrieval::VectorSlice;
+
+    #[test]
+    fn repeated_search_reuses_conversion_storage_and_preserves_keys() {
+        let config = IndexConfig {
+            dimensions: 2,
+            data_type: DataType::F32,
+            metric: Metric::L2,
+            connectivity: 8,
+            expansion_add: 32,
+            expansion_search: 16,
+        };
+        let mut backend = FaissBackend::new(config, Threads::ONE).unwrap();
+        backend
+            .add(
+                &[42, 7],
+                Vectors {
+                    data: VectorSlice::I8(&[3, 4, 0, 0]),
+                    dimensions: 2,
+                },
+            )
+            .unwrap();
+        let scratch = backend.scratch.as_ptr();
+        let mut keys = [0; 3];
+        let mut distances = [0.0; 3];
+        let mut counts = [0];
+        for _ in 0..2 {
+            backend
+                .search(
+                    Vectors {
+                        data: VectorSlice::I8(&[0, 0]),
+                        dimensions: 2,
+                    },
+                    3,
+                    &mut keys,
+                    &mut distances,
+                    &mut counts,
+                )
+                .unwrap();
+            assert_eq!(keys, [7, 42, Key::MAX]);
+            assert_eq!(distances, [0.0, 25.0, Distance::INFINITY]);
+            assert_eq!(counts, [2]);
+            assert_eq!(scratch, backend.scratch.as_ptr());
+        }
+    }
 }

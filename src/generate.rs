@@ -20,24 +20,20 @@
 //!     --format b1bin \
 //!     --base-count 1000000 \
 //!     --query-count 10000 \
-//!     --dimensions 1024 \
+//!     --dims 1024 \
 //!     --clusters 256 \
-//!     --count 10 \
+//!     --top-k 10 \
 //!     --output datasets/binary_1M/
 //! ```
 
-use std::collections::BinaryHeap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::{collections::BinaryHeap, fmt, io::Write, path::PathBuf};
 
 use clap::Parser;
 use fork_union::{IndexedSplit, SyncMutPtr, ThreadPool};
 use numkong::{MatrixSpan, MatrixView};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
-use retrieval::error::GroundTruthError;
-use retrieval::packed_distance::PackedDistance;
+use retrieval::{error::GroundTruthError, packed_distance::PackedDistance, Seed, Threads};
 
 // #region Ground truth helpers — consumed by download scripts
 
@@ -102,7 +98,7 @@ pub fn compute_top_k<Metric: PackedDistance>(
     queries: MatrixView<'_, Metric>,
     mut ground_truth: MatrixSpan<'_, u32>,
     batch_size: Option<usize>,
-    threads: usize,
+    threads: Threads,
 ) -> Result<(), GroundTruthError> {
     if !base.has_contiguous_rows() {
         return Err(GroundTruthError::NonContiguousView { which: "base" });
@@ -133,12 +129,11 @@ pub fn compute_top_k<Metric: PackedDistance>(
     if top_k == 0 || top_k > base_count {
         return Err(GroundTruthError::TopKTooLarge { top_k, base_count });
     }
-    let threads = threads.max(1);
+    let threads = threads.0.get();
 
     let batch = batch_size
         .unwrap_or_else(|| auto_tune_batch(base_count, query_count))
-        .min(query_count.max(1))
-        .max(1);
+        .min(query_count.max(1));
     let auto_tag = if batch_size.is_none() { " (auto)" } else { "" };
     eprintln!(
         "  ground truth ({metric}): base_count={base_count}, query_count={query_count}, \
@@ -147,15 +142,7 @@ pub fn compute_top_k<Metric: PackedDistance>(
         metric = Metric::metric_name()
     );
 
-    // Build an owning `Matrix<Metric>` over the base. `Matrix::from_slice`
-    // copies into a SIMD-aligned buffer — an unavoidable one-time cost until
-    // NumKong adds a view-accepting `PackedMatrix::try_pack_view`. We drop
-    // the tensor immediately after packing; only `packed_base` survives.
-    //
-    // TODO(numkong): switch to `PackedMatrix::pack_view(&base)` once upstream.
-    let base_storage_count = base_count * base.stride_bytes(0) as usize / std::mem::size_of::<Metric>();
-    let base_slice: &[Metric] = unsafe { std::slice::from_raw_parts(base.as_ptr(), base_storage_count) };
-    let base_tensor = numkong::Matrix::<Metric>::from_slice(base_slice, &[base_count, dimensions]);
+    let base_tensor = padded_matrix(base)?;
     let packed_base = numkong::PackedMatrix::pack(&base_tensor);
     drop(base_tensor);
 
@@ -169,7 +156,6 @@ pub fn compute_top_k<Metric: PackedDistance>(
 
     let ground_truth_ptr = SyncMutPtr::new(ground_truth.as_mut_ptr());
     let gt_row_stride = (ground_truth.stride_bytes(0) as usize) / std::mem::size_of::<u32>();
-    let query_row_stride = queries.stride_bytes(0) as usize;
 
     // TTY-aware progress bar. Matches the styling already used by
     // `bench.rs::run`'s add/search phases so redirected output stays quiet
@@ -186,20 +172,7 @@ pub fn compute_top_k<Metric: PackedDistance>(
         let batch_end = (batch_start + batch).min(query_count);
         let batch_count = batch_end - batch_start;
 
-        // Safe sub-view for this batch's query rows. Replaces the older
-        // `as_ptr().byte_add(...)` + `from_raw_parts(...)` pattern with a
-        // single stride-aware slice call.
-        let batch_view: MatrixView<'_, Metric> = queries.slice((batch_start..batch_end, ..))?;
-        // Wrap the sub-view's backing memory in a throwaway owning `Matrix`.
-        // SAFETY: the sub-view has contiguous rows (inherited from `queries`
-        // which we validated above), so the first `batch_count *
-        // storage_per_row` elements at `batch_view.as_ptr()` are a valid
-        // `&[Metric]`. This copy disappears once NumKong gains a
-        // view-accepting `PackedMatrix::pack_view` path.
-        // TODO(numkong): drop the copy once `PackedMatrix::pack_view` lands.
-        let batch_storage_count = batch_count * query_row_stride / std::mem::size_of::<Metric>();
-        let batch_slice: &[Metric] = unsafe { std::slice::from_raw_parts(batch_view.as_ptr(), batch_storage_count) };
-        let query_tensor = numkong::Matrix::<Metric>::from_slice(batch_slice, &[batch_count, dimensions]);
+        let query_tensor = padded_matrix(queries.slice((batch_start..batch_end, ..))?)?;
 
         // NumKong writes the distance matrix in parallel using our pool.
         // Pass only the used prefix span so the kernel doesn't touch unused
@@ -264,6 +237,27 @@ pub fn compute_top_k<Metric: PackedDistance>(
     Ok(())
 }
 
+/// Copies `rows` into an owned matrix whose width is zero-padded to a multiple of 64 dimensions.
+/// NumKong 7.8.3's SME `f32` norm drops odd lanes of a partial tail vector, so every row ends on a full one.
+fn padded_matrix<Metric: PackedDistance>(
+    rows: MatrixView<'_, Metric>,
+) -> Result<numkong::Matrix<Metric>, GroundTruthError> {
+    let (count, dimensions) = (rows.shape()[0], rows.shape()[1]);
+    let row_values = dimensions / Metric::dimensions_per_value();
+    let padded_dimensions = dimensions.next_multiple_of(64);
+    let row_stride = rows.stride_bytes(0) as usize / std::mem::size_of::<Metric>();
+    // SAFETY: rows are contiguous, so `count` rows of `row_stride` values start at `as_ptr`.
+    let source = unsafe { std::slice::from_raw_parts(rows.as_ptr(), count * row_stride) };
+    let mut padded = numkong::Matrix::<Metric>::try_full(&[count, padded_dimensions], Metric::zero())?;
+    let padded_rows = padded
+        .as_mut_slice()
+        .chunks_exact_mut(padded_dimensions / Metric::dimensions_per_value());
+    for (target, row) in padded_rows.zip(source.chunks_exact(row_stride)) {
+        target[..row_values].copy_from_slice(&row[..row_values]);
+    }
+    Ok(padded)
+}
+
 /// Backward-compat alias for the Hamming path. Preferred for new callers:
 /// use [`compute_top_k::<numkong::u1x8>`] directly.
 pub fn compute_hamming_top_k(
@@ -271,7 +265,7 @@ pub fn compute_hamming_top_k(
     queries: MatrixView<'_, numkong::u1x8>,
     ground_truth: MatrixSpan<'_, u32>,
     batch_size: Option<usize>,
-    threads: usize,
+    threads: Threads,
 ) -> Result<(), GroundTruthError> {
     compute_top_k::<numkong::u1x8>(base, queries, ground_truth, batch_size, threads)
 }
@@ -362,50 +356,75 @@ pub fn matrix_span<'a, T>(data: &'a mut [T], rows: usize, cols: usize) -> Matrix
 struct Cli {
     /// Output format: `b1bin` (clustered binary, Hamming GT) or
     /// `fbin` (Gaussian f32, L2 GT)
-    #[arg(long)]
-    format: String,
+    #[arg(long, value_enum)]
+    format: Format,
 
     /// Number of base vectors
-    #[arg(long)]
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
     base_count: usize,
 
     /// Number of query vectors
-    #[arg(long)]
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
     query_count: usize,
 
     /// Vector dimensions. For `b1bin` this is the bit count (must be a
     /// multiple of 8); for `fbin` it's the f32 scalar count.
-    #[arg(long)]
-    dimensions: usize,
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
+    dims: usize,
 
     /// Number of cluster centers for non-uniform data
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 256, value_parser = retrieval::parse_count_flag)]
     clusters: usize,
 
     /// Bit-flip probability for cluster noise (0.0 = identical to center, 0.5 = random)
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.1, value_parser = parse_probability)]
     noise: f64,
 
     /// Neighbors to compute per query (the k in the ground-truth file)
-    #[arg(long, default_value_t = 10)]
-    count: usize,
+    #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
+    top_k: usize,
 
     /// Ground-truth query batch size. When omitted, auto-tuned from available RAM
     /// (distance matrix is `batch_size * base_count * 4 bytes`).
-    #[arg(long)]
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
     ground_truth_batch: Option<usize>,
 
     /// Threads for ground-truth top-K extraction (defaults to all logical cores).
-    #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
-    threads: usize,
+    #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
+    threads: Threads,
 
-    /// Random seed
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
+    /// Random seed, or `random` to draw one
+    #[arg(long, default_value = "42", value_parser = retrieval::parse_seed_flag)]
+    seed: Seed,
 
     /// Output directory
     #[arg(long)]
     output: PathBuf,
+}
+
+/// Parses a probability like `0.1`, from 0 to 1 in plain digits.
+#[allow(dead_code)]
+fn parse_probability(text: &str) -> Result<f64, String> {
+    let digits = text.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.');
+    digits
+        .then(|| text.parse().ok())
+        .flatten()
+        .filter(|probability| (0.0..=1.0).contains(probability))
+        .ok_or_else(|| "expected a probability like 0.1".into())
+}
+
+/// Generated dataset layouts, as `--format` spells them.
+#[allow(dead_code)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    B1bin,
+    Fbin,
+}
+
+impl fmt::Display for Format {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
+    }
 }
 
 /// Write the 8-byte BigANN-style header: two little-endian `u32` values
@@ -438,9 +457,13 @@ fn generate_clustered_binary(
     centers: &[u8],
     num_clusters: usize,
     noise: f64,
-) -> Vec<u8> {
+) -> Vec<u8, std::alloc::System> {
     let noise_threshold = (noise * 256.0) as u8;
-    let mut base_bytes = vec![0u8; count * bytes_per_vector];
+    let mut base_bytes = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(count * bytes_per_vector, 0u8);
+        values
+    };
     for vector_index in 0..count {
         let center_index = rng.random_range(0..num_clusters);
         let center = &centers[center_index * bytes_per_vector..(center_index + 1) * bytes_per_vector];
@@ -485,9 +508,13 @@ fn generate_clustered_binary(
 /// If `count * dimensions` is odd, one extra Box–Muller pair is generated and
 /// the second sample is discarded. Costs one surplus `ln/sqrt/cos`.
 #[allow(dead_code)]
-fn generate_gaussian_f32(rng: &mut StdRng, count: usize, dimensions: usize) -> Vec<f32> {
+fn generate_gaussian_f32(rng: &mut StdRng, count: usize, dimensions: usize) -> Vec<f32, std::alloc::System> {
     let scalar_count = count * dimensions;
-    let mut base_bytes = vec![0f32; scalar_count];
+    let mut base_bytes = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(scalar_count, 0f32);
+        values
+    };
     let mut cursor = 0;
     while cursor + 1 < scalar_count {
         let (z_cos, z_sin) = sample_standard_normal_pair(rng);
@@ -521,13 +548,26 @@ fn sample_standard_normal_pair(rng: &mut StdRng) -> (f32, f32) {
 /// alignment, etc.) happens inside the per-format runner.
 #[allow(dead_code)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let cli: Cli = retrieval::parse_cli();
+    eprintln!("- Format: {}", cli.format);
+    eprintln!("- Base count: {}", cli.base_count);
+    eprintln!("- Query count: {}", cli.query_count);
+    eprintln!("- Dims: {}", cli.dims);
+    eprintln!("- Clusters: {}", cli.clusters);
+    eprintln!("- Noise: {}", cli.noise);
+    eprintln!("- Top k: {}", cli.top_k);
+    match cli.ground_truth_batch {
+        Some(batch) => eprintln!("- Ground-truth batch: {batch}"),
+        None => eprintln!("- Ground-truth batch: auto"),
+    }
+    eprintln!("- Threads: {}", cli.threads);
+    eprintln!("- Seed: {}", cli.seed);
+    eprintln!("- Output: {}", cli.output.display());
     std::fs::create_dir_all(&cli.output)?;
 
-    match cli.format.as_str() {
-        "b1bin" => run_b1bin(&cli),
-        "fbin" => run_fbin(&cli),
-        other => Err(format!("unsupported format: {other} (supported: b1bin, fbin)").into()),
+    match cli.format {
+        Format::B1bin => run_b1bin(&cli),
+        Format::Fbin => run_fbin(&cli),
     }
 }
 
@@ -536,17 +576,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// ground truth → write `base.N.b1bin`, `query.M.b1bin`, `groundtruth.M.ibin`.
 #[allow(dead_code)]
 fn run_b1bin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    if !cli.dimensions.is_multiple_of(8) {
-        return Err("--dimensions must be a multiple of 8 for b1bin format".into());
+    if !cli.dims.is_multiple_of(8) {
+        return Err("--dims must be a multiple of 8 for b1bin format".into());
     }
-    let bytes_per_vector = cli.dimensions / 8;
-    let mut rng = StdRng::seed_from_u64(cli.seed);
+    let bytes_per_vector = cli.dims / 8;
+    let mut rng = StdRng::seed_from_u64(cli.seed.into());
 
     eprintln!(
         "Generating {} cluster centers ({} bits = {} bytes each)...",
-        cli.clusters, cli.dimensions, bytes_per_vector
+        cli.clusters, cli.dims, bytes_per_vector
     );
-    let mut centers = vec![0u8; cli.clusters * bytes_per_vector];
+    let mut centers = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(cli.clusters * bytes_per_vector, 0u8);
+        values
+    };
     rng.fill(&mut centers[..]);
 
     eprintln!("Generating {} base vectors (noise={})...", cli.base_count, cli.noise);
@@ -571,12 +615,16 @@ fn run_b1bin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "Computing brute-force hamming top-{} ground truth (NumKong + ForkUnion)...",
-        cli.count
+        cli.top_k
     );
-    let base_view = binary_view(&base, cli.base_count, cli.dimensions);
-    let query_view = binary_view(&queries, cli.query_count, cli.dimensions);
-    let mut ground_truth_storage = vec![0u32; cli.query_count * cli.count];
-    let ground_truth_span = matrix_span(&mut ground_truth_storage, cli.query_count, cli.count);
+    let base_view = binary_view(&base, cli.base_count, cli.dims);
+    let query_view = binary_view(&queries, cli.query_count, cli.dims);
+    let mut ground_truth_storage = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(cli.query_count * cli.top_k, 0u32);
+        values
+    };
+    let ground_truth_span = matrix_span(&mut ground_truth_storage, cli.query_count, cli.top_k);
     compute_hamming_top_k(
         base_view,
         query_view,
@@ -593,25 +641,29 @@ fn run_b1bin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// `base.N.fbin`, `query.M.fbin`, `groundtruth.M.ibin`.
 #[allow(dead_code)]
 fn run_fbin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rng = StdRng::seed_from_u64(cli.seed);
+    let mut rng = StdRng::seed_from_u64(cli.seed.into());
 
     eprintln!(
         "Generating {} base vectors (f32, {} dimensions)...",
-        cli.base_count, cli.dimensions
+        cli.base_count, cli.dims
     );
-    let base = generate_gaussian_f32(&mut rng, cli.base_count, cli.dimensions);
+    let base = generate_gaussian_f32(&mut rng, cli.base_count, cli.dims);
 
     eprintln!("Generating {} query vectors...", cli.query_count);
-    let queries = generate_gaussian_f32(&mut rng, cli.query_count, cli.dimensions);
+    let queries = generate_gaussian_f32(&mut rng, cli.query_count, cli.dims);
 
     eprintln!(
         "Computing brute-force L2 top-{} ground truth (NumKong + ForkUnion)...",
-        cli.count
+        cli.top_k
     );
-    let base_view = matrix_view(&base, cli.base_count, cli.dimensions);
-    let query_view = matrix_view(&queries, cli.query_count, cli.dimensions);
-    let mut ground_truth = vec![0u32; cli.query_count * cli.count];
-    let ground_truth_span = matrix_span(&mut ground_truth, cli.query_count, cli.count);
+    let base_view = matrix_view(&base, cli.base_count, cli.dims);
+    let query_view = matrix_view(&queries, cli.query_count, cli.dims);
+    let mut ground_truth = {
+        let mut values = Vec::new_in(std::alloc::System);
+        values.resize(cli.query_count * cli.top_k, 0u32);
+        values
+    };
+    let ground_truth_span = matrix_span(&mut ground_truth, cli.query_count, cli.top_k);
     compute_top_k::<f32>(
         base_view,
         query_view,
@@ -645,7 +697,7 @@ fn write_dataset<T: Copy>(
 
     eprintln!("Writing {}", base_path.display());
     let mut file = std::fs::File::create(&base_path)?;
-    write_bin_header(&mut file, cli.base_count as u32, cli.dimensions as u32)?;
+    write_bin_header(&mut file, cli.base_count as u32, cli.dims as u32)?;
     // SAFETY: `T: Copy` is our stand-in for POD; the caller picks `T` from
     // {u8, f32, i8, u32} all of which have no padding and no invalid bit
     // patterns. `pod_slice_as_bytes` just reinterprets the slice's bytes.
@@ -653,17 +705,104 @@ fn write_dataset<T: Copy>(
 
     eprintln!("Writing {}", query_path.display());
     let mut file = std::fs::File::create(&query_path)?;
-    write_bin_header(&mut file, cli.query_count as u32, cli.dimensions as u32)?;
+    write_bin_header(&mut file, cli.query_count as u32, cli.dims as u32)?;
     file.write_all(unsafe { retrieval::pod_slice_as_bytes(queries) })?;
 
     eprintln!("Writing {}", gt_path.display());
     let mut file = std::fs::File::create(&gt_path)?;
-    write_bin_header(&mut file, cli.query_count as u32, cli.count as u32)?;
+    write_bin_header(&mut file, cli.query_count as u32, cli.top_k as u32)?;
     file.write_all(unsafe { retrieval::pod_slice_as_bytes(ground_truth) })?;
 
-    let base_mb = (8 + std::mem::size_of_val(base)) as f64 / 1e6;
+    let base_mb = (8 + std::mem::size_of_val(base)) as f64 / (1u64 << 20) as f64;
     eprintln!("Done! base: {base_mb:.1} MB, {} output files", cli.output.display());
     Ok(())
 }
 
 // #endregion
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+    use super::{binary_view, compute_top_k, generate_gaussian_f32, matrix_span, matrix_view};
+    use retrieval::Threads;
+
+    const BASE_COUNT: usize = 300;
+    const QUERY_COUNT: usize = 20;
+    const TOP_K: usize = 10;
+
+    /// Runs `compute_top_k` across several batches and returns each query's neighbor ids.
+    fn top_k<Metric: retrieval::packed_distance::PackedDistance>(
+        base: numkong::MatrixView<'_, Metric>,
+        queries: numkong::MatrixView<'_, Metric>,
+    ) -> Vec<u32> {
+        let mut ground_truth = vec![0u32; QUERY_COUNT * TOP_K];
+        let span = matrix_span(&mut ground_truth, QUERY_COUNT, TOP_K);
+        compute_top_k(base, queries, span, Some(7), Threads(NonZeroUsize::new(2).unwrap())).unwrap();
+        ground_truth
+    }
+
+    /// Ascending `(distance, index)` order of `distances`, cut to `TOP_K`.
+    fn naive_top_k<Distance: PartialOrd + Copy>(distances: &[Distance]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..distances.len()).collect();
+        order.sort_by(|&a, &b| distances[a].partial_cmp(&distances[b]).unwrap().then(a.cmp(&b)));
+        order.truncate(TOP_K);
+        order
+    }
+
+    #[test]
+    fn f32_top_k_matches_scalar_l2_at_tail_widths() {
+        for dimensions in [2, 3, 7, 20, 64, 100] {
+            let mut rng = StdRng::seed_from_u64(dimensions as u64);
+            let base = generate_gaussian_f32(&mut rng, BASE_COUNT, dimensions);
+            let queries = generate_gaussian_f32(&mut rng, QUERY_COUNT, dimensions);
+            let found = top_k(
+                matrix_view(&base, BASE_COUNT, dimensions),
+                matrix_view(&queries, QUERY_COUNT, dimensions),
+            );
+            for (query, found) in queries.chunks_exact(dimensions).zip(found.as_chunks::<TOP_K>().0) {
+                let distances: Vec<f64> = base
+                    .chunks_exact(dimensions)
+                    .map(|row| {
+                        row.iter()
+                            .zip(query)
+                            .map(|(&b, &q)| (b as f64 - q as f64).powi(2))
+                            .sum()
+                    })
+                    .collect();
+                let expected = naive_top_k(&distances);
+                for (&id, &want) in found.iter().zip(&expected) {
+                    let (got, want) = (distances[id as usize], distances[want]);
+                    assert!(
+                        (got - want).abs() <= 1e-9 * want.max(1.0),
+                        "dims {dimensions}: {got} != {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn b1bin_top_k_matches_scalar_hamming() {
+        for bits in [8, 24, 136] {
+            let bytes = bits / 8;
+            let mut rng = StdRng::seed_from_u64(bits as u64);
+            let base: Vec<u8> = (0..BASE_COUNT * bytes).map(|_| rng.random()).collect();
+            let queries: Vec<u8> = (0..QUERY_COUNT * bytes).map(|_| rng.random()).collect();
+            let found = top_k(
+                binary_view(&base, BASE_COUNT, bits),
+                binary_view(&queries, QUERY_COUNT, bits),
+            );
+            for (query, found) in queries.chunks_exact(bytes).zip(found.as_chunks::<TOP_K>().0) {
+                let distances: Vec<u32> = base
+                    .chunks_exact(bytes)
+                    .map(|row| row.iter().zip(query).map(|(&b, &q)| (b ^ q).count_ones()).sum())
+                    .collect();
+                let found: Vec<usize> = found.iter().map(|&id| id as usize).collect();
+                assert_eq!(found, naive_top_k(&distances), "bits {bits}");
+            }
+        }
+    }
+}

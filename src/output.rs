@@ -1,7 +1,10 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::path::Path;
+//! Typed benchmark reports, machine information, and JSON serialization.
+
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
+    path::Path,
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -27,7 +30,7 @@ pub struct DatasetInfo {
     /// step could possibly have found.
     pub vectors_count: usize,
     pub queries_count: usize,
-    /// The input file's vector width. A `--dimensions` sweep truncates per
+    /// The input file's vector width. A `--dims` sweep truncates per
     /// config and reports the effective width as `config.dimensions`.
     pub dimensions: usize,
     pub neighbors_per_query: usize,
@@ -65,7 +68,7 @@ pub struct StepAddEntry {
 pub struct StepSearchEntry {
     pub queries: usize,
     /// Neighbors requested per query — the k every metric below is taken at.
-    pub neighbor_count: usize,
+    pub top_k: usize,
     pub elapsed: f64,
     pub throughput: u64,
     /// Rank-1 truth found anywhere in the top-k: FAISS's `OneRecallAtRCriterion`,
@@ -157,7 +160,8 @@ pub fn write_report(path: &Path, report: &ConfigReport) -> std::io::Result<()> {
 /// Generate a short hash from config metadata for file naming.
 pub fn config_hash(config: &HashMap<String, Value>) -> String {
     let mut hasher = DefaultHasher::new();
-    let sorted: std::collections::BTreeMap<&String, &Value> = config.iter().collect();
+    let mut sorted = std::collections::BTreeMap::new_in(std::alloc::System);
+    sorted.extend(config.iter());
     format!("{sorted:?}").hash(&mut hasher);
     format!("{:06x}", hasher.finish() & CONFIG_HASH_MASK)
 }

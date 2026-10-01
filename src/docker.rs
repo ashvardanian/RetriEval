@@ -1,10 +1,11 @@
 //! Docker container lifecycle management for Tier 2 backends.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use bollard::models::*;
-use bollard::Docker;
+use bollard::{
+    models::{ContainerCreateBody, HostConfig, PortBinding},
+    Docker,
+};
 use futures_util::StreamExt;
 
 pub struct ContainerHandle {
@@ -13,14 +14,13 @@ pub struct ContainerHandle {
     name: String,
 }
 
-pub type PortMap = Vec<(u16, u16)>;
-
 impl ContainerHandle {
     pub async fn start(
         image: &str,
         container_name: &str,
-        ports: &PortMap,
+        ports: &[(u16, u16)],
         env: &[String],
+        command: &[String],
         _timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let docker = Docker::connect_with_local_defaults()?;
@@ -46,7 +46,7 @@ impl ContainerHandle {
             port_bindings.insert(
                 format!("{container_port}/tcp"),
                 Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
+                    host_ip: Some("127.0.0.1".to_string()),
                     host_port: Some(host_port.to_string()),
                 }]),
             );
@@ -59,6 +59,7 @@ impl ContainerHandle {
                 ..Default::default()
             }),
             env: Some(env.to_vec()),
+            cmd: (!command.is_empty()).then(|| command.to_vec()),
             ..Default::default()
         };
 
@@ -81,11 +82,11 @@ impl ContainerHandle {
     }
 
     /// Poll `check` every 500ms until it returns `true` or `timeout` expires.
-    async fn wait_until(
+    async fn wait_until<F: std::future::Future<Output = bool>>(
         &self,
         label: &str,
         timeout: Duration,
-        check: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>,
+        check: impl Fn() -> F,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let deadline = tokio::time::Instant::now() + timeout;
         eprintln!("  Waiting for {label}...");
@@ -106,7 +107,7 @@ impl ContainerHandle {
         self.wait_until(url, timeout, || {
             let client = client.clone();
             let url = url.to_string();
-            Box::pin(async move { client.get(&url).send().await.is_ok_and(|r| r.status().is_success()) })
+            async move { client.get(&url).send().await.is_ok_and(|r| r.status().is_success()) }
         })
         .await
     }
@@ -120,7 +121,7 @@ impl ContainerHandle {
         let address = format!("{host}:{port}");
         self.wait_until(&address, timeout, || {
             let address = address.clone();
-            Box::pin(async move { tokio::net::TcpStream::connect(&address).await.is_ok() })
+            async move { tokio::net::TcpStream::connect(&address).await.is_ok() }
         })
         .await
     }

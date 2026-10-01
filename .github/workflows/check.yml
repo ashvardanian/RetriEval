@@ -1,0 +1,27 @@
+name: CPU Checks
+on: [push, pull_request]
+jobs:
+  check:
+    name: Check ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Native and Server Backends
+            features: usearch-backend,redis-backend,qdrant-backend,weaviate-backend,generate,perf-counters
+          - name: Static FAISS
+            features: faiss-static
+          - name: LanceDB and Downloads
+            features: lancedb-backend,download
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v4
+      - name: Set Up uv
+        uses: astral-sh/setup-uv@v6
+      - name: Install BLAS, LAPACK, OpenMP and Protobuf
+        run: sudo apt-get update && sudo apt-get install -y libblas-dev liblapack-dev libomp-dev protobuf-compiler
+      - name: Install Nightly Rust with Rustfmt and Clippy
+        run: rustup toolchain install nightly-2026-09-24 --profile minimal --component rustfmt,clippy
+      - name: Format, Lint and Test ${{ matrix.name }}
+        run: scripts/check.sh '${{ matrix.features }}'

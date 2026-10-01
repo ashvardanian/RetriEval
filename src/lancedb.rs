@@ -19,26 +19,43 @@
 //!     --output results/
 //! ```
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use clap::Parser;
 use futures_util::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, Vectors};
 use serde_json::json;
+
+use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, Vectors};
 
 const TABLE_NAME: &str = "bench";
 
 // #region Local metric mapping
 
-fn parse_lancedb_metric(s: &str) -> Result<lancedb::DistanceType, String> {
-    match s {
-        "ip" => Ok(lancedb::DistanceType::Dot),
-        "cos" => Ok(lancedb::DistanceType::Cosine),
-        "l2sq" | "l2" => Ok(lancedb::DistanceType::L2),
-        _ => Err(format!("unknown LanceDB distance metric: {s}")),
+/// LanceDB distances, as `--metric` spells them.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Metric {
+    Ip,
+    Cos,
+    #[value(alias = "l2sq")]
+    L2,
+}
+
+impl From<Metric> for lancedb::DistanceType {
+    fn from(metric: Metric) -> Self {
+        match metric {
+            Metric::Ip => Self::Dot,
+            Metric::Cos => Self::Cosine,
+            Metric::L2 => Self::L2,
+        }
+    }
+}
+
+impl fmt::Display for Metric {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        retrieval::spell_value(self, formatter)
     }
 }
 
@@ -50,21 +67,23 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    #[arg(long, default_value = "l2")]
-    metric: String,
+    /// Distance metric
+    #[arg(long, value_enum, default_value = "l2")]
+    metric: Metric,
 
     /// Path for LanceDB storage
-    #[arg(long, default_value = "/tmp/retrieval-lancedb")]
+    #[arg(long, default_value = "/tmp/retrieval-lancedb", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     db_path: String,
 }
 
 // #region Backend
 
 struct LanceDbBackend {
+    scratch: Vec<f32, std::alloc::System>,
     db: lancedb::Connection,
     table: Option<lancedb::Table>,
     dimensions: usize,
-    metric: String,
+    metric: Metric,
     runtime: tokio::runtime::Handle,
     description: String,
     metadata: std::collections::HashMap<String, serde_json::Value>,
@@ -85,14 +104,12 @@ impl LanceDbBackend {
         ]))
     }
 
-    fn make_batch(&self, keys: &[Key], data: &[f32]) -> RecordBatch {
-        let schema = self.schema();
+    fn make_batch(schema: Arc<Schema>, dimensions: usize, keys: &[Key], data: &[f32]) -> RecordBatch {
         let ids = UInt64Array::from(keys.iter().map(|&k| k as u64).collect::<Vec<_>>());
         let values = Float32Array::from(data.to_vec());
         let list_field = Arc::new(Field::new("item", DataType::Float32, true));
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new(list_field, self.dimensions as i32, Arc::new(values), None)
-                .expect("vector array");
+        let vectors = arrow_array::FixedSizeListArray::try_new(list_field, dimensions as i32, Arc::new(values), None)
+            .expect("vector array");
         RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(vectors)]).expect("batch")
     }
 }
@@ -107,8 +124,9 @@ impl Backend for LanceDbBackend {
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let data = vectors.data.to_f32();
-        let batch = self.make_batch(keys, &data);
+        let schema = self.schema();
+        let data = vectors.data.to_f32_in(&mut self.scratch)?;
+        let batch = Self::make_batch(schema, self.dimensions, keys, data);
 
         self.runtime.block_on(async {
             match &self.table {
@@ -134,25 +152,24 @@ impl Backend for LanceDbBackend {
     }
 
     fn search(
-        &self,
+        &mut self,
         queries: Vectors,
         count: usize,
         out_keys: &mut [Key],
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String> {
-        let data = queries.data.to_f32();
+        let data = queries.data.to_f32_in(&mut self.scratch)?;
         let dimensions = queries.dimensions;
         let num_vectors = data.len() / dimensions;
         let table = self.table.as_ref().ok_or("no table created")?;
 
-        let lance_metric =
-            parse_lancedb_metric(&self.metric).map_err(|e| format!("unsupported metric for LanceDB: {e}"))?;
+        let lance_metric = lancedb::DistanceType::from(self.metric);
 
         self.runtime.block_on(async {
             for query_index in 0..num_vectors {
                 let query = data[query_index * dimensions..(query_index + 1) * dimensions].to_vec();
-                let results = table
+                let mut results = table
                     .vector_search(query)
                     .map_err(|e| format!("LanceDB query build: {e}"))?
                     .distance_type(lance_metric)
@@ -161,26 +178,30 @@ impl Backend for LanceDbBackend {
                     .await
                     .map_err(|e| format!("LanceDB search: {e}"))?;
 
-                let batches: Vec<RecordBatch> = results
-                    .try_collect()
-                    .await
-                    .map_err(|e| format!("LanceDB collect: {e}"))?;
-
                 let offset = query_index * count;
-                let hits = batches.iter().flat_map(|batch| {
-                    let ids: Option<&UInt64Array> = batch.column_by_name("id").and_then(|c| c.as_any().downcast_ref());
-                    let distances: Option<&Float32Array> = batch
+                out_keys[offset..offset + count].fill(Key::MAX);
+                out_distances[offset..offset + count].fill(Distance::INFINITY);
+                let mut found = 0;
+                while let Some(batch) = results.try_next().await.map_err(|e| format!("LanceDB stream: {e}"))? {
+                    let ids = batch
+                        .column_by_name("id")
+                        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                        .ok_or("LanceDB returned no id column")?;
+                    let distances = batch
                         .column_by_name("_distance")
-                        .and_then(|c| c.as_any().downcast_ref());
-                    let pair = ids.zip(distances);
-                    (0..pair.map_or(0, |(ids, _)| ids.len()))
-                        .filter_map(move |rank| pair.map(|(ids, d)| (ids.value(rank) as Key, d.value(rank))))
-                });
-                out_counts[query_index] = retrieval::write_row(
-                    hits,
-                    &mut out_keys[offset..offset + count],
-                    &mut out_distances[offset..offset + count],
-                );
+                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+                        .ok_or("LanceDB returned no distance column")?;
+                    for rank in 0..ids.len().min(count - found) {
+                        out_keys[offset + found] =
+                            Key::try_from(ids.value(rank)).map_err(|_| "LanceDB key overflow")?;
+                        out_distances[offset + found] = distances.value(rank);
+                        found += 1;
+                    }
+                    if found == count {
+                        break;
+                    }
+                }
+                out_counts[query_index] = found;
             }
             Ok::<(), String>(())
         })
@@ -194,17 +215,11 @@ impl Backend for LanceDbBackend {
 // #region main
 
 fn main() {
-    let cli = Cli::parse();
+    let cli: Cli = retrieval::parse_cli();
 
     if cli.common.index.is_some() {
         retrieval::bail("--index is not supported for this backend");
     }
-
-    // Validate the metric string early.
-    parse_lancedb_metric(&cli.metric).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1);
-    });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -217,30 +232,26 @@ fn main() {
         eprintln!("Failed to load benchmark state: {e}");
         std::process::exit(1);
     });
-    if cli.common.dimensions.len() > 1 {
-        retrieval::bail("--dimensions sweep with >1 value isn't supported on LanceDB; rerun the binary per dimensions");
+    eprintln!("- Metric: {}", cli.metric);
+    eprintln!("- Database path: {}", cli.db_path);
+    if cli.common.dims.len() > 1 {
+        retrieval::bail("--dims sweep with >1 value isn't supported on LanceDB; rerun the binary per dimensions");
     }
-    let dimensions = cli
-        .common
-        .dimensions
-        .first()
-        .copied()
-        .unwrap_or_else(|| state.dimensions());
-    state
-        .check_dimensions(dimensions)
-        .unwrap_or_bail("invalid --dimensions");
+    let dimensions = cli.common.dims.first().copied().unwrap_or_else(|| state.dimensions());
+    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dims");
 
     let mut backend = LanceDbBackend {
+        scratch: Vec::new_in(std::alloc::System),
         db,
         table: None,
         dimensions,
-        metric: cli.metric.clone(),
+        metric: cli.metric,
         runtime: runtime.handle().clone(),
         description: format!("lancedb · {} · {dimensions}d", cli.metric),
         metadata: {
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("backend".into(), json!("lancedb"));
-            metadata.insert("metric".into(), json!(&cli.metric));
+            metadata.insert("metric".into(), json!(cli.metric.to_string()));
             metadata.insert("data_type".into(), json!("f32"));
             // No `create_index` call: every LanceDB graph index (`IvfHnswFlat` /
             // `IvfHnswSq` / `IvfHnswPq`) sits behind a k-means-trained IVF layer,

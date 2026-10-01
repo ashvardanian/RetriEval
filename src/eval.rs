@@ -1,19 +1,29 @@
-use crate::dataset::GroundTruth;
-use crate::Key;
+//! Recall, intersection, and ranking metrics over borrowed search results.
+
+use std::alloc::System;
+
+use crate::{dataset::GroundTruth, Key};
 
 /// Membership tester over one query's ground-truth prefix, reused across queries.
 ///
 /// NDCG and intersection both ask "is this returned key in the truth set?" once
 /// per returned key. Scanning the prefix per lookup costs `O(k²)` per query,
 /// which was tolerable while `k` was hardcoded to 10 but is not now that
-/// `--search-count` defaults to the ground-truth width — 100 on the BigANN sets,
+/// `--top-k` defaults to the ground-truth width — 100 on the BigANN sets,
 /// i.e. 10,000 comparisons per query instead of 100. Sorting once into a reused
 /// buffer and binary-searching makes it `O(k log k)` with no per-query
 /// allocation. Ground-truth rows are ordered by distance, not by key, so the
 /// sort cannot be skipped.
-#[derive(Default)]
 struct TruthSet {
-    sorted: Vec<Key>,
+    sorted: Vec<Key, System>,
+}
+
+impl Default for TruthSet {
+    fn default() -> Self {
+        Self {
+            sorted: Vec::new_in(System),
+        }
+    }
 }
 
 impl TruthSet {
@@ -149,8 +159,10 @@ pub fn self_recall_at_k(
 
 /// Precomputed log2 table for NDCG discount factors: 1/log2(rank+1) for rank 1..=K.
 /// discount[0] = 1/log2(2) = 1.0, discount[1] = 1/log2(3) ≈ 0.63, etc.
-fn discount_table(k: usize) -> Vec<f64> {
-    (0..k).map(|rank| 1.0 / ((rank + 2) as f64).log2()).collect()
+fn discount_table(k: usize) -> Vec<f64, System> {
+    let mut values = Vec::with_capacity_in(k, System);
+    values.extend((0..k).map(|rank| 1.0 / ((rank + 2) as f64).log2()));
+    values
 }
 
 /// Compute NDCG@K (Normalized Discounted Cumulative Gain).

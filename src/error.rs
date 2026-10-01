@@ -3,8 +3,7 @@
 //! Backends still return `Result<_, String>` — their failure messages are
 //! engine-specific strings with no shared shape worth matching on.
 
-use std::io;
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 // #region Dataset errors
 

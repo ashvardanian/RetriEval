@@ -21,4 +21,5 @@ benchmark*/
 # for the negation below to be reachable.
 data/*
 !data/.gitkeep
+!data/README.md
 CLAUDE.local.md
