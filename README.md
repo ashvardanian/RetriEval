@@ -281,6 +281,8 @@ Each backend is a separate binary.
 The table lists every flag of every binary, with its default.
 Flags marked "sweep" take comma-separated values and run one configuration per combination.
 A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
+Every `retri-eval-*` flag also reads `RETRIEVAL_<FLAG>` as its default, upper-cased with dashes as underscores, so `--top-k` reads `RETRIEVAL_TOP_K`.
+The flag on the command line overrides the variable, and switches like `--self-search` read `1`, `0`, `true` or `false`.
 
 | Flag                     | Binaries                                    | Default                  | Meaning                                                                                              |
 | ------------------------ | ------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
@@ -292,8 +294,8 @@ A bad value prints `--flag="value" does not parse, expected …` and exits with 
 | `--insertion-order`      | all `retri-eval-*`                          | `shuffled`               | `shuffled` by `--seed`, or the file's `original` order                                               |
 | `--seed`                 | all `retri-eval-*`                          | `42`                     | 32-bit seed of the shuffled insertion order, or `random`; rejected with `--insertion-order original` |
 | `--steps`                | all `retri-eval-*`                          | `10`                     | Measurement steps; the base is inserted in this many equal parts                                     |
-| `--vectors-per-add`      | all `retri-eval-*`                          | `10000`                  | Vectors per backend `add` call                                                                       |
-| `--queries-per-search`   | all `retri-eval-*`                          | `10000`                  | Queries per backend `search` call                                                                    |
+| `--inserts-per-core`     | all `retri-eval-*`                          | `2048`                   | Vectors per `add` call for each backend thread: `--threads` on usearch and faiss, one elsewhere      |
+| `--queries-per-core`     | all `retri-eval-*`                          | `2048`                   | Queries per `search` call for each backend thread: `--threads` on usearch and faiss, one elsewhere   |
 | `--output`               | all `retri-eval-*`                          | none                     | Directory for JSON result files; progress only when unset                                            |
 | `--max-base-vectors`     | all `retri-eval-*`                          | all                      | Cap on the base vectors used, for calibration on a slice                                             |
 | `--index`                | usearch, faiss, cuvs                        | none                     | Persisted index: loaded and searched if the path exists, else built and saved; needs a single config |

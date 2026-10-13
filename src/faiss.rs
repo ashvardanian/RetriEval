@@ -139,27 +139,39 @@ struct Cli {
     common: CommonArgs,
 
     /// Quantization types (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "bf16")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_DATA_TYPE",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "bf16"
+    )]
     data_type: Vec<DataType>,
 
     /// Distance metrics (comma-separated for sweep); binary data always uses Hamming
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_METRIC",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "l2"
+    )]
     metric: Vec<Metric>,
 
     /// HNSW connectivity parameter (M), comma-separated for sweep
-    #[arg(long, value_delimiter = ',', default_value = "32", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "32", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// HNSW expansion factor during indexing, comma-separated for sweep
-    #[arg(long, value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// HNSW expansion factor during search, comma-separated for sweep
-    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
     /// Number of threads (sets OMP_NUM_THREADS)
-    #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
+    #[arg(long, env = "RETRIEVAL_THREADS", default_value = "0", value_parser = retrieval::parse_threads_flag)]
     threads: Threads,
 }
 

@@ -83,32 +83,44 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metrics (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_METRIC",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "l2"
+    )]
     metric: Vec<Metric>,
 
     /// Server-side quantization (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "none")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_QUANTIZATION",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "none"
+    )]
     quantization: Vec<WeaviateQuant>,
 
     /// HNSW connectivity M (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// HNSW expansion factor during indexing (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// HNSW expansion factor during search (comma-separated for sweep).
     /// Class-level on Weaviate, so each value rebuilds the class.
-    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
     /// Time limit for container start and readiness, like 120s
-    #[arg(long, default_value = "120s", value_parser = retrieval::parse_duration_flag)]
+    #[arg(long, env = "RETRIEVAL_STARTUP_TIME_LIMIT", default_value = "120s", value_parser = retrieval::parse_duration_flag)]
     startup_time_limit: Duration,
 
     /// Weaviate HTTP port
-    #[arg(long, default_value = "8080", value_parser = retrieval::parse_port)]
+    #[arg(long, env = "RETRIEVAL_PORT", default_value = "8080", value_parser = retrieval::parse_port)]
     port: Port,
 }
 

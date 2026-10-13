@@ -168,38 +168,50 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metrics (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_METRIC",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "l2"
+    )]
     metric: Vec<Metric>,
 
     /// FT.CREATE VECTOR TYPE (comma-separated for sweep); u8 and i8 need Redis 8+
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "f32")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_DATA_TYPE",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "f32"
+    )]
     data_type: Vec<DataType>,
 
     /// HNSW connectivity M (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// HNSW expansion factor during indexing (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// HNSW expansion factor during search — RediSearch's `EF_RUNTIME`
     /// (comma-separated for sweep). RediSearch rejects values below the
     /// requested neighbor count, so this is raised to it when smaller.
-    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
     /// Time limit for container start and readiness, like 120s
-    #[arg(long, default_value = "120s", value_parser = retrieval::parse_duration_flag)]
+    #[arg(long, env = "RETRIEVAL_STARTUP_TIME_LIMIT", default_value = "120s", value_parser = retrieval::parse_duration_flag)]
     startup_time_limit: Duration,
 
     /// Redis port
-    #[arg(long, default_value = "6379", value_parser = retrieval::parse_port)]
+    #[arg(long, env = "RETRIEVAL_PORT", default_value = "6379", value_parser = retrieval::parse_port)]
     port: Port,
 
-    /// Vectors per pipeline flush (distinct from the shared `--vectors-per-add`
-    /// / `--queries-per-search`, which pace the harness's add/search loops)
-    #[arg(long, default_value_t = 1_000, value_parser = retrieval::parse_count_flag)]
+    /// Vectors per pipeline flush (distinct from the shared `--inserts-per-core`
+    /// / `--queries-per-core`, which pace the harness's add/search loops)
+    #[arg(long, env = "RETRIEVAL_VECTORS_PER_UPSERT", default_value_t = 1_000, value_parser = retrieval::parse_count_flag)]
     vectors_per_upsert: usize,
 }
 

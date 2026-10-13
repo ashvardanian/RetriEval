@@ -138,45 +138,63 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metrics (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_METRIC",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "l2"
+    )]
     metric: Vec<Metric>,
 
     /// Storage data types (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "f32")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_DATA_TYPE",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "f32"
+    )]
     data_type: Vec<DataType>,
 
     /// Server-side quantization (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "none")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_QUANTIZATION",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "none"
+    )]
     quantization: Vec<QuantizationKind>,
 
     /// HNSW connectivity M (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// HNSW expansion factor during indexing (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// HNSW expansion factor during search — Qdrant's `hnsw_ef` search param
     /// (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
     /// Time limit for container start and readiness, like 120s
-    #[arg(long, default_value = "120s", value_parser = retrieval::parse_duration_flag)]
+    #[arg(long, env = "RETRIEVAL_STARTUP_TIME_LIMIT", default_value = "120s", value_parser = retrieval::parse_duration_flag)]
     startup_time_limit: Duration,
 
     /// gRPC port for Qdrant
-    #[arg(long, default_value = "6334", value_parser = retrieval::parse_port)]
+    #[arg(long, env = "RETRIEVAL_GRPC_PORT", default_value = "6334", value_parser = retrieval::parse_port)]
     grpc_port: Port,
 
     /// HTTP port for Qdrant
-    #[arg(long, default_value = "6333", value_parser = retrieval::parse_port)]
+    #[arg(long, env = "RETRIEVAL_HTTP_PORT", default_value = "6333", value_parser = retrieval::parse_port)]
     http_port: Port,
 
-    /// Vectors per upsert request (distinct from the shared `--vectors-per-add`
-    /// / `--queries-per-search`, which pace the harness's add/search loops)
-    #[arg(long, default_value_t = 10_000, value_parser = retrieval::parse_count_flag)]
+    /// Vectors per upsert request (distinct from the shared `--inserts-per-core`
+    /// / `--queries-per-core`, which pace the harness's add/search loops)
+    #[arg(long, env = "RETRIEVAL_VECTORS_PER_UPSERT", default_value_t = 10_000, value_parser = retrieval::parse_count_flag)]
     vectors_per_upsert: usize,
 }
 

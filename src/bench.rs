@@ -246,53 +246,53 @@ pub fn format_thousands(n: u64) -> String {
 #[derive(clap::Args, Debug)]
 pub struct CommonArgs {
     /// Base vectors to index (.fbin, .u8bin, .i8bin, .b1bin)
-    #[arg(long)]
+    #[arg(long, env = "RETRIEVAL_BASE_VECTORS")]
     pub base_vectors: PathBuf,
 
     /// Optional keys for the base vectors (.i32bin). One per base vector.
-    #[arg(long)]
+    #[arg(long, env = "RETRIEVAL_BASE_KEYS")]
     pub base_keys: Option<PathBuf>,
 
     /// Query vectors to search with
-    #[arg(long)]
+    #[arg(long, env = "RETRIEVAL_QUERY_VECTORS")]
     pub query_vectors: PathBuf,
 
     /// Ground-truth neighbors for those queries (.ibin)
-    #[arg(long)]
+    #[arg(long, env = "RETRIEVAL_QUERY_NEIGHBORS")]
     pub query_neighbors: PathBuf,
 
     /// Neighbors to request per query — the k every metric is taken at.
     /// Defaults to the ground-truth file's width, and may not exceed it.
-    #[arg(long, value_parser = parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_TOP_K", value_parser = parse_count_flag)]
     pub top_k: Option<usize>,
 
     /// Order in which base vectors are inserted: `shuffled` by `--seed`, or the file's `original` order
-    #[arg(long, value_enum, default_value = "shuffled")]
+    #[arg(long, env = "RETRIEVAL_INSERTION_ORDER", value_enum, default_value = "shuffled")]
     pub insertion_order: InsertionOrder,
 
     /// Seed of the shuffled insertion order, or `random` to draw one; 42 when unset
-    #[arg(long, value_parser = parse_seed_flag)]
+    #[arg(long, env = "RETRIEVAL_SEED", value_parser = parse_seed_flag)]
     pub seed: Option<Seed>,
 
     /// Number of measurement steps (dataset is split into this many equal parts)
-    #[arg(long, default_value_t = 10, value_parser = parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_STEPS", default_value_t = 10, value_parser = parse_count_flag)]
     pub steps: usize,
 
-    /// Vectors per backend add() call
-    #[arg(long, default_value_t = 10_000, value_parser = parse_count_flag)]
-    pub vectors_per_add: usize,
+    /// Vectors per add() call for each of the backend's worker threads
+    #[arg(long, env = "RETRIEVAL_INSERTS_PER_CORE", default_value_t = 2048, value_parser = parse_count_flag)]
+    pub inserts_per_core: usize,
 
-    /// Queries per backend search() call
-    #[arg(long, default_value_t = 10_000, value_parser = parse_count_flag)]
-    pub queries_per_search: usize,
+    /// Queries per search() call for each of the backend's worker threads
+    #[arg(long, env = "RETRIEVAL_QUERIES_PER_CORE", default_value_t = 2048, value_parser = parse_count_flag)]
+    pub queries_per_core: usize,
 
     /// Output directory for JSON result files
-    #[arg(long)]
+    #[arg(long, env = "RETRIEVAL_OUTPUT")]
     pub output: Option<PathBuf>,
 
     /// Cap the number of base vectors used (for calibration on a slice of a larger file).
     /// Queries and ground truth are unaffected; only the add/permutation range shrinks.
-    #[arg(long, value_parser = parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_MAX_BASE_VECTORS", value_parser = parse_count_flag)]
     pub max_base_vectors: Option<usize>,
 
     /// Persisted-index handle. For embedded backends (USearch, FAISS, cuVS): a
@@ -301,7 +301,7 @@ pub struct CommonArgs {
     /// backends: a collection / table / index name (not yet implemented).
     /// Requires a single-config sweep — multi-valued sweep axes are rejected
     /// at startup when `--index` is set.
-    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, env = "RETRIEVAL_INDEX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub index: Option<String>,
 
     /// Replay indexed vectors as their own queries and report the fraction that
@@ -310,12 +310,12 @@ pub struct CommonArgs {
     /// in the index is its own nearest neighbor. Because it can sweep the whole
     /// base rather than a short query file, it is also the only phase that
     /// measures throughput under sustained load.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, env = "RETRIEVAL_SELF_SEARCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
     pub self_search: bool,
 
     /// Neighbors requested per query during the self-recall sweep (the `k` in
     /// self-recall@k). No effect without `--self-search`.
-    #[arg(long, default_value_t = 10, value_parser = parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_SELF_SEARCH_TOP_K", default_value_t = 10, value_parser = parse_count_flag)]
     pub self_search_top_k: usize,
 
     /// How many base vectors the self-recall sweep replays. A bare integer ≥ 1
@@ -329,13 +329,13 @@ pub struct CommonArgs {
     /// figure stays clean. On a base whose row order carries structure (sorted,
     /// clustered, or concatenated shards) a partial sweep is therefore not a
     /// representative sample; only the default full sweep is unbiased.
-    #[arg(long, value_name = "N|FRACTION", value_parser = parse_self_search_sample, requires = "self_search")]
+    #[arg(long, env = "RETRIEVAL_SELF_SEARCH_SAMPLE", value_name = "N|FRACTION", value_parser = parse_self_search_sample, requires = "self_search")]
     pub self_search_sample: Option<SelfSearchSample>,
 
     /// Matryoshka-style embedding-dimension truncations to evaluate
     /// (comma-separated). Empty → use the file's native dimensions. Each value must
     /// be ≤ the native dimensions; for `.b1bin` files each must be a multiple of 8.
-    #[arg(long, value_delimiter = ',', value_parser = parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_DIMS", value_delimiter = ',', value_parser = parse_count_flag)]
     pub dims: Vec<usize>,
 }
 
@@ -403,8 +403,11 @@ pub struct BenchState {
     /// Resolved `--top-k`: the search width and the k every metric uses.
     pub top_k: usize,
     pub steps: usize,
-    pub vectors_per_add: usize,
-    pub queries_per_search: usize,
+    pub inserts_per_core: usize,
+    pub queries_per_core: usize,
+    /// Rows per `add` and `search` call: the per-core sizes times the running backend's threads.
+    inserts_per_call: usize,
+    queries_per_call: usize,
     pub self_search: bool,
     pub self_search_top_k: usize,
     pub self_search_sample: Option<SelfSearchSample>,
@@ -416,7 +419,7 @@ pub struct BenchState {
     /// Shared scratch for `Dataset::gather` (during add) and `Dataset::slice`
     /// (during search). Add and search are sequential within a step, so a
     /// single buffer sized at the upper bound is enough. Sized to fit
-    /// `max(vectors_per_add, queries_per_search) * native_vector_bytes` —
+    /// `max(inserts_per_call, queries_per_call) * native_vector_bytes` —
     /// covers any truncation since truncated bytes ≤ native.
     scratch_buf: Vec<u8, System>,
 }
@@ -531,8 +534,8 @@ impl BenchState {
         eprintln!("- Top k: {top_k}");
         eprintln!("- Dims: {}", spell_list(&args.dimensions_sweep(dimensions)));
         eprintln!("- Steps: {}", args.steps);
-        eprintln!("- Vectors per add: {}", args.vectors_per_add);
-        eprintln!("- Queries per search: {}", args.queries_per_search);
+        eprintln!("- Inserts per core: {}", args.inserts_per_core);
+        eprintln!("- Queries per core: {}", args.queries_per_core);
         match args.max_base_vectors {
             Some(count) => eprintln!("- Max base vectors: {count}"),
             None => eprintln!("- Max base vectors: all"),
@@ -572,8 +575,10 @@ impl BenchState {
             seed,
             top_k,
             steps: args.steps,
-            vectors_per_add: args.vectors_per_add,
-            queries_per_search: args.queries_per_search,
+            inserts_per_core: args.inserts_per_core,
+            queries_per_core: args.queries_per_core,
+            inserts_per_call: 0,
+            queries_per_call: 0,
             self_search: args.self_search,
             self_search_top_k: args.self_search_top_k,
             self_search_sample: args.self_search_sample,
@@ -585,20 +590,8 @@ impl BenchState {
                 buffers.resize(num_queries, top_k);
                 buffers
             },
-            key_scratch: {
-                let mut values = Vec::new_in(System);
-                values.resize(args.vectors_per_add, 0 as Key);
-                values
-            },
-            scratch_buf: {
-                let max_batch = args.vectors_per_add.max(args.queries_per_search);
-                let max_row_bytes = dataset.vector_bytes().max(query_dataset.vector_bytes());
-                {
-                    let mut values = Vec::new_in(System);
-                    values.resize(max_batch * max_row_bytes, 0u8);
-                    values
-                }
-            },
+            key_scratch: Vec::new_in(System),
+            scratch_buf: Vec::new_in(System),
             dataset,
             keys,
             query_dataset,
@@ -618,6 +611,17 @@ impl BenchState {
         self.dataset.check_dimensions(dimensions)?;
         self.query_dataset.check_dimensions(dimensions)?;
         Ok(())
+    }
+
+    /// Size calls and scratch to the backend's reported `threads`, or to one client thread when it reports none.
+    fn size_calls(&mut self, metadata: &HashMap<String, Value>) {
+        let cores = metadata.get("threads").and_then(Value::as_u64).unwrap_or(1) as usize;
+        self.inserts_per_call = self.inserts_per_core * cores;
+        self.queries_per_call = self.queries_per_core * cores;
+        let rows = self.inserts_per_call.max(self.queries_per_call);
+        let row_bytes = self.dataset.vector_bytes().max(self.query_dataset.vector_bytes());
+        self.key_scratch.resize(self.inserts_per_call, 0 as Key);
+        self.scratch_buf.resize(rows * row_bytes, 0u8);
     }
 }
 
@@ -667,7 +671,7 @@ struct StepSlice {
     dimensions: usize,
 }
 
-/// Insert one step's slice in `vectors_per_add` chunks, capturing perf counters
+/// Insert one step's slice in `inserts_per_call` chunks, capturing perf counters
 /// across the phase. Advances `vectors_indexed` to the new cumulative count.
 fn run_add_phase(
     backend: &mut dyn Backend,
@@ -683,7 +687,7 @@ fn run_add_phase(
         dimensions,
     } = slice;
     let total_vectors = state.total_vectors;
-    let vectors_per_add = state.vectors_per_add;
+    let inserts_per_call = state.inserts_per_call;
 
     let progress = ProgressBar::new(total_vectors as u64);
     progress.set_style(progress_style.clone());
@@ -693,7 +697,7 @@ fn run_add_phase(
     let add_start = Instant::now();
     let mut added = 0;
     while added < step_count {
-        let batch = vectors_per_add.min(step_count - added);
+        let batch = inserts_per_call.min(step_count - added);
         let logical_offset = step_start + added;
         let indices = state.perm.range(logical_offset, batch);
 
@@ -765,7 +769,7 @@ fn run_search_phase(
     let search_start = Instant::now();
     let mut searched = 0usize;
     while searched < num_queries {
-        let batch_rows = state.queries_per_search.min(num_queries - searched);
+        let batch_rows = state.queries_per_call.min(num_queries - searched);
         let batch_queries = state
             .query_dataset
             .slice(searched, batch_rows, dimensions, &mut state.scratch_buf);
@@ -879,7 +883,7 @@ fn run_self_search_phase(
     num_queries: usize,
     dimensions: usize,
 ) -> BenchResult<StepSearchEntry> {
-    let batch_size = state.queries_per_search.min(num_queries).max(1);
+    let batch_size = state.queries_per_call.min(num_queries).max(1);
     let mut batch_keys = {
         let mut values = Vec::new_in(System);
         values.resize(batch_size * count, 0 as Key);
@@ -1059,8 +1063,8 @@ fn save_report(
     metadata.insert("vectors_count".into(), Value::from(state.total_vectors));
     metadata.insert("seed".into(), Value::from(state.seed.map(|seed| seed.0)));
     metadata.insert("steps".into(), Value::from(state.steps));
-    metadata.insert("vectors_per_add".into(), Value::from(state.vectors_per_add));
-    metadata.insert("queries_per_search".into(), Value::from(state.queries_per_search));
+    metadata.insert("inserts_per_core".into(), Value::from(state.inserts_per_core));
+    metadata.insert("queries_per_core".into(), Value::from(state.queries_per_core));
     metadata.insert("top_k".into(), Value::from(state.top_k));
     if let Some(entry) = steps.last().and_then(|step| step.self_search.as_ref()) {
         metadata.insert("self_search_top_k".into(), Value::from(entry.top_k));
@@ -1099,6 +1103,7 @@ pub fn run(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize)
 
     let description = backend.description();
     let metadata = backend.metadata();
+    state.size_calls(&metadata);
     eprintln!("\n── {description} ──");
 
     let num_steps = state.steps;
@@ -1221,6 +1226,7 @@ pub fn run_search_only(backend: &mut dyn Backend, state: &mut BenchState, dimens
 
     let description = backend.description();
     let metadata = backend.metadata();
+    state.size_calls(&metadata);
     eprintln!("\n── {description} (search-only) ──");
 
     let search_style = ProgressStyle::default_bar()

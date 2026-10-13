@@ -53,11 +53,11 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metric
-    #[arg(long, value_enum, default_value = "l2")]
+    #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "l2")]
     metric: Metric,
 
     /// Database file, or `:memory:`; only its `bench` table is recreated
-    #[arg(long, default_value = ":memory:", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, env = "RETRIEVAL_DB_PATH", default_value = ":memory:", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     db_path: String,
 }
 

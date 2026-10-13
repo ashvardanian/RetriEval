@@ -68,11 +68,11 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metric
-    #[arg(long, value_enum, default_value = "l2")]
+    #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "l2")]
     metric: Metric,
 
     /// Path for LanceDB storage
-    #[arg(long, default_value = "/tmp/retrieval-lancedb", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, env = "RETRIEVAL_DB_PATH", default_value = "/tmp/retrieval-lancedb", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     db_path: String,
 }
 

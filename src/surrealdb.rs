@@ -67,27 +67,33 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metrics (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_METRIC",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "l2"
+    )]
     metric: Vec<Metric>,
 
     /// HNSW connectivity M, at least 2 (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// HNSW expansion factor during indexing, SurrealDB's `EFC` (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// HNSW expansion factor during search, the `EF` of each KNN query (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
     /// Time limit for container start and readiness, and for each HTTP request, like 120s
-    #[arg(long, default_value = "120s", value_parser = retrieval::parse_duration_flag)]
+    #[arg(long, env = "RETRIEVAL_STARTUP_TIME_LIMIT", default_value = "120s", value_parser = retrieval::parse_duration_flag)]
     startup_time_limit: Duration,
 
     /// SurrealDB HTTP port
-    #[arg(long, default_value = "8000", value_parser = retrieval::parse_port)]
+    #[arg(long, env = "RETRIEVAL_PORT", default_value = "8000", value_parser = retrieval::parse_port)]
     port: Port,
 }
 
@@ -447,7 +453,7 @@ fn main() {
     for &dimension in &dimensions {
         state.check_dimensions(dimension).unwrap_or_bail("invalid --dims");
     }
-    let rows_per_request = cli.common.vectors_per_add.max(cli.common.queries_per_search);
+    let rows_per_request = cli.common.inserts_per_core.max(cli.common.queries_per_core);
     let widest = dimensions
         .iter()
         .copied()

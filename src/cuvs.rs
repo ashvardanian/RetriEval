@@ -521,46 +521,58 @@ struct Cli {
     common: CommonArgs,
 
     /// Quantization types (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "f32")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_DATA_TYPE",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "f32"
+    )]
     data_type: Vec<CuvsDataType>,
 
     /// Distance metrics (comma-separated for sweep)
-    #[arg(long, value_delimiter = ',', value_enum, default_value = "l2")]
+    #[arg(
+        long,
+        env = "RETRIEVAL_METRIC",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "l2"
+    )]
     metric: Vec<Metric>,
 
     /// CAGRA output graph degree — the shared-vocabulary name for HNSW's M.
-    #[arg(long, value_delimiter = ',', default_value = "32", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "32", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
     /// CAGRA intermediate graph degree before pruning — analogous to
     /// `ef_construction`.
-    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
     /// CAGRA internal top-i list retained during search — analogous to
     /// `ef_search`. Higher values improve recall at the cost of speed.
-    #[arg(long, value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
     /// Graph nodes used as starting points per search iteration, or `auto`
     /// for cuVS's choice (comma-separated for sweep). Higher values improve recall.
-    #[arg(long, value_delimiter = ',', default_value = "auto", value_parser = parse_count_or_auto)]
+    #[arg(long, env = "RETRIEVAL_SEARCH_WIDTH", value_delimiter = ',', default_value = "auto", value_parser = parse_count_or_auto)]
     search_width: Vec<Option<usize>>,
 
     /// Minimum search iterations, preventing early termination; cuVS chooses when unset.
-    #[arg(long, value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_MIN_ITERATIONS", value_parser = retrieval::parse_count_flag)]
     min_iterations: Option<usize>,
 
     /// Maximum search iterations; cuVS chooses when unset.
-    #[arg(long, value_parser = retrieval::parse_count_flag)]
+    #[arg(long, env = "RETRIEVAL_MAX_ITERATIONS", value_parser = retrieval::parse_count_flag)]
     max_iterations: Option<usize>,
 
     /// Random sampling rounds for the initial search points; cuVS chooses when unset.
-    #[arg(long, value_parser = |text: &str| retrieval::parse_count_flag(text).and_then(|count| u32::try_from(count).map_err(|_| "expected a positive count".into())))]
+    #[arg(long, env = "RETRIEVAL_NUM_RANDOM_SAMPLINGS", value_parser = |text: &str| retrieval::parse_count_flag(text).and_then(|count| u32::try_from(count).map_err(|_| "expected a positive count".into())))]
     num_random_samplings: Option<u32>,
 
     /// Graph build algorithm.
-    #[arg(long, value_enum, default_value = "auto")]
+    #[arg(long, env = "RETRIEVAL_BUILD_ALGO", value_enum, default_value = "auto")]
     build_algo: BuildAlgo,
 }
 
