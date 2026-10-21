@@ -6,7 +6,6 @@
 .DS_Store
 *.jsonl
 
-/datasets
 /plots
 *.usearch
 __pycache__/
