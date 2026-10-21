@@ -41,7 +41,7 @@ use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, Seeda
 use serde_json::Value;
 
 use retrieval::{
-    generate::{binary_view, compute_hamming_top_k, matrix_span},
+    generate::{binary_view, compute_hamming_top_k, matrix_span, DEFAULT_QUERY_BATCH},
     Seed, Threads,
 };
 
@@ -82,7 +82,7 @@ struct Cli {
     #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
     top_k: usize,
 
-    /// Ground-truth query batch size. Auto-tuned from free RAM when omitted.
+    /// Queries per ground-truth kernel call; memory stays bounded by the distance tile either way.
     #[arg(long, value_parser = retrieval::parse_count_flag)]
     ground_truth_batch: Option<usize>,
 
@@ -313,10 +313,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("- Query count: {}", cli.query_count);
     eprintln!("- Top k: {}", cli.top_k);
-    match cli.ground_truth_batch {
-        Some(batch) => eprintln!("- Ground-truth batch: {batch}"),
-        None => eprintln!("- Ground-truth batch: auto"),
-    }
+    eprintln!(
+        "- Ground-truth batch: {}",
+        cli.ground_truth_batch.unwrap_or(DEFAULT_QUERY_BATCH)
+    );
     eprintln!("- Threads: {}", cli.threads);
     eprintln!("- Download concurrency: {}", cli.download_concurrency);
     eprintln!("- No text: {}", cli.no_text);

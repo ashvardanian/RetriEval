@@ -3,7 +3,7 @@
 //! This file doubles as:
 //! - the `retri-generate` binary (has a `main()`), and
 //! - the `retrieval::generate` library module, exposing
-//!   [`compute_hamming_top_k`], [`auto_tune_batch`], [`binary_view`], and
+//!   [`compute_hamming_top_k`], [`DEFAULT_QUERY_BATCH`], [`binary_view`], and
 //!   [`matrix_span`] for the dataset-download binaries under `scripts/`.
 //!
 //! ## Build & Install
@@ -37,67 +37,38 @@ use retrieval::{error::GroundTruthError, packed_distance::PackedDistance, Seed, 
 
 // #region Ground truth helpers — consumed by download scripts
 
-/// Upper bound on the auto-tuned batch size. Beyond this, the per-batch
-/// distance tensor allocation gets wasteful without helping throughput —
-/// NumKong's packed kernel already saturates every core regardless of
-/// batch width.
-pub const MAX_AUTO_BATCH_SIZE: usize = 4096;
+/// Queries per distance-kernel call when `--ground-truth-batch` is not given.
+pub const DEFAULT_QUERY_BATCH: usize = 4096;
 
-/// Lower bound on the auto-tuned batch size. Below this, the per-batch
-/// setup cost (packed kernel dispatch, top-K tear-up) starts to dominate
-/// the useful work.
-pub const MIN_AUTO_BATCH_SIZE: usize = 8;
-
-/// Fraction of available RAM the auto-tuner will budget for the per-batch
-/// distance matrix. 25 % leaves room for the packed base, OS cache, and
-/// per-thread scratch.
-const AUTO_BATCH_MEMORY_FRACTION: usize = 4; // budget = available / 4
-
-/// Auto-tune the query batch size for ground-truth computation.
-///
-/// The dominant memory cost per batch is the distance matrix of
-/// `batch * base_count * size_of::<DistanceScalar>()` bytes (where
-/// `DistanceScalar` is `u32` for Hamming and `f64` for Euclidean on `f32`
-/// input). We budget roughly `1 / AUTO_BATCH_MEMORY_FRACTION` of available
-/// RAM for that matrix and derive the batch size, then clamp to
-/// `[MIN_AUTO_BATCH_SIZE, MAX_AUTO_BATCH_SIZE]`.
-///
-/// # Arguments
-///
-/// - `base_count` — number of base vectors (drives row width of the
-///   distance matrix).
-/// - `query_count` — total query count (used only as an upper clamp so we
-///   don't return a batch larger than the workload).
-///
-/// # Returns
-///
-/// A batch size in `[MIN_AUTO_BATCH_SIZE, MAX_AUTO_BATCH_SIZE]`, further
-/// bounded above by `max(1, query_count)`.
-pub fn auto_tune_batch(base_count: usize, query_count: usize) -> usize {
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
-    let available_bytes = system.available_memory() as usize;
-
-    let budget_bytes = available_bytes / AUTO_BATCH_MEMORY_FRACTION;
-    let row_bytes = base_count.saturating_mul(std::mem::size_of::<u32>()).max(1);
-    let from_memory = (budget_bytes / row_bytes).max(1);
-
-    from_memory
-        .clamp(MIN_AUTO_BATCH_SIZE, MAX_AUTO_BATCH_SIZE)
-        .min(query_count.max(1))
-}
+/// Bytes of the per-call distance tile, enough cells for one kernel call to keep every core busy.
+/// The base is walked in tiles of this size, so memory stays fixed however large the base grows.
+const DISTANCE_TILE_BYTES: usize = 1 << 30;
 
 /// Exact top-K via NumKong's packed distance kernels plus a ForkUnion-parallel
 /// top-K pass (NumKong provides distances but no top-K).
 ///
 /// All three views must have contiguous rows; `base` and `queries` must agree
 /// on width, and `ground_truth` is `[query_count, top_k]`. `batch_size = None`
-/// triggers [`auto_tune_batch`]. Ties break toward the lower base index.
+/// uses [`DEFAULT_QUERY_BATCH`]. Ties break toward the lower base index.
 pub fn compute_top_k<Metric: PackedDistance>(
     base: MatrixView<'_, Metric>,
     queries: MatrixView<'_, Metric>,
-    mut ground_truth: MatrixSpan<'_, u32>,
+    ground_truth: MatrixSpan<'_, u32>,
     batch_size: Option<usize>,
+    threads: Threads,
+) -> Result<(), GroundTruthError> {
+    let batch = batch_size.unwrap_or(DEFAULT_QUERY_BATCH).min(queries.shape()[0].max(1));
+    let tile_rows = DISTANCE_TILE_BYTES / (batch * std::mem::size_of::<Metric::Distance>());
+    compute_top_k_tiled(base, queries, ground_truth, batch, tile_rows, threads)
+}
+
+/// [`compute_top_k`] with an explicit base tile, which tests shrink to cross tile boundaries.
+fn compute_top_k_tiled<Metric: PackedDistance>(
+    base: MatrixView<'_, Metric>,
+    queries: MatrixView<'_, Metric>,
+    mut ground_truth: MatrixSpan<'_, u32>,
+    batch: usize,
+    tile_rows: usize,
     threads: Threads,
 ) -> Result<(), GroundTruthError> {
     if !base.has_contiguous_rows() {
@@ -130,37 +101,28 @@ pub fn compute_top_k<Metric: PackedDistance>(
         return Err(GroundTruthError::TopKTooLarge { top_k, base_count });
     }
     let threads = threads.0.get();
+    let tile_rows = tile_rows.clamp(top_k, base_count);
 
-    let batch = batch_size
-        .unwrap_or_else(|| auto_tune_batch(base_count, query_count))
-        .min(query_count.max(1));
-    let auto_tag = if batch_size.is_none() { " (auto)" } else { "" };
     eprintln!(
         "  ground truth ({metric}): base_count={base_count}, query_count={query_count}, \
-         dimensions={dimensions}, top_k={top_k}, \
-         batch_size={batch}{auto_tag}, threads={threads}",
+         dimensions={dimensions}, top_k={top_k}, batch_size={batch}, tile_rows={tile_rows}, threads={threads}",
         metric = Metric::metric_name()
     );
 
-    let base_tensor = padded_matrix(base)?;
-    let packed_base = numkong::PackedMatrix::pack(&base_tensor);
-    drop(base_tensor);
-
     let mut pool = ThreadPool::try_spawn(threads).map_err(|e| GroundTruthError::ThreadPool(format!("{e}")))?;
 
-    // One reusable distance tensor of shape `[batch, base_count]` of
-    // `Metric::Distance` scalars. Each per-query batch writes into the
-    // first `batch_count` rows.
+    // One reusable `[batch, tile_rows]` distance buffer; each call views a contiguous prefix of it.
     let mut distance_tensor =
-        numkong::Matrix::<Metric::Distance>::try_full(&[batch, base_count], Metric::Distance::default())?;
+        numkong::Matrix::<Metric::Distance>::try_full(&[batch, tile_rows], Metric::Distance::default())?;
 
-    let ground_truth_ptr = SyncMutPtr::new(ground_truth.as_mut_ptr());
-    let gt_row_stride = (ground_truth.stride_bytes(0) as usize) / std::mem::size_of::<u32>();
+    // Per-query size-K max-heaps keyed on `(OrderingKey, base_idx)`, carried across tiles.
+    // `BinaryHeap` is a max-heap, so the largest kept distance is evicted first, and
+    // the tuple order breaks ties toward the lower global index.
+    let mut heaps: Vec<BinaryHeap<(Metric::OrderingKey, u32)>> =
+        (0..query_count).map(|_| BinaryHeap::with_capacity(top_k + 1)).collect();
+    let heaps_ptr = SyncMutPtr::new(heaps.as_mut_ptr());
 
-    // TTY-aware progress bar. Matches the styling already used by
-    // `bench.rs::run`'s add/search phases so redirected output stays quiet
-    // while an attached terminal shows live `{pos}/{len} ({per_sec}, ETA)`.
-    let progress = indicatif::ProgressBar::new(query_count as u64);
+    let progress = indicatif::ProgressBar::new(base_count as u64);
     progress.set_style(
         indicatif::ProgressStyle::with_template("  {msg} [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
             .unwrap()
@@ -168,72 +130,57 @@ pub fn compute_top_k<Metric: PackedDistance>(
     );
     progress.set_message(format!("ground truth ({})", Metric::metric_name()));
 
-    for batch_start in (0..query_count).step_by(batch) {
-        let batch_end = (batch_start + batch).min(query_count);
-        let batch_count = batch_end - batch_start;
+    for tile_start in (0..base_count).step_by(tile_rows) {
+        let tile_end = (tile_start + tile_rows).min(base_count);
+        let tile_count = tile_end - tile_start;
+        let tile_tensor = padded_matrix(base.slice((tile_start..tile_end, ..))?)?;
+        let packed_tile = numkong::PackedMatrix::pack(&tile_tensor);
+        drop(tile_tensor);
 
-        let query_tensor = padded_matrix(queries.slice((batch_start..batch_end, ..))?)?;
+        for batch_start in (0..query_count).step_by(batch) {
+            let batch_end = (batch_start + batch).min(query_count);
+            let batch_count = batch_end - batch_start;
+            let query_tensor = padded_matrix(queries.slice((batch_start..batch_end, ..))?)?;
 
-        // NumKong writes the distance matrix in parallel using our pool.
-        // Pass only the used prefix span so the kernel doesn't touch unused
-        // trailing rows of the reusable tensor.
-        let mut distance_span = distance_tensor.slice_mut((0..batch_count, ..))?;
-        Metric::distances_parallel_into(&query_tensor, &packed_base, &mut distance_span, &mut pool)?;
+            let distances = &mut distance_tensor.as_mut_slice()[..batch_count * tile_count];
+            let mut distance_span = matrix_span(distances, batch_count, tile_count);
+            Metric::distances_parallel_into(&query_tensor, &packed_tile, &mut distance_span, &mut pool)?;
 
-        // Row-parallel top-K extraction. NumKong has no top-K, so we fan out
-        // over queries ourselves and write straight into `ground_truth`.
-        let distances = distance_tensor.as_slice();
-        let split = IndexedSplit::new(batch_count, threads);
-
-        pool.for_threads(|thread_index, _| {
-            // Per-thread size-K max-heap keyed on `(OrderingKey, base_idx)`.
-            // `BinaryHeap` is a max-heap; we evict the largest-seen distance
-            // when a smaller one arrives. Tuple ordering breaks ties by index
-            // ascending. `OrderingKey` is `Metric::Distance` for integral
-            // metrics, or a bit-projection (`f64::to_bits`) for floats so
-            // `Ord` is well-defined without a newtype wrapper.
-            let mut heap: BinaryHeap<(Metric::OrderingKey, u32)> = BinaryHeap::with_capacity(top_k + 1);
-            for local_idx in split.get(thread_index) {
-                debug_assert!(heap.is_empty());
-                let row_offset = local_idx * base_count;
-                for base_idx in 0..base_count {
-                    let key = Metric::ordering_key(distances[row_offset + base_idx]);
-                    if heap.len() < top_k {
-                        heap.push((key, base_idx as u32));
-                    } else if key < heap.peek().unwrap().0 {
-                        heap.pop();
-                        heap.push((key, base_idx as u32));
+            let distances = &distance_tensor.as_slice()[..batch_count * tile_count];
+            let split = IndexedSplit::new(batch_count, threads);
+            pool.for_threads(|thread_index, _| {
+                for local_idx in split.get(thread_index) {
+                    // SAFETY: `IndexedSplit` hands each query of the batch to exactly one thread.
+                    let heap = unsafe { &mut *heaps_ptr.as_ptr().add(batch_start + local_idx) };
+                    let row = &distances[local_idx * tile_count..][..tile_count];
+                    for (tile_idx, &distance) in row.iter().enumerate() {
+                        let key = Metric::ordering_key(distance);
+                        let base_idx = (tile_start + tile_idx) as u32;
+                        if heap.len() < top_k {
+                            heap.push((key, base_idx));
+                        } else if key < heap.peek().unwrap().0 {
+                            heap.pop();
+                            heap.push((key, base_idx));
+                        }
                     }
                 }
-                // Drain into the output row in ascending-distance order by
-                // popping K times and writing from rank = K-1 down to 0.
-                //
-                // SAFETY: each thread owns a disjoint `top_k`-wide row, keyed
-                // by the thread-local `query_idx` which ranges over this
-                // batch's `[batch_start, batch_end)` — ForkUnion's
-                // `IndexedSplit` guarantees those ranges are disjoint across
-                // threads. We reconstruct the row as a proper `&mut [u32]`
-                // so the inner pop/write loop is bounds-checked rather than
-                // pointer-arithmetic.
-                let query_idx = batch_start + local_idx;
-                let row: &mut [u32] = unsafe {
-                    std::slice::from_raw_parts_mut(ground_truth_ptr.as_ptr().add(query_idx * gt_row_stride), top_k)
-                };
-                for rank in (0..top_k).rev() {
-                    // SAFETY of `unwrap_unchecked`: at this point the heap
-                    // holds exactly `top_k` entries because `top_k <=
-                    // base_count` was checked up front and we pushed once
-                    // per `base_idx`.
-                    let (_, base_idx) = unsafe { heap.pop().unwrap_unchecked() };
-                    row[rank] = base_idx;
-                }
-            }
-        });
-
-        progress.set_position(batch_end as u64);
+            });
+        }
+        progress.set_position(tile_end as u64);
     }
     progress.finish_and_clear();
 
+    // Drain each heap into its output row in ascending-distance order.
+    let gt_row_stride = (ground_truth.stride_bytes(0) as usize) / std::mem::size_of::<u32>();
+    for (query_idx, heap) in heaps.iter_mut().enumerate() {
+        // SAFETY: rows are contiguous and `query_idx < query_count` rows of `gt_row_stride` were checked above.
+        let row: &mut [u32] =
+            unsafe { std::slice::from_raw_parts_mut(ground_truth.as_mut_ptr().add(query_idx * gt_row_stride), top_k) };
+        for rank in (0..top_k).rev() {
+            // `top_k <= base_count` guarantees every heap holds exactly `top_k` entries.
+            row[rank] = heap.pop().unwrap().1;
+        }
+    }
     Ok(())
 }
 
@@ -384,8 +331,7 @@ struct Cli {
     #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
     top_k: usize,
 
-    /// Ground-truth query batch size. When omitted, auto-tuned from available RAM
-    /// (distance matrix is `batch_size * base_count * 4 bytes`).
+    /// Queries per ground-truth kernel call; memory stays bounded by the distance tile either way.
     #[arg(long, value_parser = retrieval::parse_count_flag)]
     ground_truth_batch: Option<usize>,
 
@@ -556,10 +502,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("- Clusters: {}", cli.clusters);
     eprintln!("- Noise: {}", cli.noise);
     eprintln!("- Top k: {}", cli.top_k);
-    match cli.ground_truth_batch {
-        Some(batch) => eprintln!("- Ground-truth batch: {batch}"),
-        None => eprintln!("- Ground-truth batch: auto"),
-    }
+    eprintln!(
+        "- Ground-truth batch: {}",
+        cli.ground_truth_batch.unwrap_or(DEFAULT_QUERY_BATCH)
+    );
     eprintln!("- Threads: {}", cli.threads);
     eprintln!("- Seed: {}", cli.seed);
     eprintln!("- Output: {}", cli.output.display());
@@ -726,21 +672,22 @@ mod tests {
 
     use rand::{rngs::StdRng, RngExt, SeedableRng};
 
-    use super::{binary_view, compute_top_k, generate_gaussian_f32, matrix_span, matrix_view};
+    use super::{binary_view, compute_top_k_tiled, generate_gaussian_f32, matrix_span, matrix_view};
     use retrieval::Threads;
 
     const BASE_COUNT: usize = 300;
     const QUERY_COUNT: usize = 20;
     const TOP_K: usize = 10;
 
-    /// Runs `compute_top_k` across several batches and returns each query's neighbor ids.
+    /// Runs the tiled top-K across several query batches and base tiles, the last tile short,
+    /// and returns each query's neighbor ids.
     fn top_k<Metric: retrieval::packed_distance::PackedDistance>(
         base: numkong::MatrixView<'_, Metric>,
         queries: numkong::MatrixView<'_, Metric>,
     ) -> Vec<u32> {
         let mut ground_truth = vec![0u32; QUERY_COUNT * TOP_K];
         let span = matrix_span(&mut ground_truth, QUERY_COUNT, TOP_K);
-        compute_top_k(base, queries, span, Some(7), Threads(NonZeroUsize::new(2).unwrap())).unwrap();
+        compute_top_k_tiled(base, queries, span, 7, 64, Threads(NonZeroUsize::new(2).unwrap())).unwrap();
         ground_truth
     }
 
