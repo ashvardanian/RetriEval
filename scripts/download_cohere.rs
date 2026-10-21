@@ -55,6 +55,12 @@ const OUTPUT_BUFFER_BYTES: usize = 1 << 20;
 /// Time limit for each HTTP request, shard downloads included.
 const HTTP_REQUEST_TIME_LIMIT: Duration = Duration::from_secs(600);
 
+/// Attempts per shard before a failure ends the run.
+const SHARD_ATTEMPTS: u32 = 5;
+
+/// Delay before the first retry, doubled for each one after it.
+const SHARD_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 const HF_API_TREE: &str =
     "https://huggingface.co/api/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary/tree/main";
 const HF_RESOLVE: &str =
@@ -159,12 +165,23 @@ async fn list_shard_urls(
     Ok(shard_paths)
 }
 
+/// Fetches one shard, retrying failures with doubling delays.
 async fn download_shard(client: &reqwest::Client, url: &str) -> Result<Bytes, Box<dyn std::error::Error>> {
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(format!("GET {url} -> {}", response.status()).into());
+    let mut last_failure = String::new();
+    for attempt in 0..SHARD_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(SHARD_RETRY_DELAY * (1 << (attempt - 1))).await;
+        }
+        match client.get(url).send().await {
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => last_failure = format!("GET {url}: {error}"),
+            },
+            Ok(response) => last_failure = format!("GET {url} -> {}", response.status()),
+            Err(error) => last_failure = format!("GET {url}: {error}"),
+        }
     }
-    Ok(response.bytes().await?)
+    Err(last_failure.into())
 }
 
 /// Extract `emb_ubinary` bytes (+ optional text columns) from one Parquet shard
