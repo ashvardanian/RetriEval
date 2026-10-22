@@ -93,13 +93,14 @@ struct Cli {
     #[arg(long, default_value_t = 512 * SHARD_ROWS, value_parser = retrieval::parse_count_flag)]
     part_rows: usize,
 
-    /// Number of query vectors to randomly sample from the base set.
+    /// Number of query vectors to randomly sample from the base set; needs `--top-k`.
     #[arg(long, default_value_t = 10_000, value_parser = retrieval::parse_count_flag)]
     query_count: usize,
 
     /// Top-K neighbors to record per query in the ground truth file.
-    #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
-    top_k: usize,
+    /// Without it, only the base parts are written, for self-recall benchmarks.
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
+    top_k: Option<usize>,
 
     /// Queries per ground-truth kernel call; memory stays bounded by the distance tile either way.
     #[arg(long, value_parser = retrieval::parse_count_flag)]
@@ -356,7 +357,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("- Part rows: {}", cli.part_rows);
     eprintln!("- Query count: {}", cli.query_count);
-    eprintln!("- Top k: {}", cli.top_k);
+    match cli.top_k {
+        Some(top_k) => eprintln!("- Top k: {top_k}"),
+        None => eprintln!("- Top k: none, no queries or ground truth"),
+    }
     eprintln!(
         "- Ground-truth batch: {}",
         cli.ground_truth_batch.unwrap_or(DEFAULT_QUERY_BATCH)
@@ -492,6 +496,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Downloaded {total_rows} molecules in {part_index} parts ({:.2} GB base data)",
         (total_rows * info.bytes_per_vector) as f64 / (1u64 << 30) as f64
     );
+    let Some(top_k) = cli.top_k else {
+        return Ok(());
+    };
 
     // Memory-map the parts for query sampling + ground truth.
     let parts = (0..part_index)
@@ -535,7 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ground truth.
     eprintln!(
         "Computing brute-force hamming top-{} ground truth (NumKong + ForkUnion)...",
-        cli.top_k
+        top_k
     );
     // NumKong's u1x8 storage requires bit dimensions to be multiples of 8.
     // MACCS (166) and PubChem (881) fingerprints round up to full-byte counts;
@@ -548,10 +555,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_view = binary_view(&query_buffer, query_count, storage_bits);
     let mut ground_truth_indices = {
         let mut values = Vec::new_in(std::alloc::System);
-        values.resize(query_count * cli.top_k, 0u32);
+        values.resize(query_count * top_k, 0u32);
         values
     };
-    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.top_k);
+    let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, top_k);
     compute_hamming_top_k(
         &base_views,
         query_view,
@@ -562,7 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gt_path = cli.output.join(format!("groundtruth.{query_count}.ibin"));
     let mut gt_file = File::create(&gt_path)?;
-    write_bin_header(&mut gt_file, query_count as u32, cli.top_k as u32)?;
+    write_bin_header(&mut gt_file, query_count as u32, top_k as u32)?;
     // SAFETY: `u32` is POD.
     gt_file.write_all(unsafe { retrieval::pod_slice_as_bytes(&ground_truth_indices) })?;
     eprintln!("Wrote {}", gt_path.display());
@@ -571,6 +578,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_dir_all(&parquet_dir);
     }
 
-    eprintln!("Done: {} base x {} queries, top-{}", total_rows, query_count, cli.top_k);
+    eprintln!("Done: {} base x {} queries, top-{}", total_rows, query_count, top_k);
     Ok(())
 }
