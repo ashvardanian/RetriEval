@@ -1,5 +1,5 @@
 //! Download a subset of the USearchMolecules dataset, extract one binary
-//! fingerprint column into the standard `.b1bin` format, and precompute
+//! fingerprint column into `.b1bin` base parts, and precompute
 //! Hamming top-K ground truth with NumKong + ForkUnion.
 //!
 //! ## Build & Install
@@ -35,8 +35,8 @@
 use std::{
     fmt,
     fs::File,
-    io::{BufWriter, Seek, SeekFrom, Write},
-    path::PathBuf,
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -87,6 +87,11 @@ struct Cli {
     /// Maximum molecules to extract (default: all available shards).
     #[arg(long, value_parser = retrieval::parse_count_flag)]
     limit: Option<usize>,
+
+    /// Rows per base part, `base.part_N.b1bin`, a whole number of the bucket's 1M-row shards.
+    /// Keeps each part's `u32` row count in range; Enamine's 6.04B rows overflow a single file.
+    #[arg(long, default_value_t = 512 * SHARD_ROWS, value_parser = retrieval::parse_count_flag)]
+    part_rows: usize,
 
     /// Number of query vectors to randomly sample from the base set.
     #[arg(long, default_value_t = 10_000, value_parser = retrieval::parse_count_flag)]
@@ -224,6 +229,33 @@ fn write_bin_header_buf<W: Write>(writer: &mut W, rows: u32, dimensions_bits: u3
     writer.write_all(&dimensions_bits.to_le_bytes())
 }
 
+fn part_path(output: &Path, part_index: usize) -> PathBuf {
+    output.join(format!("base.part_{part_index:03}.b1bin"))
+}
+
+/// Rows a part's header counts: zero while the part is being written, `None` when it is missing.
+fn part_rows_of(path: &Path) -> std::io::Result<Option<usize>> {
+    let mut header = [0u8; 4];
+    match File::open(path) {
+        Ok(mut file) => file
+            .read_exact(&mut header)
+            .map(|_| Some(u32::from_le_bytes(header) as usize)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Patches a written part's row count into its header and syncs it to disk.
+fn finish_part(writer: BufWriter<File>, rows: usize, dimensions_bits: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = writer
+        .into_inner()
+        .map_err(|error| format!("flush part writer: {error}"))?;
+    file.seek(SeekFrom::Start(0))?;
+    write_bin_header(&mut file, rows as u32, dimensions_bits as u32)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// Fetches one shard, retrying failures with doubling delays.
 /// Returns `None` only when every attempt answered 403 or 404, which this bucket's ACL uses past the last shard.
 async fn download_shard(client: &reqwest::Client, url: &str) -> Result<Option<Bytes>, Box<dyn std::error::Error>> {
@@ -322,6 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(limit) => eprintln!("- Limit: {limit}"),
         None => eprintln!("- Limit: all"),
     }
+    eprintln!("- Part rows: {}", cli.part_rows);
     eprintln!("- Query count: {}", cli.query_count);
     eprintln!("- Top k: {}", cli.top_k);
     eprintln!(
@@ -345,6 +378,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = reqwest::Client::builder().timeout(HTTP_REQUEST_TIME_LIMIT).build()?;
 
+    if !cli.part_rows.is_multiple_of(SHARD_ROWS) || cli.part_rows > u32::MAX as usize {
+        return Err(format!("--part-rows must be a multiple of {SHARD_ROWS} up to {}", u32::MAX).into());
+    }
+    let shards_per_part = cli.part_rows / SHARD_ROWS;
+
     // Shard planning: request enough shards to cover `--limit`; if omitted,
     // walk shards until we hit a 403/404. We still need an upper bound to
     // build the shard-index stream — 16K > any USearchMolecules source (enamine
@@ -357,25 +395,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SHARD_CEILING
     };
 
-    // Stream shards to a temporary base file first without the header; we'll
-    // seek back and patch the row count in once the total is known. BufWriter
-    // keeps per-row writes cheap when copying from FixedSizeBinaryArray.
-    let base_path_tmp = cli.output.join("base.tmp.b1bin");
-    let base_file_handle = File::create(&base_path_tmp)?;
-    let mut base_file = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, base_file_handle);
-    // Placeholder header (8 bytes of zero). We'll rewrite it at the end.
-    write_bin_header_buf(&mut base_file, 0, info.dimensions_bits as u32)?;
+    // Parts an earlier run finished are kept, so a rerun fetches only the shards after them.
+    let mut part_index = 0;
+    while (part_index + 1) * cli.part_rows <= limit
+        && part_rows_of(&part_path(&cli.output, part_index))? == Some(cli.part_rows)
+    {
+        part_index += 1;
+    }
+    let first_shard = part_index * shards_per_part;
+    if part_index > 0 {
+        eprintln!("Keeping {part_index} finished parts, resuming at shard {first_shard}");
+    }
 
     let progress = ProgressBar::new(max_shards as u64);
     progress.set_style(
         ProgressStyle::with_template("  {spinner} downloading shards: {pos}/{len} [{elapsed_precise}] {msg}").unwrap(),
     );
+    progress.set_position(first_shard as u64);
 
     // Concurrent download with ordered processing: we need rows in shard order
     // for deterministic output. `buffered(n)` preserves request order.
-    let urls = (0..max_shards).map(|shard_index| (shard_index, shard_url(&cli.url_prefix, source, shard_index)));
+    let urls =
+        (first_shard..max_shards).map(|shard_index| (shard_index, shard_url(&cli.url_prefix, source, shard_index)));
 
-    let mut total_rows: usize = 0;
+    // Each part is written with a zero row count, patched in once the part fills,
+    // so an interrupted part never passes for a finished one.
+    let mut total_rows = first_shard * SHARD_ROWS;
+    let mut part: Option<(BufWriter<File>, usize)> = None;
     let mut stream = stream::iter(urls)
         .map(|(shard_index, url)| {
             let client = client.clone();
@@ -407,8 +453,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if remaining == 0 {
             break;
         }
-        let appended = extract_and_append(bytes, &info, remaining, &mut base_file)?;
+        let (writer, part_rows) = match &mut part {
+            Some(part) => part,
+            None => {
+                let file = File::create(part_path(&cli.output, part_index))?;
+                let mut writer = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, file);
+                write_bin_header_buf(&mut writer, 0, info.dimensions_bits as u32)?;
+                part.insert((writer, 0))
+            }
+        };
+        let appended = extract_and_append(bytes, &info, remaining, writer)?;
+        *part_rows += appended;
         total_rows += appended;
+        if *part_rows == cli.part_rows {
+            let (writer, part_rows) = part.take().unwrap();
+            finish_part(writer, part_rows, info.dimensions_bits)?;
+            part_index += 1;
+        }
         progress.set_position((shard_index + 1) as u64);
         progress.set_message(format!(
             "{total_rows} rows ({:.1} GB)",
@@ -419,53 +480,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     progress.finish_and_clear();
+    if let Some((writer, part_rows)) = part.take() {
+        finish_part(writer, part_rows, info.dimensions_bits)?;
+        part_index += 1;
+    }
 
     if total_rows == 0 {
         return Err("no rows downloaded — check --source / --url-prefix".into());
     }
     eprintln!(
-        "Downloaded {total_rows} molecules ({:.2} GB base data)",
+        "Downloaded {total_rows} molecules in {part_index} parts ({:.2} GB base data)",
         (total_rows * info.bytes_per_vector) as f64 / (1u64 << 30) as f64
     );
 
-    // Flush BufWriter, patch the header in place.
-    base_file.flush()?;
-    let mut base_file_handle = base_file.into_inner().map_err(|e| format!("flush base writer: {e}"))?;
-    base_file_handle.seek(SeekFrom::Start(0))?;
-    write_bin_header(&mut base_file_handle, total_rows as u32, info.dimensions_bits as u32)?;
-    base_file_handle.sync_all()?;
-    drop(base_file_handle);
-
-    let base_path = cli.output.join(format!("base.{total_rows}.b1bin"));
-    std::fs::rename(&base_path_tmp, &base_path)?;
-
-    // Memory-map the base for query sampling + ground truth.
-    let base_dataset = retrieval::Dataset::load(&base_path)?;
-    assert_eq!(base_dataset.rows(), total_rows);
-    let base_bytes = base_dataset.slice(0, total_rows, base_dataset.dimensions(), &mut []);
-    let base_slice: &[u8] = match base_bytes.data {
-        retrieval::VectorSlice::B1x8(data) => data,
-        _ => return Err("unexpected non-binary base after load".into()),
-    };
+    // Memory-map the parts for query sampling + ground truth.
+    let parts = (0..part_index)
+        .map(|index| retrieval::Dataset::load(&part_path(&cli.output, index)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut part_slices: Vec<&[u8]> = Vec::with_capacity(parts.len());
+    for part in &parts {
+        match part.slice(0, part.rows(), part.dimensions(), &mut []).data {
+            retrieval::VectorSlice::B1x8(data) => part_slices.push(data),
+            _ => return Err("unexpected non-binary base after load".into()),
+        }
+    }
+    assert_eq!(parts.iter().map(retrieval::Dataset::rows).sum::<usize>(), total_rows);
 
     // Sample query indices without replacement.
     let query_count = cli.query_count.min(total_rows);
     let mut rng = StdRng::seed_from_u64(cli.seed.into());
     let query_indices = sample_without_replacement(&mut rng, total_rows, query_count).into_vec();
-    let mut sorted_indices = query_indices.clone();
-    sorted_indices.sort_unstable();
 
     // Copy queries into a contiguous buffer that doubles as the ground-truth input.
+    // Every part but the last holds `part_rows` rows, so a row's part is its quotient.
     let mut query_buffer = {
         let mut values = Vec::new_in(std::alloc::System);
         values.resize(query_count * info.bytes_per_vector, 0u8);
         values
     };
     for (output_index, &base_index) in query_indices.iter().enumerate() {
-        let source_offset = base_index * info.bytes_per_vector;
+        let source = part_slices[base_index / cli.part_rows];
+        let source_offset = (base_index % cli.part_rows) * info.bytes_per_vector;
         let dest_offset = output_index * info.bytes_per_vector;
         query_buffer[dest_offset..dest_offset + info.bytes_per_vector]
-            .copy_from_slice(&base_slice[source_offset..source_offset + info.bytes_per_vector]);
+            .copy_from_slice(&source[source_offset..source_offset + info.bytes_per_vector]);
     }
 
     let query_path = cli.output.join(format!("query.{query_count}.b1bin"));
@@ -483,7 +541,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MACCS (166) and PubChem (881) fingerprints round up to full-byte counts;
     // trailing unused bits contribute 0 to Hamming (identical across vectors).
     let storage_bits = info.bytes_per_vector * 8;
-    let base_view = binary_view(base_slice, total_rows, storage_bits);
+    let base_views: Vec<_> = part_slices
+        .iter()
+        .map(|slice| binary_view(slice, slice.len() / info.bytes_per_vector, storage_bits))
+        .collect();
     let query_view = binary_view(&query_buffer, query_count, storage_bits);
     let mut ground_truth_indices = {
         let mut values = Vec::new_in(std::alloc::System);
@@ -492,7 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.top_k);
     compute_hamming_top_k(
-        base_view,
+        &base_views,
         query_view,
         ground_truth_span,
         cli.ground_truth_batch,

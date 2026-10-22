@@ -86,6 +86,10 @@ pub enum GroundTruthError {
     #[error("top_k={top_k} exceeds base_count={base_count}")]
     TopKTooLarge { top_k: usize, base_count: usize },
 
+    /// More base rows than the `u32` neighbor ids of `.ibin` can name.
+    #[error("base_count={base_count} exceeds the 2^32 rows `u32` neighbor ids can name")]
+    IndexOverflow { base_count: usize },
+
     /// A view's row stride doesn't match `bytes_per_vector`.
     #[error("{which} row stride {got} != bytes_per_vector {expected}")]
     StrideMismatch {

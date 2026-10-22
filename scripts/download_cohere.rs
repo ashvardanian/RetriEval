@@ -499,7 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.top_k);
     compute_hamming_top_k(
-        base_view,
+        &[base_view],
         query_view,
         ground_truth_span,
         cli.ground_truth_batch,
