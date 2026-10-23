@@ -21,7 +21,11 @@
 
 use std::{fmt, sync::Arc};
 
-use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{
+    cast::AsArray,
+    types::{UInt32Type, UInt64Type},
+    Array, ArrayRef, FixedSizeBinaryArray, Float32Array, RecordBatch, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use clap::Parser;
 use futures_util::TryStreamExt;
@@ -29,10 +33,57 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use serde_json::json;
 
 use retrieval::{
-    run_config, Backend, BenchState, CommonArgs, Hits, IndexFile, Key, SweepSummary, UnwrapOrBail, Vectors,
+    run_config, Backend, BatchKeys, BenchState, CommonArgs, Hits, IndexFile, Key, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const TABLE_NAME: &str = "bench";
+
+/// The `id` column for `keys`, at the narrowest Arrow type that holds them.
+fn id_column(keys: BatchKeys<'_>) -> Result<(DataType, ArrayRef), String> {
+    Ok(match keys.key_bytes() {
+        4 => (
+            DataType::UInt32,
+            Arc::new(UInt32Array::from_iter_values(keys.keys().map(|key| key.0 as u32))),
+        ),
+        8 => (
+            DataType::UInt64,
+            Arc::new(UInt64Array::from_iter_values(keys.keys().map(|key| key.0 as u64))),
+        ),
+        _ => (
+            DataType::FixedSizeBinary(16),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(keys.keys().map(|key| key.0.to_be_bytes()))
+                    .map_err(|error| format!("LanceDB id array: {error}"))?,
+            ),
+        ),
+    })
+}
+
+/// Appends the keys of an `id` column that [`id_column`] built.
+fn read_keys(ids: &dyn Array, keys: &mut Vec<Key, std::alloc::System>) -> Result<(), String> {
+    match ids.data_type() {
+        DataType::UInt32 => keys.extend(
+            ids.as_primitive::<UInt32Type>()
+                .values()
+                .iter()
+                .map(|&id| Key::from(id)),
+        ),
+        DataType::UInt64 => keys.extend(
+            ids.as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .map(|&id| Key::from(id)),
+        ),
+        DataType::FixedSizeBinary(16) => keys.extend(
+            ids.as_fixed_size_binary()
+                .iter()
+                .flatten()
+                .map(|bytes| Key(u128::from_be_bytes(bytes.try_into().unwrap()))),
+        ),
+        other => return Err(format!("LanceDB returned an id column of type {other}")),
+    }
+    Ok(())
+}
 
 // #region Local metric mapping
 
@@ -116,17 +167,17 @@ impl<'a> LanceDbBackend<'a> {
         })
     }
 
-    fn batch(dimensions: usize, keys: &[Key], values: &[f32]) -> Result<RecordBatch, String> {
+    fn batch(dimensions: usize, keys: BatchKeys<'_>, values: &[f32]) -> Result<RecordBatch, String> {
         let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let (id_type, ids) = id_column(keys)?;
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
+            Field::new("id", id_type, false),
             Field::new(
                 "vector",
                 DataType::FixedSizeList(item.clone(), dimensions as i32),
                 false,
             ),
         ]));
-        let ids = UInt64Array::from_iter_values(keys.iter().map(|&key| u64::from(key)));
         let vectors = arrow_array::FixedSizeListArray::try_new(
             item,
             dimensions as i32,
@@ -134,8 +185,7 @@ impl<'a> LanceDbBackend<'a> {
             None,
         )
         .map_err(|error| format!("LanceDB vector array: {error}"))?;
-        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(vectors)])
-            .map_err(|error| format!("LanceDB batch: {error}"))
+        RecordBatch::try_new(schema, vec![ids, Arc::new(vectors)]).map_err(|error| format!("LanceDB batch: {error}"))
     }
 }
 
@@ -144,7 +194,7 @@ impl Backend for LanceDbBackend<'_> {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         let values = vectors.to_f32_in(&mut self.scratch)?;
         let batch = Self::batch(self.dimensions, keys, values)?;
         self.runtime.block_on(async {
@@ -186,32 +236,22 @@ impl Backend for LanceDbBackend<'_> {
                     .execute()
                     .await
                     .map_err(|error| format!("LanceDB search: {error}"))?;
-                let mut found = Vec::with_capacity_in(count, std::alloc::System);
+                let mut keys = Vec::with_capacity_in(count, std::alloc::System);
+                let mut distances = Vec::with_capacity_in(count, std::alloc::System);
                 while let Some(batch) = results
                     .try_next()
                     .await
                     .map_err(|error| format!("LanceDB stream: {error}"))?
                 {
-                    let ids = batch
-                        .column_by_name("id")
-                        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-                        .ok_or("LanceDB returned no id column")?;
-                    let distances = batch
+                    let ids = batch.column_by_name("id").ok_or("LanceDB returned no id column")?;
+                    read_keys(ids.as_ref(), &mut keys)?;
+                    let batch_distances = batch
                         .column_by_name("_distance")
                         .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
                         .ok_or("LanceDB returned no distance column")?;
-                    found.extend(
-                        ids.values()
-                            .iter()
-                            .zip(distances.values())
-                            .map(|(&id, &distance)| (id, distance)),
-                    );
+                    distances.extend_from_slice(batch_distances.values());
                 }
-                row.write(found.into_iter().map(|(id, distance)| {
-                    Key::try_from(id)
-                        .map(|key| (key, distance))
-                        .map_err(|_| "LanceDB key overflow".to_string())
-                }))?;
+                row.write(keys.into_iter().zip(distances).map(Ok))?;
             }
             Ok(())
         })

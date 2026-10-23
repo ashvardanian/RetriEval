@@ -30,8 +30,8 @@ use itertools::iproduct;
 use serde_json::{json, Value};
 
 use retrieval::{
-    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BenchState, CommonArgs, Distance, Hits,
-    IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CommonArgs,
+    Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const IMAGE: &str = "surrealdb/surrealdb:v3.3.0";
@@ -237,7 +237,7 @@ fn uses_hnsw(plan: &Value) -> bool {
     }
 }
 fn append_search(sql: &mut String, row: &[f32], count: usize, expansion: usize) {
-    write!(sql, "SELECT idx, vector::distance::knn() AS distance FROM bench WHERE embedding <|{count},{expansion}|> {row:?} ORDER BY distance")
+    write!(sql, "SELECT <string> record::id(id) AS key, vector::distance::knn() AS distance FROM bench WHERE embedding <|{count},{expansion}|> {row:?} ORDER BY distance")
         .expect("a String takes any write");
 }
 
@@ -308,7 +308,7 @@ impl Backend for SurrealBackend<'_> {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         let dimensions = vectors.dimensions();
         let values = vectors.to_f32_in(&mut self.scratch)?;
         if values.iter().any(|value| !value.is_finite()) {
@@ -316,20 +316,21 @@ impl Backend for SurrealBackend<'_> {
         }
         self.sql.clear();
         self.sql.push_str("INSERT INTO bench [");
-        for (index, (row, key)) in values.chunks_exact(dimensions).zip(keys).enumerate() {
+        // Every key spells as a UUID, integers zero-padded, so each one is a native record id.
+        for (index, (row, key)) in values.chunks_exact(dimensions).zip(keys.keys()).enumerate() {
             let separator = if index == 0 { "" } else { "," };
-            write!(self.sql, "{separator}{{id:bench:{key},idx:{key},embedding:{row:?}}}")
-                .expect("a String takes any write");
+            write!(self.sql, "{separator}{{id:bench:u\"{key}\",embedding:{row:?}}}").expect("a String takes any write");
         }
-        self.sql.push_str("] RETURN VALUE idx;");
+        self.sql.push_str("] RETURN VALUE id;");
         let response = self.server.runtime.block_on(self.server.query(&self.sql))?;
         let inserted = response
             .pointer("/0/result")
             .and_then(Value::as_array)
             .ok_or("missing SurrealDB insert results")?;
-        match inserted.len() == keys.len() {
-            true => Ok(()),
-            false => Err("SurrealDB insert count mismatch".into()),
+        if inserted.len() == keys.len() {
+            Ok(())
+        } else {
+            Err("SurrealDB insert count mismatch".into())
         }
     }
 
@@ -356,11 +357,11 @@ impl Backend for SurrealBackend<'_> {
                 .and_then(Value::as_array)
                 .ok_or("invalid SurrealDB neighbors")?;
             row.write(neighbors.iter().enumerate().map(|(rank, neighbor)| {
-                let key = neighbor
-                    .get("idx")
-                    .and_then(Value::as_u64)
-                    .and_then(|key| Key::try_from(key).ok())
-                    .ok_or("invalid SurrealDB neighbor key")?;
+                let key: Key = neighbor
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or("invalid SurrealDB neighbor key")?
+                    .parse()?;
                 let distance = neighbor
                     .get("distance")
                     .and_then(Value::as_f64)
@@ -369,7 +370,7 @@ impl Backend for SurrealBackend<'_> {
                     .ok_or("invalid SurrealDB neighbor distance")?;
                 if neighbors[..rank]
                     .iter()
-                    .any(|earlier| earlier.get("idx") == neighbor.get("idx"))
+                    .any(|earlier| earlier.get("key") == neighbor.get("key"))
                 {
                     return Err("duplicate SurrealDB neighbor".into());
                 }

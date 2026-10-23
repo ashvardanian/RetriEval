@@ -51,8 +51,8 @@ use itertools::iproduct;
 use serde_json::{json, Value};
 
 use retrieval::{
-    run_config, spell_list, Backend, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key, SweepSummary,
-    Threads, UnwrapOrBail, VectorSlice, Vectors,
+    run_config, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile,
+    SweepSummary, Threads, UnwrapOrBail, VectorSlice, Vectors,
 };
 
 extern "C" {
@@ -210,7 +210,7 @@ impl fmt::Display for Metric {
 }
 
 fn index_factory_string(data_type: DataType, connectivity: usize) -> String {
-    // `IDMap` persists keys beside the vectors; faiss-sys 0.7 has no `IDMapBinary`, so binary indexes keep a key table.
+    // `IDMap` persists base rows beside the vectors; faiss-sys 0.7 has no `IDMapBinary`, so binary indexes keep a row table.
     match data_type {
         DataType::F32 => format!("IDMap,HNSW{connectivity},Flat"),
         DataType::F16 => format!("IDMap,HNSW{connectivity},SQfp16"),
@@ -228,22 +228,22 @@ fn metric_label_for(metric: faiss::MetricType) -> &'static str {
     }
 }
 
-/// Writes one batch of FAISS answers, `count` per query: labels are our keys on the `IDMap` paths,
-/// and indices into `key_map` on the binary path, which has no `IDMap`. Negative labels are misses.
+/// Writes one batch of FAISS answers, `count` per query: labels are base rows on the `IDMap` paths,
+/// and indices into `rows` on the binary path, which has no `IDMap`. Negative labels are misses.
 fn write_hits<D: Copy>(
     labels: &[faiss::Idx],
     distances: &[D],
-    key_map: Option<&[Key]>,
+    rows: Option<&[u32]>,
     to_distance: impl Fn(D) -> Distance,
     mut hits: Hits<'_>,
 ) -> Result<(), String> {
     let count = hits.count();
     let answers = labels.chunks_exact(count).zip(distances.chunks_exact(count));
-    for ((labels, distances), row) in answers.zip(hits.rows()) {
-        row.write(labels.iter().zip(distances).filter_map(|(label, &distance)| {
-            let label = label.get()?;
-            let key = key_map.map_or(label as Key, |key_map| key_map[label as usize]);
-            Some(Ok((key, to_distance(distance))))
+    for ((labels, distances), hit_row) in answers.zip(hits.rows()) {
+        hit_row.write_rows(labels.iter().zip(distances).filter_map(|(label, &distance)| {
+            let label = label.get()? as usize;
+            let row = rows.map_or(label, |rows| rows[label] as usize);
+            Some(Ok((row, to_distance(distance))))
         }))?;
     }
     Ok(())
@@ -251,10 +251,10 @@ fn write_hits<D: Copy>(
 
 enum FaissIndex {
     Float(faiss::index::IndexImpl),
-    /// Binary HNSW has no `IDMap` analogue in faiss-sys 0.7, so the keys ride along in insertion order.
+    /// Binary HNSW has no `IDMap` analogue in faiss-sys 0.7, so the base rows ride along in insertion order.
     Binary {
         index: faiss::index::BinaryIndexImpl,
-        keys: Vec<Key, std::alloc::System>,
+        rows: Vec<u32, std::alloc::System>,
     },
 }
 
@@ -282,8 +282,8 @@ impl FaissBackend {
             DataType::B1 => {
                 let index = faiss::index::index_binary_factory(dimensions, &factory)
                     .map_err(|error| format!("failed to create FAISS binary index: {error}"))?;
-                let keys = Vec::new_in(std::alloc::System);
-                ("hamming", FaissIndex::Binary { index, keys })
+                let rows = Vec::new_in(std::alloc::System);
+                ("hamming", FaissIndex::Binary { index, rows })
             }
             _ => {
                 let index = faiss::index::index_factory(dimensions, &factory, metric.into())
@@ -356,24 +356,23 @@ impl Backend for FaissBackend {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         match &mut self.index {
             FaissIndex::Float(index) => {
                 let data = vectors.to_f32_in(&mut self.scratch)?;
                 self.ids.clear();
-                self.ids.extend(keys.iter().map(|&key| faiss::Idx::new(u64::from(key))));
+                self.ids.extend(keys.rows().map(|row| faiss::Idx::new(row as u64)));
                 index
                     .add_with_ids(data, &self.ids)
                     .map_err(|error| format!("FAISS add_with_ids failed: {error}"))
             }
-            FaissIndex::Binary {
-                index,
-                keys: indexed_keys,
-            } => {
+            FaissIndex::Binary { index, rows } => {
                 let VectorSlice::B1x8(bytes) = vectors.values() else {
                     return Err("FAISS binary index requires B1x8 data".into());
                 };
-                indexed_keys.extend_from_slice(keys);
+                for row in keys.rows() {
+                    rows.push(u32::try_from(row).map_err(|_| "FAISS binary rows end at 2^32".to_string())?);
+                }
                 index
                     .add(bytes)
                     .map_err(|error| format!("FAISS binary add failed: {error}"))
@@ -391,7 +390,7 @@ impl Backend for FaissBackend {
                     .map_err(|error| format!("FAISS search failed: {error}"))?;
                 write_hits(&result.labels, &result.distances, None, |distance| distance, hits)
             }
-            FaissIndex::Binary { index, keys } => {
+            FaissIndex::Binary { index, rows } => {
                 let VectorSlice::B1x8(bytes) = queries.values() else {
                     return Err("FAISS binary index requires B1x8 data".into());
                 };
@@ -401,7 +400,7 @@ impl Backend for FaissBackend {
                 write_hits(
                     &result.labels,
                     &result.distances,
-                    Some(keys),
+                    Some(rows),
                     |distance| distance as Distance,
                     hits,
                 )
@@ -419,7 +418,7 @@ impl Backend for FaissBackend {
                 write_index(index, path).map_err(|error| format!("FAISS write_index({path}): {error}"))
             }
             FaissIndex::Binary { .. } => Err("FAISS binary HNSW save is not supported — faiss-sys 0.7 doesn't bind \
-                 IndexBinaryIDMap, so keys can't be persisted natively"
+                 IndexBinaryIDMap, so its row table can't be persisted natively"
                 .into()),
         }
     }
@@ -435,9 +434,10 @@ fn faiss_version() -> String {
     // SAFETY: the version is null or a static C string.
     unsafe {
         let version = faiss_get_version();
-        match version.is_null() {
-            true => "unknown".into(),
-            false => CStr::from_ptr(version).to_string_lossy().into_owned(),
+        if version.is_null() {
+            "unknown".into()
+        } else {
+            CStr::from_ptr(version).to_string_lossy().into_owned()
         }
     }
 }
@@ -495,7 +495,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use retrieval::SearchBuffers;
+    use retrieval::{BatchRows, Key, KeyType, Keys, SearchBuffers};
 
     #[test]
     fn repeated_search_reuses_conversion_storage_and_preserves_keys() {
@@ -508,17 +508,24 @@ mod tests {
             expansion_search: 16,
         };
         let mut backend = FaissBackend::new(config, Threads::ONE).unwrap();
+        let keys = Keys::Generated {
+            count: 2,
+            key_type: KeyType::UuidV4,
+        };
         backend
-            .add(&[42, 7], Vectors::new(VectorSlice::I8(&[3, 4, 0, 0]), 2))
+            .add(
+                BatchKeys::new(&keys, BatchRows::Range(0..2)),
+                Vectors::new(VectorSlice::I8(&[3, 4, 0, 0]), 2),
+            )
             .unwrap();
         let scratch = backend.scratch.as_ptr();
         let mut buffers = SearchBuffers::new(1, 3).unwrap();
         for _ in 0..2 {
             backend
-                .search(Vectors::new(VectorSlice::I8(&[0, 0]), 2), buffers.hits(0..1))
+                .search(Vectors::new(VectorSlice::I8(&[0, 0]), 2), buffers.hits(0..1, &keys))
                 .unwrap();
-            let (keys, distances, found) = buffers.rows().next().unwrap();
-            assert_eq!(keys, [7, 42, Key::MAX]);
+            let (found_keys, distances, found) = buffers.rows().next().unwrap();
+            assert_eq!(found_keys, [keys.get(1), keys.get(0), Key::MISSING]);
             assert_eq!(distances, [0.0, 25.0, Distance::INFINITY]);
             assert_eq!(found, 2);
             assert_eq!(scratch, backend.scratch.as_ptr());

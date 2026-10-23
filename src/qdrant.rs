@@ -28,19 +28,24 @@ use itertools::iproduct;
 use qdrant_client::{
     qdrant::{
         point_id, quantization_config::Quantization, BinaryQuantization, CreateCollectionBuilder, Datatype,
-        Distance as QdrantDistance, HnswConfigDiffBuilder, Memory, PointStruct, QuantizationType, ScalarQuantization,
-        SearchParamsBuilder, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+        Distance as QdrantDistance, HnswConfigDiffBuilder, Memory, PointId, PointStruct, QuantizationType,
+        ScalarQuantization, SearchParamsBuilder, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
     },
     Qdrant,
 };
 use serde_json::json;
 
 use retrieval::{
-    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BenchState, CommonArgs, Hits, IndexFile,
-    Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Hits,
+    IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const COLLECTION: &str = "bench";
+
+/// Qdrant's own id for `key`: a number when it fits 64 bits, a UUID otherwise.
+fn point_id(key: Key) -> PointId {
+    u64::try_from(key).map_or_else(|_| PointId::from(key.to_string()), PointId::from)
+}
 
 /// Qdrant distance functions, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,20 +281,18 @@ impl Backend for QdrantBackend<'_> {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         let dimensions = vectors.dimensions();
         let data = vectors.to_f32_in(&mut self.scratch)?;
-        let batches = keys
-            .chunks(self.vectors_per_upsert)
-            .zip(data.chunks(self.vectors_per_upsert * dimensions));
+        let mut keys = keys.keys();
         self.runtime.block_on(async {
-            for (keys, rows) in batches {
+            for rows in data.chunks(self.vectors_per_upsert * dimensions) {
                 let points: Vec<PointStruct> = keys
-                    .iter()
+                    .by_ref()
                     .zip(rows.chunks_exact(dimensions))
-                    .map(|(&key, row)| {
+                    .map(|(key, row)| {
                         PointStruct::new(
-                            u64::from(key),
+                            point_id(key),
                             row.to_vec(),
                             HashMap::<String, qdrant_client::qdrant::Value>::new(),
                         )
@@ -330,15 +333,15 @@ impl Backend for QdrantBackend<'_> {
         }
         for (result, row) in response.result.iter().zip(hits.rows()) {
             row.write(result.result.iter().map(|point| {
-                let Some(point_id::PointIdOptions::Num(id)) =
-                    point.id.as_ref().and_then(|id| id.point_id_options.as_ref())
-                else {
-                    return Err("Qdrant returned an invalid numeric ID".to_string());
+                let key = match point.id.as_ref().and_then(|id| id.point_id_options.as_ref()) {
+                    Some(point_id::PointIdOptions::Num(id)) => Key::from(*id),
+                    Some(point_id::PointIdOptions::Uuid(id)) => id.parse()?,
+                    None => return Err("Qdrant returned a point without an ID".to_string()),
                 };
-                let key = Key::try_from(*id).map_err(|_| "Qdrant key overflow".to_string())?;
-                match point.score.is_finite() {
-                    true => Ok((key, point.score)),
-                    false => Err("Qdrant returned a nonfinite score".into()),
+                if point.score.is_finite() {
+                    Ok((key, point.score))
+                } else {
+                    Err("Qdrant returned a nonfinite score".into())
                 }
             }))?;
         }

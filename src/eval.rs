@@ -1,8 +1,8 @@
 //! Recall, intersection, and ranking metrics over borrowed search results.
 
-use std::alloc::System;
+use std::{alloc::System, iter::Sum, ops::Add};
 
-use crate::{dataset::GroundTruth, Key};
+use crate::{dataset::GroundTruth, Key, Keys};
 
 /// Membership tester over one query's ground-truth prefix, reused across queries.
 ///
@@ -16,21 +16,29 @@ use crate::{dataset::GroundTruth, Key};
 /// sort cannot be skipped.
 struct TruthSet {
     sorted: Vec<Key, System>,
+    nearest: Option<Key>,
 }
 
 impl Default for TruthSet {
     fn default() -> Self {
         Self {
             sorted: Vec::new_in(System),
+            nearest: None,
         }
     }
 }
 
 impl TruthSet {
-    fn load(&mut self, truth: &[Key]) {
+    /// Replaces the set with `truth`, nearest first.
+    fn load(&mut self, truth: impl Iterator<Item = Key>) {
         self.sorted.clear();
-        self.sorted.extend_from_slice(truth);
+        self.sorted.extend(truth);
+        self.nearest = self.sorted.first().copied();
         self.sorted.sort_unstable();
+    }
+
+    fn len(&self) -> usize {
+        self.sorted.len()
     }
 
     fn contains(&self, key: Key) -> bool {
@@ -55,38 +63,98 @@ pub struct Scores {
     pub ndcg_at_k: f64,
 }
 
-/// Scores each query's `found` keys, best first, against the matching ground-truth row.
-pub fn score<'a>(found: impl Iterator<Item = &'a [Key]>, ground_truth: &GroundTruth, k: usize) -> Scores {
-    let discount = discount_table(k);
-    let mut truth_set = TruthSet::default();
-    let (mut queries, mut recall_at_1, mut recall_at_k, mut intersection, mut ndcg) = (0, 0.0, 0.0, 0.0, 0.0);
-    for (query_index, found) in found.take(ground_truth.queries()).enumerate() {
-        queries += 1;
-        let results = &found[..found.len().min(k)];
-        let truth = ground_truth.neighbors(query_index);
-        let truth = &truth[..truth.len().min(k)];
-        let Some(&true_nearest) = truth.first() else {
-            continue;
+/// Every metric summed over the queries scored. Sums add associatively, so the partial sums of any
+/// split of the queries combine into the same total before [`ScoreSums::mean`] divides once.
+#[derive(Clone, Copy, Default)]
+struct ScoreSums {
+    queries: usize,
+    recall_at_1: f64,
+    recall_at_k: f64,
+    intersection_at_k: f64,
+    ndcg_at_k: f64,
+}
+
+impl Add for ScoreSums {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            queries: self.queries + other.queries,
+            recall_at_1: self.recall_at_1 + other.recall_at_1,
+            recall_at_k: self.recall_at_k + other.recall_at_k,
+            intersection_at_k: self.intersection_at_k + other.intersection_at_k,
+            ndcg_at_k: self.ndcg_at_k + other.ndcg_at_k,
+        }
+    }
+}
+
+impl Sum for ScoreSums {
+    fn sum<Iter: Iterator<Item = Self>>(sums: Iter) -> Self {
+        sums.fold(Self::default(), Add::add)
+    }
+}
+
+impl ScoreSums {
+    /// One query's `results`, best first and at most `k`, against its `truth`.
+    fn of_query(results: &[Key], truth: &TruthSet, discount: &[f64]) -> Self {
+        let Some(nearest) = truth.nearest else {
+            return Self {
+                queries: 1,
+                ..Self::default()
+            };
         };
-        recall_at_1 += f64::from(results.first() == Some(&true_nearest));
-        recall_at_k += f64::from(results.contains(&true_nearest));
-        truth_set.load(truth);
-        let matched = |rank: &usize| truth_set.contains(results[*rank]);
+        let matched = |rank: &usize| truth.contains(results[*rank]);
         let overlap = (0..results.len()).filter(matched).count();
-        // Normalized by the truth available, so a ground truth narrower than `k` cannot depress it.
-        intersection += overlap as f64 / truth.len() as f64;
         let gain: f64 = (0..results.len()).filter(matched).map(|rank| discount[rank]).sum();
         let ideal: f64 = discount[..truth.len()].iter().sum();
-        // Clamped, since a key returned twice is credited twice.
-        ndcg += (gain / ideal).min(1.0);
+        Self {
+            queries: 1,
+            recall_at_1: f64::from(results.first() == Some(&nearest)),
+            recall_at_k: f64::from(results.contains(&nearest)),
+            // Normalized by the truth available, so a ground truth narrower than `k` cannot depress it.
+            intersection_at_k: overlap as f64 / truth.len() as f64,
+            // Clamped, since a key returned twice is credited twice.
+            ndcg_at_k: (gain / ideal).min(1.0),
+        }
     }
-    let mean = |total: f64| if queries == 0 { 0.0 } else { total / queries as f64 };
-    Scores {
-        recall_at_1: mean(recall_at_1),
-        recall_at_k: mean(recall_at_k),
-        intersection_at_k: mean(intersection),
-        ndcg_at_k: mean(ndcg),
+
+    fn mean(self) -> Scores {
+        let mean = |total: f64| match self.queries {
+            0 => 0.0,
+            queries => total / queries as f64,
+        };
+        Scores {
+            recall_at_1: mean(self.recall_at_1),
+            recall_at_k: mean(self.recall_at_k),
+            intersection_at_k: mean(self.intersection_at_k),
+            ndcg_at_k: mean(self.ndcg_at_k),
+        }
     }
+}
+
+/// Scores each query's `found` keys, best first, against its ground-truth rows named by `base_keys`.
+pub fn score<'a>(
+    found: impl Iterator<Item = &'a [Key]>,
+    ground_truth: &GroundTruth,
+    base_keys: &Keys,
+    k: usize,
+) -> Scores {
+    let discount = discount_table(k);
+    let mut truth = TruthSet::default();
+    found
+        .take(ground_truth.queries())
+        .enumerate()
+        .map(|(query_index, found)| {
+            truth.load(
+                ground_truth
+                    .neighbors(query_index)
+                    .take(k)
+                    .map(|row| base_keys.get(row)),
+            );
+            ScoreSums::of_query(&found[..found.len().min(k)], &truth, &discount)
+        })
+        .sum::<ScoreSums>()
+        .mean()
 }
 
 /// Counts the queries whose own `expected` key came back at rank 1 and within the top `k`.
@@ -94,12 +162,16 @@ pub fn score<'a>(found: impl Iterator<Item = &'a [Key]>, ground_truth: &GroundTr
 /// Self-recall needs no ground-truth file: a vector that is in the index is its own nearest
 /// neighbor. Exact-duplicate vectors in the base can cost a hit, since either twin may take rank
 /// 1, so self-recall below 1.0 bounds the index's error rate from above rather than measuring it.
-pub fn self_recall_hits<'a>(found: impl Iterator<Item = &'a [Key]>, expected: &[Key], k: usize) -> (usize, usize) {
+pub fn self_recall_hits<'a>(
+    found: impl Iterator<Item = &'a [Key]>,
+    expected: impl Iterator<Item = Key>,
+    k: usize,
+) -> (usize, usize) {
     found.zip(expected).fold((0, 0), |(at_1, at_k), (found, expected)| {
         let results = &found[..found.len().min(k)];
         (
-            at_1 + usize::from(results.first() == Some(expected)),
-            at_k + usize::from(results.contains(expected)),
+            at_1 + usize::from(results.first() == Some(&expected)),
+            at_k + usize::from(results.contains(&expected)),
         )
     })
 }
@@ -124,7 +196,7 @@ mod tests {
     fn truth_set_matches_linear_scan() {
         let mut set = TruthSet::default();
         // Unsorted and with a duplicate, as ground-truth rows may be.
-        let cases: [&[Key]; 5] = [
+        let cases: [&[u32]; 5] = [
             &[],
             &[7],
             &[9, 3, 5, 1],
@@ -132,18 +204,18 @@ mod tests {
             &[u32::MAX, 0, 12345, 6, 6, 999_999],
         ];
         for truth in cases {
-            set.load(truth);
+            set.load(truth.iter().map(|&key| Key::from(key)));
+            assert_eq!(set.nearest, truth.first().map(|&key| Key::from(key)));
             for probe in 0..64u32 {
                 assert_eq!(
-                    set.contains(probe),
+                    set.contains(Key::from(probe)),
                     truth.contains(&probe),
                     "probe {probe} in {truth:?}"
                 );
             }
             for &probe in truth {
-                assert!(set.contains(probe), "member {probe} missing from {truth:?}");
+                assert!(set.contains(Key::from(probe)), "member {probe} missing from {truth:?}");
             }
-            assert!(!set.contains(u32::MAX - 1) || truth.contains(&(u32::MAX - 1)));
         }
     }
 
@@ -151,9 +223,9 @@ mod tests {
     #[test]
     fn truth_set_load_replaces() {
         let mut set = TruthSet::default();
-        set.load(&[1, 2, 3]);
-        set.load(&[4, 5]);
-        assert!(set.contains(4) && set.contains(5));
-        assert!(!set.contains(1) && !set.contains(2) && !set.contains(3));
+        set.load([1u32, 2, 3].map(Key::from).into_iter());
+        set.load([4u32, 5].map(Key::from).into_iter());
+        assert!([4u32, 5].map(Key::from).iter().all(|&key| set.contains(key)));
+        assert!(![1u32, 2, 3].map(Key::from).iter().any(|&key| set.contains(key)));
     }
 }

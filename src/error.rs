@@ -43,11 +43,11 @@ pub enum DatasetError {
 
     /// A glob expansion produced shards with mismatched dimensionality or
     /// scalar format. All shards in one logical dataset must agree.
-    #[error("{path:?}: shard dimensions {got_dims} doesn't match earlier shards' dimensions {expected_dims}")]
+    #[error("{path:?}: shard width {got_width} doesn't match earlier shards' width {expected_width}")]
     ShardMismatch {
         path: PathBuf,
-        expected_dims: u32,
-        got_dims: u32,
+        expected_width: u32,
+        got_width: u32,
     },
 }
 

@@ -73,8 +73,8 @@ use usearch::{
 };
 
 use retrieval::{
-    run_config, spell_list, Backend, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key, SweepSummary,
-    Threads, UnwrapOrBail, Vectors,
+    run_config, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key,
+    SweepSummary, Threads, UnwrapOrBail, Vectors,
 };
 
 #[derive(Parser, Debug)]
@@ -302,10 +302,9 @@ impl Backend for USearchBackend {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         self.keys.clear();
-        self.keys
-            .extend(keys.iter().map(|&key| usearch::Key::from(u64::from(key))));
+        self.keys.extend(keys.keys().map(|key| usearch::Key::from(key.0)));
         let size = self.index.describe().map_err(failed("describe"))?.size;
         self.index.reserve(size + keys.len()).map_err(failed("reserve"))?;
         match vectors {
@@ -333,14 +332,12 @@ impl Backend for USearchBackend {
         .map_err(failed("search"))?;
 
         for (found, row) in matches.rows().map_err(failed("search"))?.zip(hits.rows()) {
-            // Every key this harness inserts is a `Key` widened to 64 bits, so it narrows back losslessly.
-            let narrowed = |key: &usearch::Key| u64::try_from(*key).map_or(Key::MAX, |key| key as Key);
             row.write(
                 found
                     .keys
                     .iter()
                     .zip(found.distances)
-                    .map(|(key, &distance)| Ok((narrowed(key), distance as Distance))),
+                    .map(|(&key, &distance)| Ok((Key(u128::from(key)), distance as Distance))),
             )?;
         }
         Ok(())

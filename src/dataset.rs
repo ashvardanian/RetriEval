@@ -2,31 +2,9 @@
 
 use std::{alloc::System, fs::File, io, path::Path};
 
-use forkunion::{IntoParallelIterator, ParallelIteratorExt};
 use memmap2::Mmap;
 
-use crate::{error::DatasetError, spawn_pool, stream_key, Key, Seed, SplitMix64, Threads, VectorSlice, Vectors};
-
-/// Below this many elements the thread-pool spin-up cost outweighs any
-/// parallelism benefit; the shuffle runs serially as one chunk.
-/// Measured at ~70 µs pool launch on a 192-thread Xeon 6776P, which
-/// is slower than shuffling 65 K elements serially.
-const PERMUTATION_SERIAL_THRESHOLD: usize = 65_536;
-
-/// Chunks the parallel shuffle splits into; fixed, so the permutation never depends on the core count.
-const PERMUTATION_CHUNKS: usize = 256;
-
-/// In-place Fisher–Yates over chunk `chunk_index`'s own SplitMix64 stream, so
-/// the permutation is the same on every platform and `rand` version.
-fn fisher_yates_shuffle(slice: &mut [usize], seed: Seed, chunk_index: usize) {
-    let mut generator = SplitMix64 {
-        state: stream_key(seed, "permutation", chunk_index as u64),
-    };
-    for swap_target_ceiling in (1..slice.len()).rev() {
-        let swap_target = generator.below(swap_target_ceiling as u64 + 1) as usize;
-        slice.swap(swap_target_ceiling, swap_target);
-    }
-}
+use crate::{error::DatasetError, mix, stream_key, Key, KeyType, Seed, VectorSlice, Vectors};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarFormat {
@@ -83,7 +61,9 @@ fn expand_glob(pattern: &str) -> io::Result<Vec<std::path::PathBuf, System>> {
     }
     let entries = glob::glob(pattern).map_err(|error| io::Error::other(format!("glob({pattern}): {error}")))?;
     let mut paths = Vec::new_in(System);
-    paths.extend(entries.filter_map(Result::ok));
+    for entry in entries {
+        paths.push(entry.map_err(|error| io::Error::other(format!("glob({pattern}): {error}")))?);
+    }
     if paths.is_empty() {
         return Err(io::Error::other(format!("glob({pattern}) matched no files")));
     }
@@ -188,11 +168,10 @@ fn load_shards(
         let rows = u32::from_le_bytes(mmap[0..4].try_into().unwrap()) as usize;
         let width = u32::from_le_bytes(mmap[4..8].try_into().unwrap()) as usize;
         if let Some(expected) = shared_width.filter(|&expected| expected != width) {
-            let (expected_dims, got_dims) = (expected as u32, width as u32);
             return Err(io::Error::other(DatasetError::ShardMismatch {
                 path,
-                expected_dims,
-                got_dims,
+                expected_width: expected as u32,
+                got_width: width as u32,
             }));
         }
         shared_width = Some(width);
@@ -240,11 +219,12 @@ fn bytes_for(format: ScalarFormat, dimensions: usize) -> usize {
     }
 }
 
-/// Ground-truth neighbor indices loaded from one or more `.ibin` files
-/// (single path or glob expansion).
+/// Ground-truth neighbor rows from one or more `.ibin` or `.u64bin` files (single path or glob expansion).
 pub struct GroundTruth {
     shards: Shards,
     neighbors_per_query: usize,
+    /// Bytes per neighbor row id: 4 in `.ibin`, 8 in `.u64bin`.
+    row_bytes: usize,
 }
 
 impl Dataset {
@@ -363,134 +343,163 @@ impl Dataset {
     }
 }
 
-/// The order rows are inserted in: the file's own, which needs no indices and reads rows in place,
-/// or a permutation of `[0..n]` shuffled by `seed`.
+/// The order rows are inserted in: the file's own, which reads rows in place, or a seeded shuffle.
 pub enum Permutation {
     Identity,
-    Shuffled { seed: Seed, indices: Vec<usize, System> },
+    Shuffled(Shuffle),
 }
 
 impl Permutation {
-    /// Create a shuffled permutation of `[0..n]` with a deterministic seed,
-    /// parallelized across the ForkUnion thread pool.
-    ///
-    /// The output is uniformly random *within each chunk* of `ceil(n/256)`
-    /// consecutive positions. Across chunks, element ranges remain ordered
-    /// (chunk 0 holds some subset of `[0, n/256)`, chunk 1 holds a subset
-    /// of `[n/256, 2n/256)`, etc.). This is sufficient for ANN
-    /// benchmarking — it eliminates natural orderings (e.g. sorted molecules)
-    /// and gives graph construction ~`chunk`-sized random windows to see a
-    /// representative sample before moving on.
-    pub fn shuffled(n: usize, seed: Seed) -> Self {
-        let mut indices = Vec::with_capacity_in(n, System);
-        indices.extend(0..n);
-        if n < PERMUTATION_SERIAL_THRESHOLD {
-            fisher_yates_shuffle(&mut indices, seed, 0);
-            return Self::Shuffled { seed, indices };
+    /// The base row inserted at `position`.
+    pub fn row(&self, position: usize) -> usize {
+        match self {
+            Self::Identity => position,
+            Self::Shuffled(shuffle) => shuffle.row(position),
         }
-        let mut chunks = Vec::with_capacity_in(PERMUTATION_CHUNKS, System);
-        chunks.extend(indices.chunks_mut(n.div_ceil(PERMUTATION_CHUNKS)));
-        let shuffle = |chunk: &mut &mut [usize], chunk_index: usize| fisher_yates_shuffle(chunk, seed, chunk_index);
-        let shuffled = match spawn_pool(Threads::all_cores()) {
-            Ok(mut pool) => chunks
-                .as_mut_slice()
-                .into_par_iter()
-                .with_pool(&mut pool)
-                .for_each(|chunk, chunk_index, _| shuffle(chunk, chunk_index)),
-            Err(error) => Err(error),
-        };
-        if shuffled.is_err() {
-            chunks
-                .iter_mut()
-                .enumerate()
-                .for_each(|(chunk_index, chunk)| shuffle(chunk, chunk_index));
-        }
-        Self::Shuffled { seed, indices }
     }
 
     /// The seed of a shuffled order.
     pub fn seed(&self) -> Option<Seed> {
         match self {
             Self::Identity => None,
-            Self::Shuffled { seed, .. } => Some(*seed),
+            Self::Shuffled(shuffle) => Some(shuffle.seed),
         }
     }
 }
 
-/// Vector keys, either loaded from one or more `.i32bin` files (single path
-/// or glob expansion) or generated sequentially.
+/// Rounds of the shuffle's Feistel network; four make it a strong pseudorandom permutation.
+const SHUFFLE_ROUNDS: usize = 4;
+
+/// A seeded bijection on `[0, count)`, computed per position, so a shuffle of any size stores nothing
+/// per row. A balanced Feistel network permutes the smallest even-width power of two holding
+/// `count`, and positions it sends past the end walk the cycle until they land inside, which takes
+/// under four steps on average, since that domain is less than four times `count`.
+pub struct Shuffle {
+    seed: Seed,
+    count: u64,
+    half_bits: u32,
+    round_keys: [u64; SHUFFLE_ROUNDS],
+}
+
+impl Shuffle {
+    pub fn new(count: usize, seed: Seed) -> Self {
+        let bits = u64::BITS - (count as u64).saturating_sub(1).leading_zeros();
+        Self {
+            seed,
+            count: count as u64,
+            half_bits: bits.div_ceil(2).max(1),
+            round_keys: std::array::from_fn(|round| stream_key(seed, "permutation", round as u64)),
+        }
+    }
+
+    pub fn row(&self, position: usize) -> usize {
+        debug_assert!(
+            (position as u64) < self.count,
+            "position {position} past {}",
+            self.count
+        );
+        let mut value = position as u64;
+        loop {
+            value = self.encrypt(value);
+            if value < self.count {
+                return value as usize;
+            }
+        }
+    }
+
+    fn encrypt(&self, value: u64) -> u64 {
+        let mask = (1 << self.half_bits) - 1;
+        let (left, right) = self
+            .round_keys
+            .iter()
+            .fold((value >> self.half_bits, value & mask), |(left, right), &key| {
+                (right, left ^ (mix(right ^ key) & mask))
+            });
+        left << self.half_bits | right
+    }
+}
+
+/// Vector keys: memory-mapped from `.i32bin`, `.u64bin` or `.uuidbin` shards at the file's width,
+/// or generated per row, so no run stores keys wider than its input.
 pub enum Keys {
-    /// Memory-mapped keys, one or more shards (file format per shard:
-    /// `rows u32`, `dimensions u32` (always 1), then `Key` data).
-    Mapped(Shards),
-    /// Sequential keys 0..count, generated on the fly.
-    Sequential { count: usize },
+    /// One `key_bytes`-wide key per row after each shard's `rows`, `1` header: little-endian
+    /// integers, or UUIDs most significant byte first.
+    Mapped {
+        shards: Shards,
+        key_bytes: usize,
+    },
+    Generated {
+        count: usize,
+        key_type: KeyType,
+    },
 }
 
 impl Keys {
-    /// Load keys from a `.i32bin` path or glob of shards.
+    /// Load keys from a path or glob of shards, as wide as the extension says.
     pub fn load(path: &Path) -> io::Result<Self> {
-        let (shards, _) = load_shards(path, "keys", |_| std::mem::size_of::<Key>())?;
-        Ok(Keys::Mapped(shards))
+        let key_bytes = match path.extension().and_then(|extension| extension.to_str()) {
+            Some("i32bin") => 4,
+            Some("u64bin") => 8,
+            Some("uuidbin") => 16,
+            _ => {
+                return Err(io::Error::other(format!(
+                    "{}: keys are .i32bin, .u64bin or .uuidbin",
+                    path.display()
+                )))
+            }
+        };
+        let (shards, _) = load_shards(path, "keys", |_| key_bytes)?;
+        Ok(Keys::Mapped { shards, key_bytes })
     }
 
-    /// Get the key at a specific index.
-    pub fn get(&self, index: usize) -> Key {
-        debug_assert!(
-            index < self.rows(),
-            "key index {index} out of bounds (rows={})",
-            self.rows()
-        );
+    /// The key of base `row`.
+    pub fn get(&self, row: usize) -> Key {
         match self {
-            Keys::Mapped(shards) => {
-                let bytes = shards.row_bytes(index, std::mem::size_of::<Key>());
-                Key::from_le_bytes(bytes.try_into().unwrap())
+            Keys::Mapped { shards, key_bytes } => {
+                let bytes = shards.row_bytes(row, *key_bytes);
+                match *key_bytes {
+                    4 => Key::from(u32::from_le_bytes(bytes.try_into().unwrap())),
+                    8 => Key::from(u64::from_le_bytes(bytes.try_into().unwrap())),
+                    _ => Key(u128::from_be_bytes(bytes.try_into().unwrap())),
+                }
             }
-            Keys::Sequential { .. } => index as Key,
+            Keys::Generated { key_type, .. } => key_type.encode(row),
         }
     }
 
     pub fn rows(&self) -> usize {
         match self {
-            Keys::Mapped(shards) => shards.rows(),
-            Keys::Sequential { count } => *count,
+            Keys::Mapped { shards, .. } => shards.rows(),
+            Keys::Generated { count, .. } => *count,
         }
     }
 
-    /// Borrow a contiguous slice of keys. Zero-copy when the range fits in
-    /// a single mapped shard; otherwise (cross-shard or `Sequential`) the
-    /// scratch buffer is filled and returned.
-    pub fn slice<'a>(&'a self, start: usize, count: usize, scratch: &'a mut [Key]) -> &'a [Key] {
-        let count = count.min(self.rows() - start);
+    /// Bytes per key, for engines that size a key column once: 4, 8 or 16.
+    pub fn key_bytes(&self) -> usize {
         match self {
-            Keys::Mapped(shards) => {
-                if let Some(bytes) = shards.zero_copy_range(start, count) {
-                    // SAFETY: `bytes` spans `count` keys and the page-aligned mapping keeps 4-byte alignment.
-                    return unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Key, count) };
-                }
-                for (offset, slot) in scratch[..count].iter_mut().enumerate() {
-                    let bytes = shards.row_bytes(start + offset, std::mem::size_of::<Key>());
-                    *slot = Key::from_le_bytes(bytes.try_into().unwrap());
-                }
-                &scratch[..count]
-            }
-            Keys::Sequential { .. } => {
-                for (offset, slot) in scratch[..count].iter_mut().enumerate() {
-                    *slot = (start + offset) as Key;
-                }
-                &scratch[..count]
-            }
+            Keys::Mapped { key_bytes, .. } => *key_bytes,
+            Keys::Generated { key_type, .. } => key_type.key_bytes(),
         }
     }
 }
 
 impl GroundTruth {
     pub fn load(path: &Path) -> io::Result<Self> {
-        let (shards, neighbors_per_query) =
-            load_shards(path, "ground_truth", |neighbors| neighbors * std::mem::size_of::<Key>())?;
+        let row_bytes = match path.extension().and_then(|extension| extension.to_str()) {
+            Some("ibin" | "i32bin") => 4,
+            Some("u64bin") => 8,
+            _ => {
+                return Err(io::Error::other(format!(
+                    "{}: ground truth is .ibin, .i32bin or .u64bin",
+                    path.display()
+                )))
+            }
+        };
+        let (shards, neighbors_per_query) = load_shards(path, "ground_truth", |neighbors| neighbors * row_bytes)?;
         Ok(Self {
             shards,
             neighbors_per_query,
+            row_bytes,
         })
     }
 
@@ -502,11 +511,14 @@ impl GroundTruth {
         self.neighbors_per_query
     }
 
-    /// Get the ground-truth neighbor IDs for a specific query.
-    pub fn neighbors(&self, query_index: usize) -> &[Key] {
-        let stride_bytes = self.neighbors_per_query * std::mem::size_of::<Key>();
-        let bytes = self.shards.row_bytes(query_index, stride_bytes);
-        // SAFETY: `bytes` spans `neighbors_per_query` keys and the page-aligned mapping keeps 4-byte alignment.
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Key, self.neighbors_per_query) }
+    /// The base rows of a query's true neighbors, nearest first.
+    pub fn neighbors(&self, query_index: usize) -> impl ExactSizeIterator<Item = usize> + '_ {
+        let bytes = self
+            .shards
+            .row_bytes(query_index, self.neighbors_per_query * self.row_bytes);
+        bytes.chunks_exact(self.row_bytes).map(|row| match row.len() {
+            4 => u32::from_le_bytes(row.try_into().unwrap()) as usize,
+            _ => u64::from_le_bytes(row.try_into().unwrap()) as usize,
+        })
     }
 }

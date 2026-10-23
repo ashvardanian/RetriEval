@@ -31,8 +31,8 @@ use itertools::iproduct;
 use serde_json::{json, Value};
 
 use retrieval::{
-    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BenchState, CommonArgs, Distance, Hits,
-    IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CommonArgs,
+    Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const CLASS_NAME: &str = "Bench";
@@ -179,18 +179,25 @@ impl Backend for WeaviateBackend<'_> {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         let dimensions = vectors.dimensions();
         let data = vectors.to_f32_in(&mut self.scratch)?;
-        let objects: Vec<_> = data
-            .chunks_exact(dimensions)
-            .zip(keys)
-            .map(|(row, &key)| json!({"class": CLASS_NAME, "properties": {"idx": key}, "vector": row}))
-            .collect();
+        // Every key spells as a UUID, integers zero-padded, so each one is the object's own id.
+        self.query.clear();
+        self.query.push_str(r#"{"objects":["#);
+        for (index, (row, key)) in data.chunks_exact(dimensions).zip(keys.keys()).enumerate() {
+            let separator = if index == 0 { "" } else { "," };
+            write!(
+                self.query,
+                r#"{separator}{{"class":"{CLASS_NAME}","id":"{key}","vector":{row:?}}}"#
+            )
+            .expect("a String takes any write");
+        }
+        self.query.push_str("]}");
         let response = self.runtime.block_on(post_json(
             self.http,
             &format!("{}/v1/batch/objects", self.http_base),
-            &json!({"objects": objects}),
+            self.query.clone(),
         ))?;
         let results = response.as_array().ok_or("Weaviate batch response is not an array")?;
         if results.len() != keys.len() {
@@ -212,13 +219,13 @@ impl Backend for WeaviateBackend<'_> {
         self.query.clear();
         self.query.push_str("{ Get {");
         for (query_index, row) in data.chunks_exact(dimensions).enumerate() {
-            write!(self.query, "q{query_index}: {CLASS_NAME}(nearVector: {{ vector: {row:?} }} limit: {count}) {{ idx _additional {{ distance }} }} ").expect("a String takes any write");
+            write!(self.query, "q{query_index}: {CLASS_NAME}(nearVector: {{ vector: {row:?} }} limit: {count}) {{ _additional {{ id distance }} }} ").expect("a String takes any write");
         }
         self.query.push_str("} }");
         let response = self.runtime.block_on(post_json(
             self.http,
             &format!("{}/v1/graphql", self.http_base),
-            &json!({"query": self.query}),
+            json!({"query": self.query}).to_string(),
         ))?;
         if let Some(errors) = response.get("errors") {
             return Err(format!("Weaviate query failed: {errors}"));
@@ -229,11 +236,11 @@ impl Backend for WeaviateBackend<'_> {
                 .and_then(Value::as_array)
                 .ok_or("Weaviate query response missing results")?;
             row.write(items.iter().map(|item| {
-                let key = item
-                    .get("idx")
-                    .and_then(Value::as_u64)
-                    .and_then(|key| Key::try_from(key).ok())
-                    .ok_or("Weaviate returned invalid key")?;
+                let key: Key = item
+                    .pointer("/_additional/id")
+                    .and_then(Value::as_str)
+                    .ok_or("Weaviate returned an object without an id")?
+                    .parse()?;
                 let distance = item
                     .pointer("/_additional/distance")
                     .and_then(Value::as_f64)
@@ -252,10 +259,11 @@ impl Backend for WeaviateBackend<'_> {
 }
 
 /// POST `body` as JSON and return the parsed response, turning a non-2xx status into an error.
-async fn post_json(http: &reqwest::Client, url: &str, body: &Value) -> Result<Value, String> {
+async fn post_json(http: &reqwest::Client, url: &str, body: String) -> Result<Value, String> {
     let response = http
         .post(url)
-        .json(body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .await
         .map_err(|error| format!("POST {url} failed: {error}"))?;
@@ -285,11 +293,9 @@ async fn create_class(http: &reqwest::Client, http_base: &str, settings: ClassSe
             "maxConnections": settings.connectivity,
             "bq": { "enabled": matches!(settings.quantization, WeaviateQuantization::Binary) }
         },
-        "properties": [
-            { "name": "idx", "dataType": ["int"] }
-        ]
+        "properties": []
     });
-    post_json(http, &format!("{http_base}/v1/schema"), &body)
+    post_json(http, &format!("{http_base}/v1/schema"), body.to_string())
         .await
         .map(drop)
 }

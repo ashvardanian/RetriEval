@@ -74,8 +74,8 @@ use numkong as nk;
 use serde_json::json;
 
 use retrieval::{
-    run_config, spell_list, Backend, BenchState, CastScratch, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key,
-    SweepSummary, UnwrapOrBail, Vectors,
+    run_config, spell_list, Backend, BatchKeys, BenchState, CastScratch, CommonArgs, Distance, Hits, IndexConfig,
+    IndexFile, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 // #region CudaAllocator
@@ -296,58 +296,58 @@ impl Drop for CagraIndex {
     }
 }
 
-/// Path of the host-keys sidecar. CAGRA's serializer persists the device-side
-/// dataset and graph but knows nothing about our row-index → user-key mapping
-/// (it uses sequential IDs internally), so we write the keys ourselves next
-/// to the index file.
-fn keys_sidecar_path(handle: &str) -> String {
-    format!("{handle}.keys")
+/// Path of the host-rows sidecar. CAGRA's serializer persists the device-side dataset and graph
+/// but knows nothing about which base row each of its sequential ids came from, so we write the rows
+/// ourselves next to the index file; keys follow from rows at search time.
+fn rows_sidecar_path(handle: &str) -> String {
+    format!("{handle}.rows")
 }
 
-/// Sidecar layout: `magic | graph_degree: u64 | count: u64 | keys`, all
-/// little-endian. Widths are fixed rather than `usize` because this is a file
-/// read back on whatever machine opens the index; the counts are `u64` to match
-/// the key count the format already carried. The magic is what makes a
-/// pre-graph-degree file a loud error instead of one that parses with a
-/// nonsense degree, since the old layout opened with a bare `u64`.
-const KEYS_SIDECAR_MAGIC: &[u8; 8] = b"RETRIKY1";
-const KEYS_SIDECAR_HEADER_BYTES: usize = 24;
+/// Sidecar layout: `magic | graph_degree: u64 | count: u64 | rows: u32...`, all little-endian.
+/// Widths are fixed rather than `usize` because this is a file read back on whatever machine opens
+/// the index, and rows fit `u32` because CAGRA's own ids do. The magic makes any older sidecar a
+/// loud error instead of one that parses into nonsense.
+const ROWS_SIDECAR_MAGIC: &[u8; 8] = b"RETRIRW1";
+const ROWS_SIDECAR_HEADER_BYTES: usize = 24;
 
 /// `graph_degree` rides along because CAGRA's deserializer cannot report the
 /// build parameters, and `memory_bytes()` needs the degree to size the graph.
-fn write_host_keys(path: &str, keys: &[Key], graph_degree: usize) -> Result<(), String> {
+fn write_host_rows(path: &str, rows: &[u32], graph_degree: usize) -> Result<(), String> {
     let mut bytes = Vec::with_capacity_in(
-        KEYS_SIDECAR_HEADER_BYTES + keys.len() * std::mem::size_of::<Key>(),
+        ROWS_SIDECAR_HEADER_BYTES + std::mem::size_of_val(rows),
         std::alloc::System,
     );
-    bytes.extend_from_slice(KEYS_SIDECAR_MAGIC);
+    bytes.extend_from_slice(ROWS_SIDECAR_MAGIC);
     bytes.extend_from_slice(&(graph_degree as u64).to_le_bytes());
-    bytes.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-    for &key in keys {
-        bytes.extend_from_slice(&key.to_le_bytes());
+    bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    for &row in rows {
+        bytes.extend_from_slice(&row.to_le_bytes());
     }
     std::fs::write(path, &bytes).map_err(|error| format!("write {path}: {error}"))
 }
 
-fn read_host_keys(path: &str) -> Result<(Vec<Key, std::alloc::System>, usize), String> {
+fn read_host_rows(path: &str) -> Result<(Vec<u32, std::alloc::System>, usize), String> {
     let bytes = std::fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
-    if bytes.len() < KEYS_SIDECAR_HEADER_BYTES || &bytes[0..8] != KEYS_SIDECAR_MAGIC {
-        return Err(format!(
-            "{path}: not a versioned key sidecar — it predates graph-degree persistence, rebuild the index"
-        ));
+    if bytes.len() < ROWS_SIDECAR_HEADER_BYTES || &bytes[0..8] != ROWS_SIDECAR_MAGIC {
+        return Err(format!("{path}: not a row sidecar of this version, rebuild the index"));
     }
     let graph_degree = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
     let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-    let expected = KEYS_SIDECAR_HEADER_BYTES + count * std::mem::size_of::<Key>();
-    if bytes.len() < expected {
-        return Err(format!("{path}: expected {expected} bytes, got {}", bytes.len()));
+    let body = &bytes[ROWS_SIDECAR_HEADER_BYTES..];
+    if body.len() < count * 4 {
+        return Err(format!(
+            "{path}: expected {} bytes, got {}",
+            ROWS_SIDECAR_HEADER_BYTES + count * 4,
+            bytes.len()
+        ));
     }
-    let mut keys = Vec::with_capacity_in(count, std::alloc::System);
-    for key_index in 0..count {
-        let offset = KEYS_SIDECAR_HEADER_BYTES + key_index * std::mem::size_of::<Key>();
-        keys.push(Key::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()));
-    }
-    Ok((keys, graph_degree))
+    let mut rows = Vec::with_capacity_in(count, std::alloc::System);
+    rows.extend(
+        body.chunks_exact(4)
+            .take(count)
+            .map(|row| u32::from_le_bytes(row.try_into().unwrap())),
+    );
+    Ok((rows, graph_degree))
 }
 
 // #region GpuQueries
@@ -394,7 +394,7 @@ impl GpuQueries {
 /// the DLPack shapes changes — see `set_batch_rows`.
 struct SearchBuffers {
     queries: GpuQueries,
-    neighbors: GpuTensor<Key>,
+    neighbors: GpuTensor<u32>,
     distances: GpuTensor<Distance>,
 
     /// Rows the buffers were sized for. Batches at or below this reuse them.
@@ -406,7 +406,7 @@ struct SearchBuffers {
     /// The neighbors' and distances' shared `[queries, neighbor_count]` shape.
     results_shape: [i64; 2],
 
-    neighbors_host: Vec<Key, std::alloc::System>,
+    neighbors_host: Vec<u32, std::alloc::System>,
     distances_host: Vec<Distance, std::alloc::System>,
 
     /// Search params, cached for as long as `neighbor_count` holds — the itopk
@@ -426,11 +426,11 @@ impl SearchBuffers {
         let error = |error| format!("GPU alloc failed: {error}");
         let queries = GpuQueries::allocate(data_type, &[capacity_queries, dimensions], allocator.clone())?;
         let mut neighbors_host = Vec::with_capacity_in(capacity_queries * neighbor_count, std::alloc::System);
-        neighbors_host.resize(capacity_queries * neighbor_count, Key::default());
+        neighbors_host.resize(capacity_queries * neighbor_count, 0);
         let mut distances_host = Vec::with_capacity_in(capacity_queries * neighbor_count, std::alloc::System);
         distances_host.resize(capacity_queries * neighbor_count, Distance::default());
         let neighbors = unsafe {
-            GpuTensor::<Key>::uninitialized_in(&[capacity_queries, neighbor_count], allocator.clone()).map_err(error)?
+            GpuTensor::<u32>::uninitialized_in(&[capacity_queries, neighbor_count], allocator.clone()).map_err(error)?
         };
         let distances = unsafe {
             GpuTensor::<Distance>::uninitialized_in(&[capacity_queries, neighbor_count], allocator).map_err(error)?
@@ -638,7 +638,7 @@ pub struct CuvsBackend {
     num_random_samplings: Option<u32>,
 
     host_vectors: Vec<u8, std::alloc::System>,
-    host_keys: Vec<Key, std::alloc::System>,
+    host_rows: Vec<u32, std::alloc::System>,
 
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -706,21 +706,21 @@ impl CuvsBackend {
             max_iterations,
             num_random_samplings,
             host_vectors: Vec::new_in(std::alloc::System),
-            host_keys: Vec::new_in(std::alloc::System),
+            host_rows: Vec::new_in(std::alloc::System),
             metadata,
         })
     }
 
     /// Open a saved CAGRA index. CAGRA's deserializer reports no build params, so the graph degree
-    /// comes from the key sidecar written alongside the index, and the other build-time settings
+    /// comes from the row sidecar written alongside the index, and the other build-time settings
     /// are reported as null.
     pub fn load(path: &str, config: IndexConfig<CuvsDataType, Metric>, tuning: CagraTuning) -> Result<Self, String> {
         let mut backend = Self::new(config, tuning)?;
         let index = CagraIndex::new()?;
         index.deserialize(&backend.resources, path)?;
-        let (host_keys, connectivity) = read_host_keys(&keys_sidecar_path(path))?;
+        let (host_rows, connectivity) = read_host_rows(&rows_sidecar_path(path))?;
         backend.index = Some(index);
-        backend.host_keys = host_keys;
+        backend.host_rows = host_rows;
         backend.connectivity = connectivity;
         backend.metadata.insert("connectivity".into(), json!(connectivity));
         backend.metadata.insert("loaded_from".into(), json!(path));
@@ -762,7 +762,7 @@ impl CuvsBackend {
 
     /// Build the CAGRA index from the accumulated host buffers.
     fn build_index(&mut self) -> Result<(), String> {
-        let vector_count = self.host_keys.len();
+        let vector_count = self.host_rows.len();
         let dimensions = self.dimensions;
         let mut shape = [vector_count as i64, dimensions as i64];
 
@@ -834,10 +834,13 @@ impl Backend for CuvsBackend {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
+        for row in keys.rows() {
+            self.host_rows
+                .push(u32::try_from(row).map_err(|_| "CAGRA rows end at 2^32".to_string())?);
+        }
         let bytes = self.cast.encode(&vectors)?;
         self.host_vectors.extend_from_slice(bytes);
-        self.host_keys.extend_from_slice(keys);
         self.index = None;
         Ok(())
     }
@@ -929,24 +932,24 @@ impl Backend for CuvsBackend {
         let answers = buffers.neighbors_host[..filled]
             .chunks_exact(count)
             .zip(buffers.distances_host[..filled].chunks_exact(count));
-        for ((neighbors, distances), row) in answers.zip(hits.rows()) {
-            row.write(neighbors.iter().zip(distances).filter_map(|(&neighbor, &distance)| {
-                let key = *self.host_keys.get(neighbor as usize)?;
-                Some(Ok((key, distance)))
+        for ((neighbors, distances), hit_row) in answers.zip(hits.rows()) {
+            hit_row.write_rows(neighbors.iter().zip(distances).filter_map(|(&neighbor, &distance)| {
+                let row = *self.host_rows.get(neighbor as usize)?;
+                Some(Ok((row as usize, distance)))
             }))?;
         }
         Ok(())
     }
 
-    /// The host-key sidecar has one entry per indexed vector, on both the
+    /// The host-row sidecar has one entry per indexed vector, on both the
     /// freshly-built and the deserialized path.
     fn indexed_count(&self) -> Option<usize> {
-        Some(self.host_keys.len())
+        Some(self.host_rows.len())
     }
 
     fn memory_bytes(&self) -> usize {
-        let vector_count = self.host_keys.len();
-        let host_bytes = self.host_vectors.len() + vector_count * std::mem::size_of::<Key>();
+        let vector_count = self.host_rows.len();
+        let host_bytes = self.host_vectors.len() + std::mem::size_of_val(self.host_rows.as_slice());
         let gpu_bytes = vector_count * self.dimensions * self.data_type.bytes_per_element()
             + vector_count * self.connectivity * std::mem::size_of::<u32>();
         host_bytes + gpu_bytes
@@ -955,7 +958,7 @@ impl Backend for CuvsBackend {
     fn save(&self, path: &str) -> Result<(), String> {
         let index = self.index.as_ref().ok_or("CAGRA index not built — nothing to save")?;
         index.serialize(&self.resources, path)?;
-        write_host_keys(&keys_sidecar_path(path), &self.host_keys, self.connectivity)
+        write_host_rows(&rows_sidecar_path(path), &self.host_rows, self.connectivity)
     }
 }
 

@@ -20,7 +20,7 @@ pub mod perf_counters;
 use std::{
     alloc::{Allocator, System},
     collections::HashMap,
-    fmt,
+    fmt::{self, Write as _},
     hash::{BuildHasher, Hasher},
     num::{NonZeroU16, NonZeroUsize},
     ops::Range,
@@ -34,15 +34,136 @@ use numkong::{self as nk, MatrixSpan, MatrixView};
 use serde_json::Value;
 
 pub use crate::{
-    dataset::{Dataset, GroundTruth, Keys, Permutation},
+    dataset::{Dataset, GroundTruth, Keys, Permutation, Shuffle},
     error::{DatasetError, GroundTruthError},
     output::{config_hash, write_report, ConfigReport, DatasetInfo, StepAddEntry, StepEntry, StepSearchEntry},
 };
 
 // #region Core types
 
-/// Vector key type used throughout the benchmark.
-pub type Key = u32;
+/// A vector's identity: an integer widened to 128 bits, or a UUID's 16 bytes read most significant first.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Key(pub u128);
+
+impl Key {
+    /// Pads the result slots a backend leaves unfilled.
+    pub const MISSING: Key = Key(u128::MAX);
+}
+
+impl From<u32> for Key {
+    fn from(value: u32) -> Self {
+        Key(u128::from(value))
+    }
+}
+
+impl From<u64> for Key {
+    fn from(value: u64) -> Self {
+        Key(u128::from(value))
+    }
+}
+
+impl TryFrom<Key> for u64 {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(key: Key) -> Result<Self, Self::Error> {
+        u64::try_from(key.0)
+    }
+}
+
+impl fmt::Display for Key {
+    /// The lowercase dashed UUID spelling, which integer keys take too, zero-padded.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bits = self.0;
+        write!(
+            formatter,
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            bits >> 96,
+            (bits >> 80) & 0xFFFF,
+            (bits >> 64) & 0xFFFF,
+            (bits >> 48) & 0xFFFF,
+            bits & 0xFFFF_FFFF_FFFF,
+        )
+    }
+}
+
+impl std::str::FromStr for Key {
+    type Err = String;
+
+    /// Parses 32 hexadecimal digits, dashes anywhere, as `Display` spells them.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let digits = text.bytes().filter(|&byte| byte != b'-');
+        let (count, bits) = digits.fold((0, Some(0u128)), |(count, bits), byte| {
+            let digit = (byte as char).to_digit(16).map(u128::from);
+            (count + 1, bits.zip(digit).map(|(bits, digit)| bits << 4 | digit))
+        });
+        match (count, bits) {
+            (32, Some(bits)) => Ok(Key(bits)),
+            _ => Err(format!("{text:?} is not a UUID of 32 hexadecimal digits")),
+        }
+    }
+}
+
+impl nk::StorageElement for Key {
+    fn zero() -> Self {
+        Key(0)
+    }
+    fn one() -> Self {
+        Key(1)
+    }
+}
+
+/// Keys generated when `--base-keys` is unset, one per base row and unique to it.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyType {
+    U32,
+    U64,
+    /// Random UUIDs, scattered over the whole key space.
+    #[value(name = "uuid-v4")]
+    UuidV4,
+    /// Time-ordered UUIDs: the row is the timestamp and counter, so keys sort as rows do.
+    #[value(name = "uuid-v7")]
+    UuidV7,
+}
+
+impl KeyType {
+    /// The key of base `row`.
+    pub fn encode(self, row: usize) -> Key {
+        let row = row as u64;
+        match self {
+            Self::U32 => Key::from(row as u32),
+            Self::U64 => Key::from(row),
+            Self::UuidV4 => uuid(4, mix(row), mix(row ^ SPLITMIX64_GAMMA)),
+            Self::UuidV7 => uuid(7, row, mix(row)),
+        }
+    }
+
+    /// Bytes per key: 4, 8 or 16.
+    pub fn key_bytes(self) -> usize {
+        match self {
+            Self::U32 => 4,
+            Self::U64 => 8,
+            Self::UuidV4 | Self::UuidV7 => 16,
+        }
+    }
+}
+
+impl fmt::Display for KeyType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        spell_value(self, formatter)
+    }
+}
+
+/// An RFC 9562 UUID of `version` that keeps all 64 `payload` bits, in order, around the version and
+/// variant fields, so distinct payloads never collide; `filler` supplies the remaining 58 bits.
+fn uuid(version: u128, payload: u64, filler: u64) -> Key {
+    let (payload, filler) = (u128::from(payload), u128::from(filler));
+    Key((payload >> 16) << 80
+        | version << 76
+        | (payload >> 4 & 0xFFF) << 64
+        | 0b10 << 62
+        | (payload & 0xF) << 58
+        | filler & ((1 << 58) - 1))
+}
 
 /// Distance/similarity value returned by search operations.
 pub type Distance = f32;
@@ -216,12 +337,65 @@ pub fn process_rss_bytes() -> u64 {
     system.process(process_id).map(|process| process.memory()).unwrap_or(0)
 }
 
+/// The base rows of one batch, global across shards, resolved once so the harness and the backend
+/// read the same rows.
+#[derive(Clone)]
+pub enum BatchRows<'a> {
+    /// File order: the rows themselves.
+    Range(Range<usize>),
+    /// Shuffled order: the rows the permutation produced for this batch.
+    Shuffled(&'a [usize]),
+}
+
+/// One batch's keys, read through the run's [`Keys`] in insertion order, so the batch owns no buffer.
+#[derive(Clone)]
+pub struct BatchKeys<'a> {
+    keys: &'a Keys,
+    rows: BatchRows<'a>,
+}
+
+impl<'a> BatchKeys<'a> {
+    pub fn new(keys: &'a Keys, rows: BatchRows<'a>) -> Self {
+        Self { keys, rows }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.rows {
+            BatchRows::Range(rows) => rows.len(),
+            BatchRows::Shuffled(rows) => rows.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes per key, for engines that size a key column once: 4, 8 or 16.
+    pub fn key_bytes(&self) -> usize {
+        self.keys.key_bytes()
+    }
+
+    /// The base rows of the batch, for engines that store rows rather than wide keys.
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = usize> + 'a {
+        let rows = self.rows.clone();
+        (0..self.len()).map(move |index| match &rows {
+            BatchRows::Range(rows) => rows.start + index,
+            BatchRows::Shuffled(rows) => rows[index],
+        })
+    }
+
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = Key> + 'a {
+        let keys = self.keys;
+        self.rows().map(move |row| keys.get(row))
+    }
+}
+
 // #region Backend trait
 
 /// Common trait for all vector search backends.
 pub trait Backend: Send {
     fn metadata(&self) -> HashMap<String, Value>;
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String>;
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String>;
     /// Answers every row of `queries` into the matching row of `hits`.
     fn search(&mut self, queries: Vectors, hits: Hits<'_>) -> Result<(), String>;
     fn memory_bytes(&self) -> usize;
@@ -304,19 +478,21 @@ impl SearchBuffers {
         let mut counts = Vec::with_capacity_in(queries, System);
         counts.resize(queries, 0);
         Ok(Self {
-            keys: nk::Matrix::full(&[queries, count], Key::MAX).map_err(error)?,
+            keys: nk::Matrix::full(&[queries, count], Key::MISSING).map_err(error)?,
             distances: nk::Matrix::full(&[queries, count], Distance::INFINITY).map_err(error)?,
             counts,
         })
     }
 
-    /// The rows of one batch, for a backend to answer into.
-    pub fn hits(&mut self, rows: Range<usize>) -> Hits<'_> {
+    /// The rows of one batch, for a backend to answer into; `base_keys` names the rows an engine
+    /// reports instead of keys.
+    pub fn hits<'a>(&'a mut self, rows: Range<usize>, base_keys: &'a Keys) -> Hits<'a> {
         const WHOLE_ROWS: &str = "a batch is a run of whole rows";
         Hits {
             keys: self.keys.slice_mut((rows.clone(), ..)).expect(WHOLE_ROWS),
             distances: self.distances.slice_mut((rows.clone(), ..)).expect(WHOLE_ROWS),
             counts: &mut self.counts[rows],
+            base_keys,
         }
     }
 
@@ -342,6 +518,7 @@ pub struct Hits<'a> {
     keys: MatrixSpan<'a, Key>,
     distances: MatrixSpan<'a, Distance>,
     counts: &'a mut [usize],
+    base_keys: &'a Keys,
 }
 
 impl Hits<'_> {
@@ -354,12 +531,18 @@ impl Hits<'_> {
     pub fn rows(&mut self) -> impl Iterator<Item = HitRow<'_>> {
         const WHOLE_ROWS: &str = "a batch is a run of whole rows";
         let count = self.count();
+        let base_keys = self.base_keys;
         let keys = self.keys.as_contiguous_slice_mut().expect(WHOLE_ROWS);
         let distances = self.distances.as_contiguous_slice_mut().expect(WHOLE_ROWS);
         keys.chunks_exact_mut(count)
             .zip(distances.chunks_exact_mut(count))
             .zip(self.counts.iter_mut())
-            .map(|((keys, distances), found)| HitRow { keys, distances, found })
+            .map(move |((keys, distances), found)| HitRow {
+                keys,
+                distances,
+                found,
+                base_keys,
+            })
     }
 }
 
@@ -368,10 +551,11 @@ pub struct HitRow<'a> {
     keys: &'a mut [Key],
     distances: &'a mut [Distance],
     found: &'a mut usize,
+    base_keys: &'a Keys,
 }
 
 impl HitRow<'_> {
-    /// Writes the query's hits best first, pads the rest with `Key::MAX` and infinity, and counts
+    /// Writes the query's hits best first, pads the rest with `Key::MISSING` and infinity, and counts
     /// them. `eval` scores only the counted prefix, so backends drop their engine's misses rather
     /// than yield sentinels; more hits than slots is an error.
     pub fn write(self, hits: impl IntoIterator<Item = Result<(Key, Distance), String>>) -> Result<(), String> {
@@ -385,10 +569,25 @@ impl HitRow<'_> {
             self.distances[found] = distance;
             found += 1;
         }
-        self.keys[found..].fill(Key::MAX);
+        self.keys[found..].fill(Key::MISSING);
         self.distances[found..].fill(Distance::INFINITY);
         *self.found = found;
         Ok(())
+    }
+
+    /// Writes hits that an engine reports as base rows, as engines without wide ids store them,
+    /// naming each by its key.
+    pub fn write_rows(self, hits: impl IntoIterator<Item = Result<(usize, Distance), String>>) -> Result<(), String> {
+        let base_keys = self.base_keys;
+        self.write(hits.into_iter().map(|hit| {
+            hit.and_then(|(row, distance)| {
+                if row < base_keys.rows() {
+                    Ok((base_keys.get(row), distance))
+                } else {
+                    Err(format!("a hit names row {row}, past the base's end"))
+                }
+            })
+        }))
     }
 }
 
@@ -403,17 +602,30 @@ pub unsafe fn pod_slice_as_bytes<T: Copy>(slice: &[T]) -> &[u8] {
     std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice))
 }
 
-/// Format a number with thousand separators: 1234567 → "1,234,567"
-pub fn format_thousands(number: u64) -> String {
-    let digits = number.to_string();
-    let mut result = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            result.push(',');
+/// A number spelled with thousand separators, `1,234,567`, written straight into the formatter.
+pub struct Thousands(pub u64);
+
+impl fmt::Display for Thousands {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut digits = [0u8; 20];
+        let mut remaining = self.0;
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (remaining % 10) as u8;
+            remaining /= 10;
+            count += 1;
+            if remaining == 0 {
+                break;
+            }
         }
-        result.push(character);
+        for index in (0..count).rev() {
+            formatter.write_char(char::from(digits[index]))?;
+            if index > 0 && index.is_multiple_of(3) {
+                formatter.write_char(',')?;
+            }
+        }
+        Ok(())
     }
-    result
 }
 
 /// Splits `range` into runs of `step`, the last one possibly shorter.
@@ -431,15 +643,25 @@ pub struct CommonArgs {
     #[arg(long, env = "RETRIEVAL_BASE_VECTORS")]
     pub base_vectors: PathBuf,
 
-    /// Optional keys for the base vectors (.i32bin). One per base vector.
+    /// Keys for the base vectors, one per vector: `.i32bin`, `.u64bin` or `.uuidbin`
     #[arg(long, env = "RETRIEVAL_BASE_KEYS")]
     pub base_keys: Option<PathBuf>,
+
+    /// Keys generated when `--base-keys` is unset: u32, u64, uuid-v4 or uuid-v7
+    #[arg(
+        long,
+        env = "RETRIEVAL_KEY_TYPE",
+        value_enum,
+        default_value = "u32",
+        conflicts_with = "base_keys"
+    )]
+    pub key_type: KeyType,
 
     /// Query vectors to search with
     #[arg(long, env = "RETRIEVAL_QUERY_VECTORS")]
     pub query_vectors: PathBuf,
 
-    /// Ground-truth neighbors for those queries (.ibin)
+    /// Ground-truth neighbor rows for those queries: `.ibin`, or `.u64bin` past 2^32 base rows
     #[arg(long, env = "RETRIEVAL_QUERY_NEIGHBORS")]
     pub query_neighbors: PathBuf,
 
@@ -577,10 +799,11 @@ pub struct BenchState {
     output_dir: Option<PathBuf>,
     dataset_info: DatasetInfo,
     search_buffers: SearchBuffers,
-    key_scratch: Vec<Key, System>,
-    /// Rows copied for a batch that cannot borrow the mapped file: a gather, a truncation or a
+    /// The rows of a shuffled batch, resolved once per batch.
+    row_scratch: Vec<usize, System>,
+    /// Vectors copied for a batch that cannot borrow the mapped file: a gather, a truncation or a
     /// shard boundary.
-    row_scratch: Vec<u8, System>,
+    vector_scratch: Vec<u8, System>,
 }
 
 impl BenchState {
@@ -616,21 +839,21 @@ impl BenchState {
         if total_vectors < file_vectors {
             eprintln!(
                 "  {} vectors in file, capping to {} (--max-base-vectors)",
-                format_thousands(file_vectors as u64),
-                format_thousands(total_vectors as u64),
+                Thousands(file_vectors as u64),
+                Thousands(total_vectors as u64),
             );
             eprintln!(
                 "  note: ground truth still refers to all {} rows, so raw recall is bounded by \
                  ~{:.0}%. The `*_normalized` fields divide that back out, assuming the indexed \
                  slice is a uniform sample of the base — treat them as estimates, and don't \
                  compare capped runs against uncapped ones.",
-                format_thousands(file_vectors as u64),
+                Thousands(file_vectors as u64),
                 100.0 * total_vectors as f64 / file_vectors as f64,
             );
         } else {
             eprintln!(
                 "  {} vectors, {} dimensions",
-                format_thousands(total_vectors as u64),
+                Thousands(total_vectors as u64),
                 dimensions
             );
         }
@@ -639,20 +862,26 @@ impl BenchState {
             Some(path) => {
                 eprintln!("Loading keys: {}", path.display());
                 let keys = Keys::load(path)?;
-                eprintln!("  {} keys", format_thousands(keys.rows() as u64));
-                // The add loop reads one key per base row, so a short file would read past its mapping.
-                if keys.rows() < total_vectors {
+                eprintln!("  {} keys", Thousands(keys.rows() as u64));
+                // Ground truth names rows of the whole file, even past `--max-base-vectors`.
+                if keys.rows() < file_vectors {
                     return Err(format!(
-                        "--base-keys has {} entries but {} base vectors are in play; \
+                        "--base-keys has {} entries but the base has {} vectors; \
                          one key per vector is required",
-                        format_thousands(keys.rows() as u64),
-                        format_thousands(total_vectors as u64),
+                        Thousands(keys.rows() as u64),
+                        Thousands(file_vectors as u64),
                     )
                     .into());
                 }
                 keys
             }
-            None => Keys::Sequential { count: total_vectors },
+            None if args.key_type == KeyType::U32 && file_vectors as u64 > u64::from(u32::MAX) + 1 => {
+                return Err(format!("--key-type u32 names at most 2^32 rows, the base has {file_vectors}").into());
+            }
+            None => Keys::Generated {
+                count: file_vectors,
+                key_type: args.key_type,
+            },
         };
 
         eprintln!("Loading queries: {}", args.query_vectors.display());
@@ -660,7 +889,7 @@ impl BenchState {
         let query_count = query_dataset.rows();
         eprintln!(
             "  {} queries, {} dimensions",
-            format_thousands(query_count as u64),
+            Thousands(query_count as u64),
             query_dataset.dimensions()
         );
 
@@ -673,7 +902,7 @@ impl BenchState {
         let ground_truth = GroundTruth::load(&args.query_neighbors)?;
         eprintln!(
             "  {} queries, {} neighbors each",
-            format_thousands(ground_truth.queries() as u64),
+            Thousands(ground_truth.queries() as u64),
             ground_truth.neighbors_per_query(),
         );
 
@@ -690,6 +919,10 @@ impl BenchState {
             sample: args.self_search_sample,
         });
 
+        match &args.base_keys {
+            Some(path) => eprintln!("- Keys: {}", path.display()),
+            None => eprintln!("- Key type: {}", args.key_type),
+        }
         eprintln!("- Insertion order: {}", args.insertion_order);
         if let Some(seed) = seed {
             eprintln!("- Seed: {seed}");
@@ -720,7 +953,7 @@ impl BenchState {
 
         let permutation = match seed {
             None => Permutation::Identity,
-            Some(seed) => Permutation::shuffled(total_vectors, seed),
+            Some(seed) => Permutation::Shuffled(Shuffle::new(total_vectors, seed)),
         };
 
         let dataset_info = DatasetInfo {
@@ -744,8 +977,8 @@ impl BenchState {
             output_dir: args.output.clone(),
             dataset_info,
             search_buffers: SearchBuffers::new(query_count, top_k)?,
-            key_scratch: Vec::new_in(System),
             row_scratch: Vec::new_in(System),
+            vector_scratch: Vec::new_in(System),
             dataset,
             keys,
             query_dataset,
@@ -824,9 +1057,9 @@ fn run_add_phase(
     let message = |indexed: usize, throughput: u64| {
         format!(
             "{}/{} ({} add/s)",
-            format_thousands(indexed as u64),
-            format_thousands(total_vectors as u64),
-            format_thousands(throughput),
+            Thousands(indexed as u64),
+            Thousands(total_vectors as u64),
+            Thousands(throughput),
         )
     };
     let progress = progress_bar(total_vectors, "  add    [{elapsed_precise}] {bar:40.cyan/blue} {msg}");
@@ -835,27 +1068,26 @@ fn run_add_phase(
     start_counter_capture(perf, "add");
     let started = Instant::now();
     for batch in row_ranges(step.clone(), inserts_per_call) {
-        let (keys, vectors) = match &state.permutation {
+        let (rows, vectors) = match &state.permutation {
             Permutation::Identity => (
-                state.keys.slice(batch.start, batch.len(), &mut state.key_scratch),
+                BatchRows::Range(batch.clone()),
                 state
                     .dataset
-                    .slice(batch.start, batch.len(), dimensions, &mut state.row_scratch),
+                    .slice(batch.start, batch.len(), dimensions, &mut state.vector_scratch),
             ),
-            Permutation::Shuffled { indices, .. } => {
-                let indices = &indices[batch.clone()];
-                for (slot, &row) in state.key_scratch.iter_mut().zip(indices) {
-                    *slot = state.keys.get(row);
-                }
-                (
-                    &state.key_scratch[..indices.len()],
-                    state
-                        .dataset
-                        .gather(indices.iter().copied(), dimensions, &mut state.row_scratch),
-                )
+            Permutation::Shuffled(shuffle) => {
+                state.row_scratch.clear();
+                state
+                    .row_scratch
+                    .extend(batch.clone().map(|position| shuffle.row(position)));
+                let rows = state.row_scratch.as_slice();
+                let vectors = state
+                    .dataset
+                    .gather(rows.iter().copied(), dimensions, &mut state.vector_scratch);
+                (BatchRows::Shuffled(rows), vectors)
             }
         };
-        backend.add(keys, vectors)?;
+        backend.add(BatchKeys::new(&state.keys, rows), vectors)?;
         progress.set_position(batch.end as u64);
         progress.set_message(message(
             batch.end,
@@ -894,20 +1126,20 @@ fn run_search_phase(
     for batch in row_ranges(0..query_count, queries_per_call) {
         let queries = state
             .query_dataset
-            .slice(batch.start, batch.len(), dimensions, &mut state.row_scratch);
-        backend.search(queries, state.search_buffers.hits(batch.clone()))?;
+            .slice(batch.start, batch.len(), dimensions, &mut state.vector_scratch);
+        backend.search(queries, state.search_buffers.hits(batch.clone(), &state.keys))?;
         progress.set_position(batch.end as u64);
         progress.set_message(format!(
             "{}/{} ({} search/s)",
-            format_thousands(batch.end as u64),
-            format_thousands(query_count as u64),
-            format_thousands(per_second(batch.end, started.elapsed().as_secs_f64())),
+            Thousands(batch.end as u64),
+            Thousands(query_count as u64),
+            Thousands(per_second(batch.end, started.elapsed().as_secs_f64())),
         ));
     }
     let elapsed = started.elapsed().as_secs_f64();
     let counters = stop_and_read_counters(perf, "search");
     let throughput = per_second(query_count, elapsed);
-    let scores = eval::score(state.search_buffers.found(), &state.ground_truth, count);
+    let scores = eval::score(state.search_buffers.found(), &state.ground_truth, &state.keys, count);
 
     // Raw metrics, since dividing out coverage would treat the indexed prefix as a uniform sample.
     let coverage = vectors_indexed as f64 / state.dataset.rows().max(1) as f64;
@@ -917,12 +1149,12 @@ fn run_search_phase(
          {approximate}recall@{count}={:.4}, \
          {approximate}intersection@{count}={:.4}, \
          {approximate}NDCG@{count}={:.4} ({} vectors, {:.0}% coverage)",
-        format_thousands(throughput),
+        Thousands(throughput),
         scores.recall_at_1,
         scores.recall_at_k,
         scores.intersection_at_k,
         scores.ndcg_at_k,
-        format_thousands(vectors_indexed as u64),
+        Thousands(vectors_indexed as u64),
         coverage * 100.0,
     ));
 
@@ -954,28 +1186,26 @@ fn run_self_search_phase(
 ) -> BenchResult<StepSearchEntry> {
     let batch_size = queries_per_call.min(query_count);
     let mut buffers = SearchBuffers::new(batch_size, count)?;
-    let mut expected_scratch = Vec::with_capacity_in(batch_size, System);
-    expected_scratch.resize(batch_size, 0 as Key);
     let progress = progress_bar(query_count, "  self   [{elapsed_precise}] {bar:40.magenta/blue} {msg}");
 
     start_counter_capture(perf, "self-recall");
     let started = Instant::now();
     let (mut hits_at_1, mut hits_at_k) = (0, 0);
     for batch in row_ranges(0..query_count, batch_size) {
-        let expected = state.keys.slice(batch.start, batch.len(), &mut expected_scratch);
+        let expected = batch.clone().map(|row| state.keys.get(row));
         let queries = state
             .dataset
-            .slice(batch.start, batch.len(), dimensions, &mut state.row_scratch);
-        backend.search(queries, buffers.hits(0..batch.len()))?;
+            .slice(batch.start, batch.len(), dimensions, &mut state.vector_scratch);
+        backend.search(queries, buffers.hits(0..batch.len(), &state.keys))?;
         let (at_1, at_k) = eval::self_recall_hits(buffers.found().take(batch.len()), expected, count);
         hits_at_1 += at_1;
         hits_at_k += at_k;
         progress.set_position(batch.end as u64);
         progress.set_message(format!(
             "{}/{} ({} search/s)",
-            format_thousands(batch.end as u64),
-            format_thousands(query_count as u64),
-            format_thousands(per_second(batch.end, started.elapsed().as_secs_f64())),
+            Thousands(batch.end as u64),
+            Thousands(query_count as u64),
+            Thousands(per_second(batch.end, started.elapsed().as_secs_f64())),
         ));
     }
     let elapsed = started.elapsed().as_secs_f64();
@@ -985,8 +1215,8 @@ fn run_self_search_phase(
     let recall_at_k = hits_at_k as f64 / query_count as f64;
     progress.finish_with_message(format!(
         "{} search/s, recall@1={recall_at_1:.4}, recall@{count}={recall_at_k:.4} ({} queries)",
-        format_thousands(throughput),
-        format_thousands(query_count as u64),
+        Thousands(throughput),
+        Thousands(query_count as u64),
     ));
 
     Ok(StepSearchEntry {
@@ -1063,6 +1293,11 @@ fn save_report(
     metadata.insert("dimensions".into(), Value::from(dimensions));
     metadata.insert("vectors_count".into(), Value::from(state.total_vectors));
     metadata.insert("seed".into(), Value::from(state.permutation.seed().map(|seed| seed.0)));
+    if let Keys::Generated { key_type, .. } = state.keys {
+        if key_type != KeyType::U32 {
+            metadata.insert("key_type".into(), Value::from(key_type.to_string()));
+        }
+    }
     metadata.insert("steps".into(), Value::from(state.steps));
     metadata.insert("inserts_per_core".into(), Value::from(state.inserts_per_core));
     metadata.insert("queries_per_core".into(), Value::from(state.queries_per_core));
@@ -1100,10 +1335,10 @@ pub fn run(
     let inserts_per_call = state.inserts_per_core * cores;
     let queries_per_call = state.queries_per_core * cores;
     let row_bytes = state.dataset.vector_bytes().max(state.query_dataset.vector_bytes());
-    state.key_scratch.resize(inserts_per_call, 0 as Key);
     state
-        .row_scratch
+        .vector_scratch
         .resize(inserts_per_call.max(queries_per_call) * row_bytes, 0);
+    state.row_scratch.reserve(inserts_per_call);
     eprintln!("\n── {description} ──");
 
     // Without CAP_PERFMON or on another OS, steps run without counters and their fields stay empty.
@@ -1118,8 +1353,8 @@ pub fn run(
             if indexed != state.total_vectors {
                 eprintln!(
                     "  loaded index holds {} vectors, dataset implies {} — using the index's count",
-                    format_thousands(indexed as u64),
-                    format_thousands(state.total_vectors as u64),
+                    Thousands(indexed as u64),
+                    Thousands(state.total_vectors as u64),
                 );
             }
             let search = run_search_phase(backend, state, &mut perf, dimensions, queries_per_call, indexed, true)?;
@@ -1518,25 +1753,72 @@ mod tests {
     use std::alloc::System;
 
     use super::{
-        parse_self_search_sample, resolve_self_search_sample, CastScratch, Distance, Key, SearchBuffers,
-        SelfSearchSample, SplitMix64, VectorSlice, Vectors,
+        parse_self_search_sample, resolve_self_search_sample, CastScratch, Distance, Key, KeyType, Keys, SearchBuffers,
+        SelfSearchSample, Shuffle, SplitMix64, VectorSlice, Vectors,
     };
 
     #[test]
-    fn hit_rows_pad_count_and_refuse_overflow() {
-        let mut buffers = SearchBuffers::new(2, 3).unwrap();
+    fn hit_rows_pad_count_translate_rows_and_refuse_overflow() {
+        let base_keys = Keys::Generated {
+            count: 3,
+            key_type: KeyType::UuidV4,
+        };
+        let mut buffers = SearchBuffers::new(3, 3).unwrap();
         {
-            let mut hits = buffers.hits(0..2);
+            let mut hits = buffers.hits(0..3, &base_keys);
             let mut rows = hits.rows();
-            rows.next().unwrap().write([Ok((7, 0.5)), Ok((9, 1.5))]).unwrap();
-            let overflow = rows.next().unwrap().write((0..4).map(|key| Ok((key, 0.0))));
+            let (seven, nine) = (Key::from(7u32), Key::from(9u32));
+            rows.next().unwrap().write([Ok((seven, 0.5)), Ok((nine, 1.5))]).unwrap();
+            rows.next().unwrap().write_rows([Ok((2, 0.0))]).unwrap();
+            let overflow = rows.next().unwrap().write_rows((0..4).map(|row| Ok((row % 3, 0.0))));
             assert!(overflow.is_err());
         }
-        let (keys, distances, found) = buffers.rows().next().unwrap();
-        assert_eq!(keys, [7, 9, Key::MAX]);
+        let mut rows = buffers.rows();
+        let (keys, distances, found) = rows.next().unwrap();
+        assert_eq!(keys, [Key::from(7u32), Key::from(9u32), Key::MISSING]);
         assert_eq!(distances, [0.5, 1.5, Distance::INFINITY]);
         assert_eq!(found, 2);
-        assert_eq!(buffers.found().next().unwrap(), [7, 9]);
+        assert_eq!(rows.next().unwrap().0[0], base_keys.get(2));
+    }
+
+    #[test]
+    fn thousands_group_from_the_right() {
+        let spelled = |number| super::Thousands(number).to_string();
+        assert_eq!(spelled(0), "0");
+        assert_eq!(spelled(999), "999");
+        assert_eq!(spelled(1000), "1,000");
+        assert_eq!(spelled(1_234_567), "1,234,567");
+        assert_eq!(spelled(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn shuffles_permute_every_size_without_storing_rows() {
+        for count in [1, 2, 3, 5, 1000, 65_537] {
+            let shuffle = Shuffle::new(count, super::Seed(42));
+            let mut rows: Vec<usize> = (0..count).map(|position| shuffle.row(position)).collect();
+            let identity = rows.iter().enumerate().all(|(position, &row)| position == row);
+            assert!(count <= 3 || !identity, "count {count} came back in file order");
+            rows.sort_unstable();
+            assert!(rows.iter().copied().eq(0..count), "count {count}");
+        }
+    }
+
+    #[test]
+    fn generated_uuids_are_unique_versioned_and_v7_sorts_by_row() {
+        let rows = [0, 1, 2, 15, 16, 4095, 4096, 65_535, 65_536, 6_039_411_649];
+        for (key_type, version) in [(KeyType::UuidV4, 4), (KeyType::UuidV7, 7)] {
+            let keys: Vec<Key> = rows.iter().map(|&row| key_type.encode(row)).collect();
+            for key in &keys {
+                assert_eq!(key.0 >> 76 & 0xF, version);
+                assert_eq!(key.0 >> 62 & 0b11, 0b10);
+                assert_eq!(key.to_string().parse::<Key>(), Ok(*key));
+            }
+            let mut unique = keys.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), keys.len());
+            assert_eq!(key_type == KeyType::UuidV7, unique == keys);
+        }
     }
 
     #[test]

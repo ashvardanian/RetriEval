@@ -28,8 +28,8 @@ use itertools::iproduct;
 use serde_json::json;
 
 use retrieval::{
-    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BenchState, CastScratch, CommonArgs,
-    Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CastScratch,
+    CommonArgs, Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const INDEX_NAME: &str = "bench_idx";
@@ -269,15 +269,13 @@ impl Backend for RedisBackend<'_> {
         self.metadata.clone()
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         let bytes_per_row = vectors.dimensions() * self.data_type.bytes_per_element;
         let encoded = self.wire.encode(&vectors)?;
-        let batches = keys
-            .chunks(self.vectors_per_upsert)
-            .zip(encoded.chunks(self.vectors_per_upsert * bytes_per_row));
-        for (keys, rows) in batches {
+        let mut keys = keys.keys();
+        for rows in encoded.chunks(self.vectors_per_upsert * bytes_per_row) {
             self.pipeline.clear();
-            for (&key, row) in keys.iter().zip(rows.chunks_exact(bytes_per_row)) {
+            for (key, row) in keys.by_ref().zip(rows.chunks_exact(bytes_per_row)) {
                 self.key.clear();
                 write!(self.key, "{PREFIX}{key}").expect("a String takes any write");
                 self.pipeline.cmd("HSET").arg(&self.key).arg("vector").arg(row).ignore();
@@ -490,11 +488,11 @@ mod tests {
         let text = |s: &str| redis::Value::BulkString(s.as_bytes().to_vec());
         let response = redis::Value::Array(vec![
             redis::Value::Int(1),
-            text(&format!("{PREFIX}42")),
+            text(&format!("{PREFIX}{}", Key::from(42u32))),
             redis::Value::Array(vec![text("__vector_score"), text("0.25")]),
         ]);
         let hits: Result<Vec<_>, _> = decode_ft_search(&response).unwrap().collect();
-        assert_eq!(hits.unwrap(), [(42, 0.25)]);
+        assert_eq!(hits.unwrap(), [(Key::from(42u32), 0.25)]);
         let malformed = redis::Value::Array(vec![
             redis::Value::Int(1),
             text(&format!("{PREFIX}42")),

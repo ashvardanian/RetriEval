@@ -22,7 +22,7 @@ use clap::Parser;
 use serde_json::{json, Value};
 
 use retrieval::{
-    run_config, Backend, BenchState, CommonArgs, Distance, Hits, IndexFile, Key, SweepSummary, UnwrapOrBail,
+    run_config, Backend, BatchKeys, BenchState, CommonArgs, Distance, Hits, IndexFile, SweepSummary, UnwrapOrBail,
     VectorSlice, Vectors,
 };
 
@@ -117,20 +117,21 @@ impl Backend for TursoBackend {
         ])
     }
 
-    fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
+    /// Rows are the `INTEGER PRIMARY KEY`, SQLite's own rowid, and hits name them back as keys.
+    fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
         let VectorSlice::F32(values) = vectors.values() else {
             return Err("Turso supports F32 source vectors only".into());
         };
         self.runtime.block_on(async {
             let transaction = self.connection.transaction().await.map_err(|error| error.to_string())?;
             let mut statement = transaction
-                .prepare("INSERT INTO bench VALUES (?1, ?2)")
+                .prepare_cached("INSERT INTO bench VALUES (?1, ?2)")
                 .await
                 .map_err(|error| error.to_string())?;
-            for (row, &key) in values.chunks_exact(vectors.dimensions()).zip(keys) {
-                encode(row, &mut self.wire)?;
+            for (vector, row) in values.chunks_exact(vectors.dimensions()).zip(keys.rows()) {
+                encode(vector, &mut self.wire)?;
                 statement
-                    .execute((i64::from(key), self.wire.as_slice()))
+                    .execute((row as i64, self.wire.as_slice()))
                     .await
                     .map_err(|error| error.to_string())?;
             }
@@ -161,11 +162,12 @@ impl Backend for TursoBackend {
                     let distance = row.get::<f64>(1).map_err(|error| error.to_string())? as Distance;
                     found.push((id, distance));
                 }
-                hit_row.write(found.into_iter().map(|(id, distance)| {
-                    let key = Key::try_from(id).map_err(|error| error.to_string())?;
-                    match distance.is_finite() {
-                        true => Ok((key, distance)),
-                        false => Err("Turso returned nonfinite distance".into()),
+                hit_row.write_rows(found.into_iter().map(|(id, distance)| {
+                    let row = usize::try_from(id).map_err(|error| error.to_string())?;
+                    if distance.is_finite() {
+                        Ok((row, distance))
+                    } else {
+                        Err("Turso returned nonfinite distance".into())
                     }
                 }))?;
             }
@@ -207,7 +209,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use retrieval::SearchBuffers;
+    use retrieval::{BatchRows, Key, KeyType, Keys, SearchBuffers};
+
+    static KEYS: Keys = Keys::Generated {
+        count: 2,
+        key_type: KeyType::UuidV7,
+    };
+
+    fn both_rows() -> BatchKeys<'static> {
+        BatchKeys::new(&KEYS, BatchRows::Range(0..2))
+    }
 
     fn open(metric: Metric, runtime: &tokio::runtime::Runtime) -> TursoBackend {
         runtime
@@ -223,15 +234,18 @@ mod tests {
             .unwrap();
         let mut backend = open(Metric::L2, &runtime);
         backend
-            .add(&[9, 2], Vectors::new(VectorSlice::F32(&[3.0, 4.0, 0.0, 0.0]), 2))
+            .add(both_rows(), Vectors::new(VectorSlice::F32(&[3.0, 4.0, 0.0, 0.0]), 2))
             .unwrap();
         let pointer = backend.wire.as_ptr();
         let mut buffers = SearchBuffers::new(1, 3).unwrap();
         backend
-            .search(Vectors::new(VectorSlice::F32(&[0.0, 0.0]), 2), buffers.hits(0..1))
+            .search(
+                Vectors::new(VectorSlice::F32(&[0.0, 0.0]), 2),
+                buffers.hits(0..1, &KEYS),
+            )
             .unwrap();
         let (keys, distances, found) = buffers.rows().next().unwrap();
-        assert_eq!(keys, [2, 9, Key::MAX]);
+        assert_eq!(keys, [KEYS.get(1), KEYS.get(0), Key::MISSING]);
         assert_eq!(distances, [0.0, 5.0, Distance::INFINITY]);
         assert_eq!(found, 2);
         assert_eq!(pointer, backend.wire.as_ptr());
@@ -245,14 +259,17 @@ mod tests {
             .unwrap();
         let mut backend = open(Metric::Cos, &runtime);
         backend
-            .add(&[9, 2], Vectors::new(VectorSlice::F32(&[0.0, 1.0, 1.0, 0.0]), 2))
+            .add(both_rows(), Vectors::new(VectorSlice::F32(&[0.0, 1.0, 1.0, 0.0]), 2))
             .unwrap();
         let mut buffers = SearchBuffers::new(1, 2).unwrap();
         backend
-            .search(Vectors::new(VectorSlice::F32(&[1.0, 0.0]), 2), buffers.hits(0..1))
+            .search(
+                Vectors::new(VectorSlice::F32(&[1.0, 0.0]), 2),
+                buffers.hits(0..1, &KEYS),
+            )
             .unwrap();
         let (keys, distances, found) = buffers.rows().next().unwrap();
-        assert_eq!(keys, [2, 9]);
+        assert_eq!(keys, [KEYS.get(1), KEYS.get(0)]);
         assert!(distances[0].abs() < 1e-6);
         assert!((distances[1] - 1.0).abs() < 1e-6);
         assert_eq!(found, 2);
