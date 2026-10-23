@@ -1,193 +1,8 @@
-![RetriEval benchmarks thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/RetriEval.jpg?raw=true) 
+![RetriEval benchmarks thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/RetriEval.jpg?raw=true)
 
 __RetriEval__ is a benchmarking suite designed for Billion-scale Vector Search workloads.
 It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/NVIDIA/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
 It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, and machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
-
-<table>
-  <thead>
-    <tr>
-      <th align="left">Engine</th>
-      <th align="left">Config</th>
-      <th align="right">N</th>
-      <th align="right">Recall @ 10</th>
-      <th align="right">Add/s</th>
-      <th align="right">Search/s</th>
-      <th align="right">Memory</th>
-      <th align="right">Duration</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><th colspan="8" align="left">PubChem MACCS — 168-bit binary, Hamming · calibrated at 10M, same config at 100M</th></tr>
-    <tr>
-      <td rowspan="2">USearch</td>
-      <td rowspan="2">M=32, ef=128/64</td>
-      <td align="right">10M</td>
-      <td align="right">0.9696</td><td align="right">36,347</td><td align="right">35,767</td>
-      <td align="right">4.7 GB</td><td align="right">5.0m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">0.8438</td><td align="right">35,080</td><td align="right">38,432</td>
-      <td align="right">40.8 GB</td><td align="right">54.6m</td>
-    </tr>
-    <tr>
-      <td rowspan="2">FAISS</td>
-      <td rowspan="2">M=64, ef=40/16</td>
-      <td align="right">10M</td>
-      <td align="right">0.9661</td><td align="right">95,230</td><td align="right">293,795</td>
-      <td align="right">7.6 GB</td><td align="right">1.5m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">—</td><td align="right">—</td><td align="right">—</td>
-      <td align="right">≥ 63 GB</td><td align="right">killed at 9h</td>
-    </tr>
-    <tr><th colspan="8" align="left">SIFT — 128D <code>u8</code>, L2 · iso-recall baseline at ≥ 99 % recall@10</th></tr>
-    <tr>
-      <td rowspan="2">USearch</td>
-      <td rowspan="2">M=16, ef=128/256</td>
-      <td align="right">10M</td>
-      <td align="right">0.9938</td><td align="right">35,405</td><td align="right">80,729</td>
-      <td align="right">4.4 GB</td><td align="right">4.8m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">0.9833</td><td align="right">39,831</td><td align="right">75,808</td>
-      <td align="right">53.7 GB</td><td align="right">48.7m</td>
-    </tr>
-    <tr>
-      <td rowspan="2">FAISS</td>
-      <td rowspan="2">M=16, ef=128/256</td>
-      <td align="right">10M</td>
-      <td align="right">0.9952</td><td align="right">26,374</td><td align="right">38,278</td>
-      <td align="right">5.9 GB</td><td align="right">5.6m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">—</td><td align="right">—</td><td align="right">—</td>
-      <td align="right">≥ 46 GB</td><td align="right">killed at 9h</td>
-    </tr>
-    <tr>
-      <td rowspan="2">cuVS ¹</td>
-      <td>CAGRA 64/128, itopk=128</td>
-      <td align="right">10M</td>
-      <td align="right">0.9966 ²</td><td align="right">204,838</td><td align="right">1,204,000</td>
-      <td align="right">—</td><td align="right">0.8m</td>
-    </tr>
-    <tr>
-      <td>CAGRA 64/128, itopk=256</td>
-      <td align="right">100M</td>
-      <td align="right">0.9963 ²</td><td align="right">154,799</td><td align="right">582,000</td>
-      <td align="right">—</td><td align="right">10.8m</td>
-    </tr>
-    <tr><th colspan="8" align="left">Microsoft Turing-ANNS — 100D <code>f32</code>, L2 · iso-recall baseline at ≥ 99 % recall@10</th></tr>
-    <tr>
-      <td rowspan="11">USearch</td>
-      <td rowspan="2">M=48, ef=768/384, <code>f32</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9929</td><td align="right">8,532</td><td align="right">12,331</td>
-      <td align="right">13.0 GB</td><td align="right">18.3m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">0.9929</td><td align="right">6,646</td><td align="right">10,398</td>
-      <td align="right">139.6 GB</td><td align="right">4h 1m</td>
-    </tr>
-    <tr>
-      <td rowspan="2">M=48, ef=768/384, <code>bf16</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9929</td><td align="right">10,496</td><td align="right">16,940</td>
-      <td align="right">10.9 GB</td><td align="right">14.1m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">0.9931</td><td align="right">8,564</td><td align="right">14,772</td>
-      <td align="right">105.2 GB</td><td align="right">3h 1m</td>
-    </tr>
-    <tr>
-      <td rowspan="2">M=48, ef=768/384, <code>f16</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9929</td><td align="right">10,969</td><td align="right">20,246</td>
-      <td align="right">10.9 GB</td><td align="right">13.5m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">0.9930</td><td align="right">8,807</td><td align="right">15,412</td>
-      <td align="right">105.2 GB</td><td align="right">2h 54m</td>
-    </tr>
-    <tr>
-      <td rowspan="2">M=48, ef=768/384, <code>e5m2</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9919</td><td align="right">10,526</td><td align="right">20,534</td>
-      <td align="right">9.8 GB</td><td align="right">13.5m</td>
-    </tr>
-    <tr>
-      <td align="right">100M</td>
-      <td align="right">0.9924</td><td align="right">7,368</td><td align="right">13,227</td>
-      <td align="right">88.0 GB</td><td align="right">3h 15m</td>
-    </tr>
-    <tr>
-      <td>M=48, ef=768/384, <code>e4m3</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9930</td><td align="right">7,353</td><td align="right">12,106</td>
-      <td align="right">9.8 GB</td><td align="right">19.4m</td>
-    </tr>
-    <tr>
-      <td>M=48, ef=768/384, <code>e3m2</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9728</td><td align="right">10,398</td><td align="right">18,022</td>
-      <td align="right">9.8 GB</td><td align="right">13.3m</td>
-    </tr>
-    <tr>
-      <td>M=48, ef=768/384, <code>e2m3</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.7941</td><td align="right">10,935</td><td align="right">21,313</td>
-      <td align="right">9.8 GB</td><td align="right">13.2m</td>
-    </tr>
-    <tr>
-      <td rowspan="3">FAISS</td>
-      <td>M=48, ef=768/384, <code>f32</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9944</td><td align="right">7,491</td><td align="right">16,486</td>
-      <td align="right">14.1 GB</td><td align="right">20.6m</td>
-    </tr>
-    <tr>
-      <td>M=48, ef=768/384, <code>bf16</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9944</td><td align="right">3,800</td><td align="right">10,391</td>
-      <td align="right">12.1 GB</td><td align="right">39.4m</td>
-    </tr>
-    <tr>
-      <td>M=48, ef=768/384, <code>f16</code></td>
-      <td align="right">10M</td>
-      <td align="right">0.9944</td><td align="right">2,545</td><td align="right">10,032</td>
-      <td align="right">12.1 GB</td><td align="right">1h 1m</td>
-    </tr>
-  </tbody>
-</table>
-
-> Benchmarks were conducted on dual socket Intel Xeon6 with 192 logical threads.
-> USearch v2.25 was compared to FAISS v1.12.0 (static, via faiss-sys 0.7.0).
-> Both engines used the native input quantization type — no rescaling in either.
->
-> ¹ cuVS 26.10 ran on one NVIDIA B300 SXM6 through NVIDIA's `cuvs-bench` harness, not `retri-eval-cuvs`.
-> CAGRA used graph degree 64 and intermediate degree 128 with NN-descent, `search_width` 4, and one thread issuing 10K-query batches with the queries already in device memory.
-> Its build also kept 30-85 of the host's 256 logical threads busy.
-> ² K-recall@10, `intersection_at_k`, which is stricter than the 1-recall@10 of the other rows; the best of the sweep was 0.9999 at 10M and 0.9993 at 100M.
-
-The recommended methodology is to parameter-sweep different configuration options to achieve comparable recall between search backends on a given dataset.
-Once the behavior is confirmed on a small 1M–10M subset, 100M–1B and larger benchmarks can be run to validate scaling curves.
-
-Each search reports two recall conventions, because they answer different questions and one of them saturates.
-`recall_at_k` is __1-recall@K__ (hit-rate@K): the fraction of queries whose single true nearest neighbor lands within the top-K — FAISS's `OneRecallAtRCriterion`, and the measure USearch reports.
-`intersection_at_k` is __K-recall@K__ (`|top-K ∩ ground-truth-K| / K`), order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
-1-recall@K ≥ K-recall@K for the same run, so the two are never interchangeable.
-
-K is `--top-k`, which defaults to the ground-truth file's width — 10 on the Wiki sets, 100 on the BigANN ones.
-That matters because 1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
-`intersection_at_k` is what stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix, so both are stricter at wide K than the same-named numbers at K=10.
-Pass `--top-k 10` for figures comparable across datasets of differing ground-truth width.
 
 ## Quick Start
 
@@ -225,14 +40,13 @@ uv run scripts/plot.py results/ --output-dir plots/
 
 ### Search Engines
 
-| Backend     | Parallelism | Quantization                                            | Metrics                   |
-| ----------- | ----------- | ------------------------------------------------------- | ------------------------- |
-| __USearch__ | ForkUnion   | f64, f32, bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | ip, l2, cos, hamming, ... |
-| __FAISS__   | OpenMP      | f32, f16, bf16, u8, i8, b1                              | ip, l2                    |
-| __cuVS__    | CUDA        | f32, f16, i8, u8                                        | l2, ip, cos               |
+| Backend     | Parallelism | Quantization                                  | Metrics                       |
+| :---------- | :---------- | :-------------------------------------------- | :---------------------------- |
+| __USearch__ | ForkUnion   | bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | ip, l2, cos, hamming, jaccard |
+| __FAISS__   | OpenMP      | f32, f16, bf16, u8, i8, b1                    | ip, l2                        |
+| __cuVS__    | CUDA        | f32, f16, i8, u8                              | l2, ip, cos                   |
 
-- __USearch__: Input is passed directly in the specified type.
-  `--data-type` selects both the input interpretation and the internal quantization.
+- __USearch__: The input is stored in the `--data-type` quantization, converted on the fly.
 - __FAISS__: Input is always f32.
   `--data-type` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8_direct, etc.).
 - __cuVS__: Input is converted on the host to the `--data-type`, one of f32, f16, i8 or u8, before CAGRA builds on it.
@@ -290,91 +104,404 @@ Or combine multiple:
 cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
 ```
 
+## Datasets
+
+The BigANN collections are a good starting point, as most ship pre-computed ground-truth neighbors for recall evaluation.
+The tables below group the datasets by scale, and each name links to its download and run recipe in [`data/README.md`](data/README.md), which also covers the file format and sharded inputs.
+
+### ~1M Scale — Development & Testing
+
+| Dataset                         | Scalar Type | Dimensions | Metric | Base Size | Ground Truth      |
+| :------------------------------ | ----------: | ---------: | -----: | --------: | :---------------- |
+| [Unum UForm Wiki][unum-wiki-1m] |       `f32` |        256 |     IP |      1 GB | 100K queries, yes |
+| [Arxiv with E5][unum-arxiv-2m]  |       `f32` |        768 |     IP |      7 GB | 2.3M queries, yes |
+
+### ~10M Scale
+
+| Dataset                              | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
+| :----------------------------------- | ----------: | ---------: | ------: | --------: | :---------------- |
+| [Meta BIGANN — SIFT][meta-bigann]    |        `u8` |        128 |      L2 |    1.2 GB | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing] |       `f32` |        100 |      L2 |    3.7 GB | 100K queries, yes |
+| [Cohere Wiki EN][cohere-wiki]        |        `b1` |       1024 | Hamming |    5.3 GB | self-sampled ¹    |
+
+> ¹ These sources ship vectors without ground truth, so their `retri-download-*` binaries sample queries with a fixed seed and compute exact Hamming top-K.
+
+### ~100M Scale
+
+| Dataset                               | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
+| :------------------------------------ | ----------: | ---------: | ------: | --------: | :---------------- |
+| [Meta BIGANN — SIFT][meta-bigann]     |        `u8` |        128 |      L2 |     12 GB | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing]  |       `f32` |        100 |      L2 |     37 GB | 100K queries, yes |
+| [Microsoft SpaceV][msft-spacev]       |        `i8` |        100 |      L2 |    9.3 GB | 30K queries, yes  |
+| [Unum WikiVerse][wikiverse] ²         |       `f16` |  128–4096³ |  Cos/IP |  95-505GB | pipeline pending  |
+| [USearchMolecules PubChem][usm] MACCS |        `b1` |        168 | Hamming |    2.4 GB | self-sampled ¹    |
+| [USearchMolecules PubChem][usm] ECFP4 |        `b1` |       2048 | Hamming |     29 GB | self-sampled ¹    |
+
+> ² WikiVerse ships `.f16bin`, which RetriEval does not read yet.
+> ³ nomic-embed at 768, arctic-embed and Qwen3 at 1024, e5-mistral at 4096; the ColBERT model's 128d per token needs multi-vector support.
+
+### ~1B Scale
+
+| Dataset                                    | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
+| :----------------------------------------- | ----------: | ---------: | ------: | --------: | :---------------- |
+| [Meta BIGANN — SIFT][meta-bigann]          |        `u8` |        128 |      L2 |    119 GB | 10K queries, yes  |
+| [Microsoft Turing-ANNS][msft-turing]       |       `f32` |        100 |      L2 |    373 GB | 100K queries, yes |
+| [Microsoft SpaceV][msft-spacev]            |        `i8` |        100 |      L2 |     93 GB | 30K queries, yes  |
+| [Yandex Text-to-Image][yandex-t2i]         |       `f32` |        200 |     Cos |    750 GB | 100K queries, yes |
+| [Yandex Deep][yandex-deep]                 |       `f32` |         96 |      L2 |    358 GB | 10K queries, yes  |
+| [USearchMolecules GDB-13][usm] MACCS       |        `b1` |        168 | Hamming |     21 GB | self-sampled ¹    |
+| [USearchMolecules GDB-13][usm] ECFP4       |        `b1` |       2048 | Hamming |    250 GB | self-sampled ¹    |
+| [USearchMolecules Enamine REAL][usm] MACCS |        `b1` |        168 | Hamming |    127 GB | self-sampled ¹    |
+| [USearchMolecules Enamine REAL][usm] ECFP4 |        `b1` |       2048 | Hamming |   1.55 TB | self-sampled ¹    |
+
+[unum-wiki-1m]: data/README.md#unum-uform-wiki
+[unum-arxiv-2m]: data/README.md#arxiv-with-e5
+[meta-bigann]: data/README.md#meta-bigann-sift
+[msft-turing]: data/README.md#microsoft-turing-anns
+[msft-spacev]: data/README.md#microsoft-spacev
+[yandex-deep]: data/README.md#yandex-deep
+[yandex-t2i]: data/README.md#yandex-text-to-image
+[usm]: data/README.md#usearchmolecules
+[cohere-wiki]: data/README.md#cohere-wikipedia-multilingual
+[wikiverse]: data/README.md#unum-wikiverse
+
+## Results
+
+Each table holds one row per backend, device and data type, so a new run is a new row and nothing else moves.
+`1-r@10` is 1-recall@10, the share of queries whose true nearest neighbor lands in the top 10, and `10-r@10` is K-recall@10, the share of the true top 10 found.
+`Connectivity` is the graph degree, and `Expansions` the construction and search expansion, split by `/`.
+`Add/s` and `Search/s` count vectors per second, `Memory` is the backend's own peak figure, and `Build` is the wall time to index the whole base.
+`Device` is `CPU` for a dual-socket server and `GPU` for a single accelerator, and every backend took its native input type, with no rescaling.
+
+The recommended methodology is to sweep each backend's settings until they reach 99% recall@10 or more on a given dataset.
+A row never builds faster than it searches: when `Add/s` exceeds `Search/s`, raise the construction breadth and lower the search breadth until search is at least as fast at that recall.
+Once the behavior is confirmed on a 1M–10M subset, 100M–1B runs validate the scaling curves.
+
+Each search reports both recall conventions, because they answer different questions and one of them saturates.
+`recall_at_k` is 1-recall@K, FAISS's `OneRecallAtRCriterion` and the measure USearch reports.
+`intersection_at_k` is K-recall@K, `|top-K ∩ ground-truth-K| / K`, order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
+1-recall@K ≥ K-recall@K for the same run, so the two are never interchangeable.
+
+K is `--top-k`, which defaults to the ground-truth file's width, 10 on the Wiki sets and 100 on the BigANN ones.
+1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
+`intersection_at_k` stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix, so both are stricter at wide K than the same-named numbers at K=10.
+Pass `--top-k 10` for figures comparable across datasets of differing ground-truth width.
+
+### PubChem MACCS
+
+168-bit binary fingerprints of PubChem molecules under Hamming, with settings calibrated at 10M and reused at 100M; recipes in [`data/README.md`](data/README.md#usearchmolecules).
+
+#### PubChem MACCS 10M
+
+| Backend      | Device | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s | Memory | Build |
+| :----------- | :----- | :--- | -----------: | ---------: | -----: | ------: | -----: | -------: | -----: | ----: |
+| USearch 2.25 | CPU    | `b1` |           32 |     128/64 | 0.9696 |       … | 36,347 |   35,767 | 4.7 GB |  5.0m |
+| FAISS 1.12   | CPU    | `b1` |           64 |      40/16 | 0.9661 |       … | 95,230 |  293,795 | 7.6 GB |  1.5m |
+
+#### PubChem MACCS 100M
+
+| Backend      | Device | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory |        Build |
+| :----------- | :----- | :--- | -----------: | ---------: | -----: | ------: | ------: | --------: | ------: | -----------: |
+| USearch 2.25 | CPU    | `b1` |           32 |     128/64 | 0.8438 |       … |  35,080 |    38,432 | 40.8 GB |        54.6m |
+| FAISS 1.12   | CPU    | `b1` |           64 |      40/16 |      … |       … |       … |         … | ≥ 63 GB | killed at 9h |
+| USearch 3.0  | GPU    | `b1` |           32 |     256/64 | 0.9907 |  0.9906 | 559,140 | 1,460,000 | 18.3 GB |         3.4m |
+
+### SIFT
+
+Meta's 128-dimensional `u8` descriptors under L2, compared at the setting that first reaches 99% recall@10; recipes in [`data/README.md`](data/README.md#meta-bigann-sift).
+
+#### SIFT 10M
+
+| Backend      | Device | Type  | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory | Build |
+| :----------- | :----- | :---- | -----------: | ---------: | -----: | ------: | ------: | --------: | ------: | ----: |
+| USearch 2.25 | CPU    | `u8`  |           16 |    128/256 | 0.9938 |       … |  35,405 |    80,729 |  4.4 GB |  4.8m |
+| FAISS 1.12   | CPU    | `u8`  |           16 |    128/256 | 0.9952 |       … |  26,374 |    38,278 |  5.9 GB |  5.6m |
+| cuVS 26.10   | GPU    | `u8`  |           64 |    128/128 |      … |  0.9966 | 204,838 | 1,204,000 |       … |  0.8m |
+| USearch 3.0  | GPU    | `u8`  |           32 |    256/128 | 0.9911 |  0.9780 | 558,510 | 1,040,000 |  2.6 GB |  0.3m |
+| FAISS 1.15.1 | CPU    | `u8`  |           32 |     128/96 | 0.9900 |  0.9765 | 115,643 |   133,919 |  8.6 GB |  1.4m |
+| FAISS 1.15.1 | CPU    | `f32` |           32 |     128/96 | 0.9900 |  0.9765 |  59,688 |    61,027 | 14.4 GB |  2.8m |
+
+#### SIFT 100M
+
+| Backend      | Device | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory |        Build |
+| :----------- | :----- | :--- | -----------: | ---------: | -----: | ------: | ------: | -------: | ------: | -----------: |
+| USearch 2.25 | CPU    | `u8` |           16 |    128/256 | 0.9833 |       … |  39,831 |   75,808 | 53.7 GB |        48.7m |
+| FAISS 1.12   | CPU    | `u8` |           16 |    128/256 |      … |       … |       … |        … | ≥ 46 GB | killed at 9h |
+| cuVS 26.10   | GPU    | `u8` |           64 |    128/256 |      … |  0.9963 | 154,799 |  582,000 |       … |        10.8m |
+| USearch 3.0  | GPU    | `u8` |           32 |    256/256 | 0.9913 |  0.9810 | 431,520 |  604,490 | 24.8 GB |         3.9m |
+
+### Turing-ANNS
+
+Microsoft's 100-dimensional `f32` web-search embeddings under L2, compared at the setting that first reaches 99% recall@10 across storage types; recipes in [`data/README.md`](data/README.md#microsoft-turing-anns).
+
+#### Turing-ANNS 10M
+
+| Backend      | Device | Type   | Connectivity | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory | Build |
+| :----------- | :----- | :----- | -----------: | ---------: | -----: | ------: | -----: | -------: | ------: | ----: |
+| USearch 2.25 | CPU    | `f32`  |           48 |    768/384 | 0.9929 |       … |  8,532 |   12,331 | 13.0 GB | 18.3m |
+| USearch 2.25 | CPU    | `bf16` |           48 |    768/384 | 0.9929 |       … | 10,496 |   16,940 | 10.9 GB | 14.1m |
+| USearch 2.25 | CPU    | `f16`  |           48 |    768/384 | 0.9929 |       … | 10,969 |   20,246 | 10.9 GB | 13.5m |
+| USearch 2.25 | CPU    | `e5m2` |           48 |    768/384 | 0.9919 |       … | 10,526 |   20,534 |  9.8 GB | 13.5m |
+| USearch 2.25 | CPU    | `e4m3` |           48 |    768/384 | 0.9930 |       … |  7,353 |   12,106 |  9.8 GB | 19.4m |
+| USearch 2.25 | CPU    | `e3m2` |           48 |    768/384 | 0.9728 |       … | 10,398 |   18,022 |  9.8 GB | 13.3m |
+| USearch 2.25 | CPU    | `e2m3` |           48 |    768/384 | 0.7941 |       … | 10,935 |   21,313 |  9.8 GB | 13.2m |
+| FAISS 1.12   | CPU    | `f32`  |           48 |    768/384 | 0.9944 |       … |  7,491 |   16,486 | 14.1 GB | 20.6m |
+| FAISS 1.12   | CPU    | `bf16` |           48 |    768/384 | 0.9944 |       … |  3,800 |   10,391 | 12.1 GB | 39.4m |
+| FAISS 1.12   | CPU    | `f16`  |           48 |    768/384 | 0.9944 |       … |  2,545 |   10,032 | 12.1 GB | 1h 1m |
+| USearch 3.0  | GPU    | `bf16` |           32 |  1024/1024 | 0.9908 |  0.9831 | 95,870 |  155,810 |  3.4 GB |  1.7m |
+
+#### Turing-ANNS 100M
+
+| Backend      | Device | Type   | Connectivity | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |   Memory |  Build |
+| :----------- | :----- | :----- | -----------: | ---------: | -----: | ------: | -----: | -------: | -------: | -----: |
+| USearch 2.25 | CPU    | `f32`  |           48 |    768/384 | 0.9929 |       … |  6,646 |   10,398 | 139.6 GB |  4h 1m |
+| USearch 2.25 | CPU    | `bf16` |           48 |    768/384 | 0.9931 |       … |  8,564 |   14,772 | 105.2 GB |  3h 1m |
+| USearch 2.25 | CPU    | `f16`  |           48 |    768/384 | 0.9930 |       … |  8,807 |   15,412 | 105.2 GB | 2h 54m |
+| USearch 2.25 | CPU    | `e5m2` |           48 |    768/384 | 0.9924 |       … |  7,368 |   13,227 |  88.0 GB | 3h 15m |
+| USearch 3.0  | GPU    | `bf16` |           32 |  1024/1024 | 0.9933 |  0.9868 | 88,660 |  156,790 |  32.1 GB |  18.8m |
+
 ## CLI Reference
 
-Each backend is a separate binary.
-The table lists every flag of every binary, with its default.
-Flags marked "sweep" take comma-separated values and run one configuration per combination.
+Each backend is a separate binary, and the manuals below list every flag of every binary with its default.
+A value spelled `<…,...>` takes comma-separated values and runs one configuration per combination.
 A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
 Every `retri-eval-*` flag also reads `RETRIEVAL_<FLAG>` as its default, upper-cased with dashes as underscores, so `--top-k` reads `RETRIEVAL_TOP_K`.
 The flag on the command line overrides the variable, and switches like `--self-search` read `1`, `0`, `true` or `false`.
 
-| Flag                     | Binaries                                    | Default                  | Meaning                                                                                              |
-| ------------------------ | ------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `--base-vectors`         | all `retri-eval-*`                          | required                 | Base vectors to index (`.fbin`, `.u8bin`, `.i8bin`, `.b1bin`), a path or glob                        |
-| `--base-keys`            | all `retri-eval-*`                          | sequential               | Keys for the base vectors (`.i32bin`), one per vector                                                |
-| `--query-vectors`        | all `retri-eval-*`                          | required                 | Query vectors to search with                                                                         |
-| `--query-neighbors`      | all `retri-eval-*`                          | required                 | Ground-truth neighbors for those queries (`.ibin`)                                                   |
-| `--top-k`                | all `retri-eval-*`                          | ground-truth width       | Neighbors per query, the k every metric is taken at; may not exceed the ground-truth width           |
-| `--insertion-order`      | all `retri-eval-*`                          | `shuffled`               | `shuffled` by `--seed`, or the file's `original` order                                               |
-| `--seed`                 | all `retri-eval-*`                          | `42`                     | 32-bit seed of the shuffled insertion order, or `random`; rejected with `--insertion-order original` |
-| `--steps`                | all `retri-eval-*`                          | `10`                     | Measurement steps; the base is inserted in this many equal parts                                     |
-| `--inserts-per-core`     | all `retri-eval-*`                          | `2048`                   | Vectors per `add` call for each backend thread: `--threads` on usearch and faiss, one elsewhere      |
-| `--queries-per-core`     | all `retri-eval-*`                          | `2048`                   | Queries per `search` call for each backend thread: `--threads` on usearch and faiss, one elsewhere   |
-| `--output`               | all `retri-eval-*`                          | none                     | Directory for JSON result files; progress only when unset                                            |
-| `--max-base-vectors`     | all `retri-eval-*`                          | all                      | Cap on the base vectors used, for calibration on a slice                                             |
-| `--index`                | usearch, faiss, cuvs                        | none                     | Persisted index: loaded and searched if the path exists, else built and saved; needs a single config |
-| `--dims`                 | all `retri-eval-*`                          | native                   | Matryoshka truncations, sweep; each at most the native width, and a multiple of 8 for `.b1bin`       |
-| `--self-search`          | all `retri-eval-*`                          | off                      | After the last insertion, replay indexed vectors as their own queries                                |
-| `--self-search-top-k`    | all `retri-eval-*`                          | `10`                     | Neighbors per self-search query                                                                      |
-| `--self-search-sample`   | all `retri-eval-*`                          | all                      | Leading base rows to replay: a count like `50000` or a fraction like `0.1`; needs `--self-search`    |
-| `--data-type`            | usearch                                     | `bf16`                   | Sweep of `f64`, `f32`, `bf16`, `f16`, `e5m2`, `e4m3`, `e3m2`, `e2m3`, `i8`, `u8`, `b1`               |
-| `--data-type`            | faiss                                       | `bf16`                   | Sweep of `f32`, `f16`, `bf16`, `u8`, `i8`, `b1`                                                      |
-| `--data-type`            | cuvs                                        | `f32`                    | Sweep of `f32`, `f16`, `i8`, `u8`                                                                    |
-| `--data-type`            | qdrant                                      | `f32`                    | Sweep of storage types `f32`, `f16`, `u8`                                                            |
-| `--data-type`            | redis                                       | `f32`                    | Sweep of `f32`, `f64`, `f16`, `bf16`, `u8`, `i8`; `u8` and `i8` need Redis 8                         |
-| `--metric`               | usearch                                     | `l2`                     | Sweep of `ip`, `l2`, `cos`, `hamming`, `jaccard`, `sorensen`, `pearson`, `haversine`, `divergence`   |
-| `--metric`               | faiss                                       | `l2`                     | Sweep of `ip`, `l2`; `b1` data always uses Hamming                                                   |
-| `--metric`               | cuvs, redis, weaviate                       | `l2`                     | Sweep of `l2`, `ip`, `cos`                                                                           |
-| `--metric`               | qdrant                                      | `l2`                     | Sweep of `ip`, `cos`, `l2`, `manhattan`                                                              |
-| `--metric`               | lancedb                                     | `l2`                     | One of `ip`, `cos`, `l2`                                                                             |
-| `--metric`               | turso                                       | `l2`                     | One of `l2`, `cos`                                                                                   |
-| `--metric`               | surrealdb                                   | `l2`                     | Sweep of `l2`, `cos`                                                                                 |
-| `--quantization`         | qdrant                                      | `none`                   | Sweep of server-side `none`, `binary`, `scalar`                                                      |
-| `--quantization`         | weaviate                                    | `none`                   | Sweep of server-side `none`, `binary`                                                                |
-| `--connectivity`         | usearch, qdrant, redis, weaviate, surrealdb | `16`                     | HNSW M, sweep                                                                                        |
-| `--connectivity`         | faiss, cuvs                                 | `32`                     | HNSW M, or CAGRA's output graph degree, sweep                                                        |
-| `--expansion-add`        | all but cuvs, lancedb, turso                | `128`                    | HNSW construction width, sweep                                                                       |
-| `--expansion-add`        | cuvs                                        | `64`                     | CAGRA's intermediate graph degree before pruning, sweep                                              |
-| `--expansion-search`     | all but lancedb, turso                      | `64`                     | HNSW search width, or CAGRA's internal top-i list, sweep                                             |
-| `--shards`               | usearch                                     | `1`                      | Index shards, sweep                                                                                  |
-| `--threads`              | usearch                                     | `0`                      | Threads, `0` for all cores, sweep                                                                    |
-| `--threads`              | faiss                                       | `0`                      | OpenMP threads, `0` for all cores                                                                    |
-| `--search-width`         | cuvs                                        | `auto`                   | Graph nodes that start each search iteration, or `auto` for cuVS's choice, sweep                     |
-| `--min-iterations`       | cuvs                                        | cuVS's choice            | Minimum search iterations                                                                            |
-| `--max-iterations`       | cuvs                                        | cuVS's choice            | Maximum search iterations                                                                            |
-| `--num-random-samplings` | cuvs                                        | cuVS's choice            | Random sampling rounds for the initial search points                                                 |
-| `--build-algo`           | cuvs                                        | `auto`                   | Graph build algorithm, `auto` or `nn_descent`                                                        |
-| `--startup-time-limit`   | qdrant, redis, weaviate, surrealdb          | `120s`                   | Time limit for container start and readiness, like `120s`                                            |
-| `--grpc-port`            | qdrant                                      | `6334`                   | Host gRPC port                                                                                       |
-| `--http-port`            | qdrant                                      | `6333`                   | Host HTTP port                                                                                       |
-| `--port`                 | redis                                       | `6379`                   | Host port                                                                                            |
-| `--port`                 | weaviate                                    | `8080`                   | Host HTTP port                                                                                       |
-| `--port`                 | surrealdb                                   | `8000`                   | Host HTTP port                                                                                       |
-| `--vectors-per-upsert`   | qdrant                                      | `10000`                  | Vectors per upsert request                                                                           |
-| `--vectors-per-upsert`   | redis                                       | `1000`                   | Vectors per pipeline flush                                                                           |
-| `--db-path`              | lancedb                                     | `/tmp/retrieval-lancedb` | LanceDB storage directory                                                                            |
-| `--db-path`              | turso                                       | `:memory:`               | Turso database file, or `:memory:`; only its `bench` table is recreated                              |
-| `--format`               | retri-generate                              | required                 | `b1bin` for clustered binary with Hamming ground truth, or `fbin` for Gaussian `f32` with L2         |
-| `--base-count`           | retri-generate                              | required                 | Base vectors to generate                                                                             |
-| `--query-count`          | retri-generate                              | required                 | Query vectors to generate                                                                            |
-| `--query-count`          | retri-download-*                            | `10000`                  | Queries sampled from the base                                                                        |
-| `--dims`                 | retri-generate                              | required                 | Bits for `b1bin`, a multiple of 8, or scalars for `fbin`                                             |
-| `--clusters`             | retri-generate                              | `256`                    | Cluster centers                                                                                      |
-| `--noise`                | retri-generate                              | `0.1`                    | Bit-flip probability from 0 to 1                                                                     |
-| `--top-k`                | retri-generate, retri-download-*            | `10`                     | Neighbors per query in the ground-truth file                                                         |
-| `--ground-truth-batch`   | retri-generate, retri-download-*            | from free RAM            | Queries per ground-truth batch                                                                       |
-| `--threads`              | retri-generate, retri-download-*            | `0`                      | Ground-truth threads, `0` for all cores                                                              |
-| `--seed`                 | retri-generate, retri-download-*            | `42`                     | 32-bit seed of generation or query sampling, or `random`                                             |
-| `--output`               | retri-generate, retri-download-*            | required                 | Output directory                                                                                     |
-| `--source`               | retri-download-molecules                    | required                 | `pubchem` (115M), `gdb13` (977M) or `enamine` (6.04B)                                                |
-| `--fingerprint`          | retri-download-molecules                    | required                 | `maccs` (166 bits), `pubchem` (881), `ecfp4` (2048) or `fcfp4` (2048)                                |
-| `--url-prefix`           | retri-download-molecules                    | the public bucket        | S3 or HTTPS prefix of the shards                                                                     |
-| `--language`             | retri-download-cohere                       | `en`                     | Language config of the Hugging Face dataset                                                          |
-| `--no-text`              | retri-download-cohere                       | off                      | Skip the aligned `titles.txt`, `texts.txt` and `urls.txt`                                            |
-| `--limit`                | retri-download-*                            | all                      | Rows to extract                                                                                      |
-| `--download-concurrency` | retri-download-*                            | `4`                      | Concurrent shard downloads                                                                           |
-| `--keep-parquet`         | retri-download-*                            | off                      | Keep the Parquet shards under `<output>/parquet/`                                                    |
+<details>
+<summary>Shared by every <code>retri-eval-*</code> binary</summary>
+
+```text
+retri-eval-*
+  --base-vectors <PATH|GLOB>            required
+      Base vectors to index: .fbin, .u8bin, .i8bin or .b1bin.
+  --base-keys <PATH>                    sequential
+      Keys for the base vectors, .i32bin, one per vector.
+  --query-vectors <PATH>                required
+      Query vectors to search with.
+  --query-neighbors <PATH>              required
+      Ground-truth neighbors for those queries, .ibin.
+  --top-k <K>                           ground-truth width
+      Neighbors per query, the K every metric is taken at; at most the ground-truth width.
+  --insertion-order <ORDER>             shuffled
+      shuffled by --seed, or the file's original order.
+  --seed <SEED>                         42
+      32-bit seed of the shuffled order, or random; rejected with --insertion-order original.
+  --steps <N>                           10
+      Measurement steps; the base is inserted in this many equal parts.
+  --inserts-per-core <N>                2048
+      Vectors per add call for each backend thread: --threads on usearch and faiss, one elsewhere.
+  --queries-per-core <N>                2048
+      Queries per search call for each backend thread: --threads on usearch and faiss, one elsewhere.
+  --output <DIR>                        none
+      Directory for JSON result files; progress only when unset.
+  --max-base-vectors <N>                all
+      Cap on the base vectors used, for calibration on a slice.
+  --dims <N,...>                        native
+      Matryoshka truncations, each at most the native width, and a multiple of 8 for .b1bin.
+  --self-search                         off
+      After the last insertion, replay indexed vectors as their own queries.
+  --self-search-top-k <K>               10
+      Neighbors per self-search query.
+  --self-search-sample <N|FRACTION>     all
+      Leading base rows to replay, a count like 50000 or a fraction like 0.1; needs --self-search.
+```
+
+</details>
+
+<details>
+<summary>Search engines: <code>retri-eval-usearch</code>, <code>retri-eval-faiss</code> & <code>retri-eval-cuvs</code></summary>
+
+```text
+retri-eval-usearch, retri-eval-faiss, retri-eval-cuvs
+  --index <PATH>                        none
+      Persisted index: searched if the path exists, else built and saved; needs a single config.
+
+retri-eval-usearch
+  --data-type <TYPE,...>                bf16
+      Stored type: bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8 or b1.
+  --metric <METRIC,...>                 l2
+      ip, l2, cos, hamming or jaccard.
+  --connectivity <N,...>                16
+      Graph connectivity.
+  --expansion-add <N,...>               128
+      Construction expansion.
+  --expansion-search <N,...>            64
+      Search expansion.
+  --memory-domains <NODES>              every node the process may use
+      Comma-separated NUMA nodes, one shard on each.
+  --threads <N,...>                     0
+      Threads, 0 for all cores.
+
+retri-eval-faiss
+  --data-type <TYPE,...>                bf16
+      Scalar quantizer over f32 input: f32, f16, bf16, u8, i8 or b1.
+  --metric <METRIC,...>                 l2
+      ip or l2; b1 data always uses Hamming.
+  --connectivity <N,...>                32
+      HNSW M.
+  --expansion-add <N,...>               128
+      HNSW construction width.
+  --expansion-search <N,...>            64
+      HNSW search width.
+  --threads <N>                         0
+      OpenMP threads, 0 for all cores.
+
+retri-eval-cuvs
+  --data-type <TYPE,...>                f32
+      f32, f16, i8 or u8, converted on the host before CAGRA builds on it.
+  --metric <METRIC,...>                 l2
+      l2, ip or cos.
+  --connectivity <N,...>                32
+      CAGRA's output graph degree.
+  --expansion-add <N,...>               64
+      CAGRA's intermediate graph degree before pruning.
+  --expansion-search <N,...>            64
+      CAGRA's internal top-i list.
+  --search-width <N|auto,...>           auto
+      Graph nodes that start each search iteration, or auto for cuVS's choice.
+  --min-iterations <N>                  cuVS's choice
+      Minimum search iterations.
+  --max-iterations <N>                  cuVS's choice
+      Maximum search iterations.
+  --num-random-samplings <N>            cuVS's choice
+      Random sampling rounds for the initial search points.
+  --build-algo <ALGORITHM>              auto
+      Graph build algorithm, auto or nn_descent.
+```
+
+</details>
+
+<details>
+<summary>Vector databases: <code>retri-eval-qdrant</code>, <code>-redis</code>, <code>-weaviate</code>, <code>-surrealdb</code>, <code>-lancedb</code> & <code>-turso</code></summary>
+
+```text
+retri-eval-qdrant, retri-eval-redis, retri-eval-weaviate, retri-eval-surrealdb
+  --startup-time-limit <DURATION>       120s
+      Time limit for container start and readiness.
+  --connectivity <N,...>                16
+      HNSW M.
+  --expansion-add <N,...>               128
+      HNSW construction width.
+  --expansion-search <N,...>            64
+      HNSW search width.
+
+retri-eval-qdrant
+  --data-type <TYPE,...>                f32
+      Storage type: f32, f16 or u8.
+  --metric <METRIC,...>                 l2
+      ip, cos, l2 or manhattan.
+  --quantization <MODE,...>             none
+      Server-side none, binary or scalar.
+  --grpc-port <PORT>                    6334
+      Host gRPC port.
+  --http-port <PORT>                    6333
+      Host HTTP port.
+  --vectors-per-upsert <N>              10000
+      Vectors per upsert request.
+
+retri-eval-redis
+  --data-type <TYPE,...>                f32
+      f32, f64, f16, bf16, u8 or i8; u8 and i8 need Redis 8.
+  --metric <METRIC,...>                 l2
+      l2, ip or cos.
+  --port <PORT>                         6379
+      Host port.
+  --vectors-per-upsert <N>              1000
+      Vectors per pipeline flush.
+
+retri-eval-weaviate
+  --metric <METRIC,...>                 l2
+      l2, ip or cos.
+  --quantization <MODE,...>             none
+      Server-side none or binary.
+  --port <PORT>                         8080
+      Host HTTP port.
+
+retri-eval-surrealdb
+  --metric <METRIC,...>                 l2
+      l2 or cos.
+  --port <PORT>                         8000
+      Host HTTP port.
+
+retri-eval-lancedb
+  --metric <METRIC>                     l2
+      One of ip, cos or l2.
+  --db-path <DIR>                       /tmp/retrieval-lancedb
+      LanceDB storage directory.
+
+retri-eval-turso
+  --metric <METRIC>                     l2
+      One of l2 or cos.
+  --db-path <PATH>                      :memory:
+      Turso database file, or :memory:; only its bench table is recreated.
+```
+
+</details>
+
+<details>
+<summary>Dataset tools: <code>retri-generate</code>, <code>retri-download-molecules</code> & <code>retri-download-cohere</code></summary>
+
+```text
+retri-generate, retri-download-molecules, retri-download-cohere
+  --threads <N>                         0
+      Ground-truth threads, 0 for all cores.
+  --seed <SEED>                         42
+      32-bit seed of generation or query sampling, or random.
+  --output <DIR>                        required
+      Output directory.
+
+retri-generate
+  --format <FORMAT>                     required
+      b1bin for clustered binary with Hamming ground truth, or fbin for Gaussian f32 with L2.
+  --base-count <N>                      required
+      Base vectors to generate.
+  --query-count <N>                     required
+      Query vectors to generate.
+  --dims <N>                            required
+      Bits for b1bin, a multiple of 8, or scalars for fbin.
+  --clusters <N>                        256
+      Cluster centers.
+  --noise <PROBABILITY>                 0.1
+      Bit-flip probability from 0 to 1.
+  --top-k <K>                           10
+      Neighbors per query in the ground-truth file.
+
+retri-download-molecules, retri-download-cohere
+  --query-count <N>                     10000
+      Queries sampled from the base, along with the ground truth.
+  --limit <N>                           all
+      Rows to extract.
+  --download-concurrency <N>            4
+      Concurrent shard downloads.
+  --keep-parquet                        off
+      Keep the Parquet shards under <output>/parquet/.
+
+retri-download-molecules
+  --source <SOURCE>                     required
+      pubchem (115M), gdb13 (977M) or enamine (6.04B).
+  --fingerprint <COLUMN>                required unless --conformers
+      maccs (166 bits), pubchem (881), ecfp4 (2048) or fcfp4 (2048).
+  --conformers                          off
+      Each embedded molecule's first conformer, as base.part_N.f16bin xyz points beside
+      counts.part_N.ibin points per cloud; excludes --fingerprint and --top-k.
+  --top-k <K>                           none
+      Neighbors per query in the ground-truth file, which only this flag writes.
+  --part-rows <N>                       512000000
+      Rows per base part, a multiple of the bucket's 1M-row shards.
+  --url-prefix <URL>                    the public bucket
+      S3 or HTTPS prefix of the shards.
+
+retri-download-cohere
+  --top-k <K>                           10
+      Neighbors per query in the ground-truth file.
+  --language <CODE>                     en
+      Language config of the Hugging Face dataset.
+  --no-text                             off
+      Skip the aligned titles.txt, texts.txt and urls.txt.
+```
+
+</details>
 
 ### Self-Recall
 
@@ -443,67 +570,6 @@ Its metrics drop the `self_` prefix because the container already says it, and i
 
 `dataset` describes the input files and `config` describes the run, so `dataset.vectors_count` is the base file's row count while `config.vectors_count` is what `--max-base-vectors` actually indexed; divide `steps[].vectors_indexed` by the former for the share of the ground truth a step could possibly have found.
 `dataset.dimensions` is likewise the file's width, and `config.dimensions` the width a `--dims` sweep truncated to.
-
-## Datasets
-
-The BigANN collections are a good starting point, as most ship pre-computed ground-truth neighbors for recall evaluation.
-The tables below group the datasets by scale, and each name links to its download and run recipe in [`data/README.md`](data/README.md), which also covers the file format and sharded inputs.
-
-### ~1M Scale — Development & Testing
-
-| Dataset                         | Scalar Type | Dimensions | Metric | Base Size | Ground Truth      |
-| :------------------------------ | ----------: | ---------: | -----: | --------: | :---------------- |
-| [Unum UForm Wiki][unum-wiki-1m] |       `f32` |        256 |     IP |      1 GB | 100K queries, yes |
-| [Arxiv with E5][unum-arxiv-2m]  |       `f32` |        768 |     IP |      7 GB | 2.3M queries, yes |
-
-### ~10M Scale
-
-| Dataset                              | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
-| :----------------------------------- | ----------: | ---------: | ------: | --------: | :---------------- |
-| [Meta BIGANN — SIFT][meta-bigann]    |        `u8` |        128 |      L2 |    1.2 GB | 10K queries, yes  |
-| [Microsoft Turing-ANNS][msft-turing] |       `f32` |        100 |      L2 |    3.7 GB | 100K queries, yes |
-| [Cohere Wiki EN][cohere-wiki]        |        `b1` |       1024 | Hamming |    5.3 GB | self-sampled ¹    |
-
-> ¹ These sources ship vectors without ground truth, so their `retri-download-*` binaries sample queries with a fixed seed and compute exact Hamming top-K.
-
-### ~100M Scale
-
-| Dataset                               | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
-| :------------------------------------ | ----------: | ---------: | ------: | --------: | :---------------- |
-| [Meta BIGANN — SIFT][meta-bigann]     |        `u8` |        128 |      L2 |     12 GB | 10K queries, yes  |
-| [Microsoft Turing-ANNS][msft-turing]  |       `f32` |        100 |      L2 |     37 GB | 100K queries, yes |
-| [Microsoft SpaceV][msft-spacev]       |        `i8` |        100 |      L2 |    9.3 GB | 30K queries, yes  |
-| [Unum WikiVerse][wikiverse] ²         |       `f16` |  128–4096³ |  Cos/IP |  95-505GB | pipeline pending  |
-| [USearchMolecules PubChem][usm] MACCS |        `b1` |        168 | Hamming |    2.4 GB | self-sampled ¹    |
-| [USearchMolecules PubChem][usm] ECFP4 |        `b1` |       2048 | Hamming |     29 GB | self-sampled ¹    |
-
-> ² WikiVerse ships `.f16bin`, which RetriEval does not read yet.
-> ³ nomic-embed at 768, arctic-embed and Qwen3 at 1024, e5-mistral at 4096; the ColBERT model's 128d per token needs multi-vector support.
-
-### ~1B Scale
-
-| Dataset                                    | Scalar Type | Dimensions |  Metric | Base Size | Ground Truth      |
-| :----------------------------------------- | ----------: | ---------: | ------: | --------: | :---------------- |
-| [Meta BIGANN — SIFT][meta-bigann]          |        `u8` |        128 |      L2 |    119 GB | 10K queries, yes  |
-| [Microsoft Turing-ANNS][msft-turing]       |       `f32` |        100 |      L2 |    373 GB | 100K queries, yes |
-| [Microsoft SpaceV][msft-spacev]            |        `i8` |        100 |      L2 |     93 GB | 30K queries, yes  |
-| [Yandex Text-to-Image][yandex-t2i]         |       `f32` |        200 |     Cos |    750 GB | 100K queries, yes |
-| [Yandex Deep][yandex-deep]                 |       `f32` |         96 |      L2 |    358 GB | 10K queries, yes  |
-| [USearchMolecules GDB-13][usm] MACCS       |        `b1` |        168 | Hamming |     21 GB | self-sampled ¹    |
-| [USearchMolecules GDB-13][usm] ECFP4       |        `b1` |       2048 | Hamming |    250 GB | self-sampled ¹    |
-| [USearchMolecules Enamine REAL][usm] MACCS |        `b1` |        168 | Hamming |    127 GB | self-sampled ¹    |
-| [USearchMolecules Enamine REAL][usm] ECFP4 |        `b1` |       2048 | Hamming |   1.55 TB | self-sampled ¹    |
-
-[unum-wiki-1m]: data/README.md#unum-uform-wiki
-[unum-arxiv-2m]: data/README.md#arxiv-with-e5
-[meta-bigann]: data/README.md#meta-bigann-sift
-[msft-turing]: data/README.md#microsoft-turing-anns
-[msft-spacev]: data/README.md#microsoft-spacev
-[yandex-deep]: data/README.md#yandex-deep
-[yandex-t2i]: data/README.md#yandex-text-to-image
-[usm]: data/README.md#usearchmolecules
-[cohere-wiki]: data/README.md#cohere-wikipedia-multilingual
-[wikiverse]: data/README.md#unum-wikiverse
 
 ## Development
 
