@@ -1,4 +1,4 @@
-//! USearch HNSW benchmark binary.
+//! USearch NSW benchmark binary.
 //!
 //! ## Build & Install
 //!
@@ -16,18 +16,18 @@
 //!     --base-vectors datasets/wiki_1M/base.1M.fbin \
 //!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
 //!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-//!     --data-type f32,bf16,e5m2 \
+//!     --data-type bf16,e4m3,i8 \
 //!     --metric ip,cos,l2 \
 //!     --output results/
 //! ```
 //!
-//! Turing 10M at 99% recall (M=32, ef=256/1024):
+//! Turing 10M at 99% recall (M=48, ef=768/384):
 //! ```sh
 //! retri-eval-usearch \
 //!     --base-vectors datasets/turing_10M/base.10M.fbin \
 //!     --query-vectors datasets/turing_10M/query.public.100K.fbin \
 //!     --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --data-type f32,bf16,e5m2,e4m3,e3m2,e2m3,i8 \
+//!     --data-type bf16,e4m3,i8 \
 //!     --metric l2 \
 //!     --connectivity 48 \
 //!     --expansion-add 768 \
@@ -41,8 +41,8 @@
 //!     --base-vectors datasets/turing_100M/base.100M.fbin \
 //!     --query-vectors datasets/turing_100M/query.public.100K.fbin \
 //!     --query-neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
-//!     --data-type f32,bf16 \
-//!     --shards 2 \
+//!     --data-type bf16 \
+//!     --memory-domains 0,1 \
 //!     --metric l2 \
 //!     --connectivity 32 \
 //!     --expansion-add 256 \
@@ -51,7 +51,7 @@
 //!     --output results/turing_100M
 //! ```
 //!
-//! Binary 1M hamming-distance search (1024-bit vectors in `.b1bin` format):
+//! Binary 1M Hamming-distance search (1024-bit vectors in `.b1bin` format):
 //! ```sh
 //! retri-eval-usearch \
 //!     --base-vectors datasets/binary_1M/base.1M.b1bin \
@@ -62,27 +62,28 @@
 //!     --output results/binary_1M
 //! ```
 
-use std::{
-    fmt::{self, Write},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{collections::HashMap, fmt::Write};
 
 use clap::Parser;
-use fork_union::{IndexedSplit, SyncMutPtr, ThreadPool};
-use serde_json::json;
+use numkong::{self as nk, MatrixView};
+use serde_json::{json, Value};
+use usearch::{
+    rows, Arena, DenseIndex, DenseInsertConfig, DenseLoadRamConfig, DenseMetric, DenseOptions, DenseSearchConfig,
+    DenseVerbs, Element, Executor, Scalar,
+};
 
 use retrieval::{
-    run_config, spell_list, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary, Threads,
-    UnwrapOrBail, VectorSlice, Vectors,
+    run_config, spell_list, write_row, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary,
+    Threads, UnwrapOrBail, VectorSlice, Vectors,
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "retri-eval-usearch", about = "Benchmark USearch HNSW")]
+#[command(name = "retri-eval-usearch", about = "Benchmark USearch NSW")]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Quantization types (comma-separated for sweep)
+    /// Stored quantization types (comma-separated for sweep)
     #[arg(
         long,
         env = "RETRIEVAL_DATA_TYPE",
@@ -102,32 +103,30 @@ struct Cli {
     )]
     metric: Vec<Metric>,
 
-    /// HNSW connectivity M (comma-separated for sweep)
+    /// Graph connectivity (comma-separated for sweep)
     #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
     connectivity: Vec<usize>,
 
-    /// HNSW construction expansion factor (comma-separated for sweep)
+    /// Construction expansion factor (comma-separated for sweep)
     #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
     expansion_add: Vec<usize>,
 
-    /// HNSW search expansion factor (comma-separated for sweep)
+    /// Search expansion factor (comma-separated for sweep)
     #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
     expansion_search: Vec<usize>,
 
-    /// Number of index shards (comma-separated for sweep)
-    #[arg(long, env = "RETRIEVAL_SHARDS", value_delimiter = ',', default_value = "1", value_parser = retrieval::parse_count_flag)]
-    shards: Vec<usize>,
+    /// NUMA nodes to place one shard on apiece; empty takes every node the process may use
+    #[arg(long, env = "RETRIEVAL_MEMORY_DOMAINS", value_delimiter = ',')]
+    memory_domains: Vec<i32>,
 
     /// Number of threads, 0 for all cores (comma-separated for sweep)
     #[arg(long, env = "RETRIEVAL_THREADS", value_delimiter = ',', default_value = "0", value_parser = retrieval::parse_threads_flag)]
     threads: Vec<Threads>,
 }
 
-/// USearch quantization types, as `--data-type` spells them.
+/// Stored quantization types, as `--data-type` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataType {
-    F64,
-    F32,
     Bf16,
     F16,
     E5m2,
@@ -139,11 +138,9 @@ pub enum DataType {
     B1,
 }
 
-impl From<DataType> for ::usearch::ScalarKind {
+impl From<DataType> for Scalar {
     fn from(data_type: DataType) -> Self {
         match data_type {
-            DataType::F64 => Self::F64,
-            DataType::F32 => Self::F32,
             DataType::Bf16 => Self::BF16,
             DataType::F16 => Self::F16,
             DataType::E5m2 => Self::E5M2,
@@ -152,258 +149,171 @@ impl From<DataType> for ::usearch::ScalarKind {
             DataType::E2m3 => Self::E2M3,
             DataType::I8 => Self::I8,
             DataType::U8 => Self::U8,
-            DataType::B1 => Self::B1,
+            DataType::B1 => Self::U1x8,
         }
     }
 }
 
-impl fmt::Display for DataType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        retrieval::spell_value(self, formatter)
-    }
-}
-
-/// USearch metrics, as `--metric` spells them.
+/// Metrics, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
     Ip,
-    #[value(alias = "l2sq")]
     L2,
     Cos,
     Hamming,
     #[value(alias = "tanimoto")]
     Jaccard,
-    Sorensen,
-    Pearson,
-    Haversine,
-    #[value(alias = "jensenshannon")]
-    Divergence,
 }
 
-impl From<Metric> for ::usearch::MetricKind {
+impl From<Metric> for DenseMetric {
     fn from(metric: Metric) -> Self {
         match metric {
-            Metric::Ip => Self::IP,
-            Metric::L2 => Self::L2sq,
-            Metric::Cos => Self::Cos,
+            Metric::Ip => Self::Inner,
+            Metric::L2 => Self::Euclidean,
+            Metric::Cos => Self::Angular,
             Metric::Hamming => Self::Hamming,
-            Metric::Jaccard => Self::Tanimoto,
-            Metric::Sorensen => Self::Sorensen,
-            Metric::Pearson => Self::Pearson,
-            Metric::Haversine => Self::Haversine,
-            Metric::Divergence => Self::Divergence,
+            Metric::Jaccard => Self::Jaccard,
         }
     }
 }
 
-impl fmt::Display for Metric {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for DataType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         retrieval::spell_value(self, formatter)
     }
 }
 
-fn metric_kind_name(kind: ::usearch::MetricKind) -> &'static str {
-    match kind {
-        ::usearch::MetricKind::IP => "ip",
-        ::usearch::MetricKind::L2sq => "l2",
-        ::usearch::MetricKind::Cos => "cos",
-        ::usearch::MetricKind::Hamming => "hamming",
-        ::usearch::MetricKind::Tanimoto => "jaccard",
-        ::usearch::MetricKind::Sorensen => "sorensen",
-        ::usearch::MetricKind::Pearson => "pearson",
-        ::usearch::MetricKind::Haversine => "haversine",
-        ::usearch::MetricKind::Divergence => "divergence",
-        _ => "unknown",
-    }
-}
-
-fn scalar_kind_name(kind: ::usearch::ScalarKind) -> &'static str {
-    match kind {
-        ::usearch::ScalarKind::F64 => "f64",
-        ::usearch::ScalarKind::F32 => "f32",
-        ::usearch::ScalarKind::BF16 => "bf16",
-        ::usearch::ScalarKind::F16 => "f16",
-        ::usearch::ScalarKind::E5M2 => "e5m2",
-        ::usearch::ScalarKind::E4M3 => "e4m3",
-        ::usearch::ScalarKind::E3M2 => "e3m2",
-        ::usearch::ScalarKind::E2M3 => "e2m3",
-        ::usearch::ScalarKind::I8 => "i8",
-        ::usearch::ScalarKind::U8 => "u8",
-        ::usearch::ScalarKind::B1 => "b1",
-        _ => "unknown",
+impl std::fmt::Display for Metric {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        retrieval::spell_value(self, formatter)
     }
 }
 
 // #region Backend
 
 pub struct USearchBackend {
-    shards: Vec<::usearch::Index, std::alloc::System>,
-    pool: ThreadPool,
+    index: DenseIndex,
+    executor: Executor,
+    arena: Arena,
+    keys: Vec<usearch::Key>,
+    expansion_add: usize,
+    expansion_search: usize,
     description: String,
-    metadata: std::collections::HashMap<String, serde_json::Value>,
+    metadata: HashMap<String, Value>,
+}
+
+fn failed(verb: &'static str) -> impl Fn(usearch::Error) -> String {
+    move |error| format!("USearch {verb} failed with {}: {error}", error.status)
+}
+
+/// Views a bit-packed slab as `u1x8` rows, `dimensions` bits wide.
+fn bit_rows(bytes: &[u8], dimensions: usize) -> usearch::Result<MatrixView<'_, nk::u1x8>> {
+    // `u1x8` is a transparent `u8`, so the bytes are already its rows.
+    rows(
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) },
+        dimensions,
+    )
 }
 
 impl USearchBackend {
-    pub fn new(config: IndexConfig<DataType, Metric>, threads: Threads, shards: usize) -> Result<Self, String> {
-        let IndexConfig {
-            dimensions,
-            data_type,
-            metric,
-            connectivity,
-            expansion_add,
-            expansion_search,
-        } = config;
-
-        let opts = ::usearch::IndexOptions {
-            dimensions,
-            metric: metric.into(),
-            quantization: data_type.into(),
-            connectivity,
-            expansion_add,
-            expansion_search,
-            multi: false,
+    pub fn new(
+        config: IndexConfig<DataType, Metric>,
+        threads: Threads,
+        memory_domains: &[i32],
+    ) -> Result<Self, String> {
+        let options = DenseOptions {
+            dimensions: config.dimensions,
+            metric: config.metric.into(),
+            quantization: config.data_type.into(),
+            connectivity: config.connectivity,
+            ..DenseOptions::default()
         };
+        let index = DenseIndex::init_ram(&options, memory_domains).map_err(failed("init_ram"))?;
+        let executor = Executor::for_ram(memory_domains, threads.0.get(), 0).map_err(failed("for_ram"))?;
+        Self::wrap(
+            index,
+            executor,
+            config.expansion_add,
+            config.expansion_search,
+            threads,
+            memory_domains,
+        )
+    }
 
-        let mut shard_vec = Vec::with_capacity_in(shards, std::alloc::System);
-        for _ in 0..shards {
-            shard_vec.push(::usearch::Index::new(&opts).map_err(|e| format!("failed to create USearch index: {e}"))?);
-        }
+    /// Opens a saved `.safegraphs` monolith or `.safegraphs.json` manifest, whose header carries the
+    /// geometry, metric, quantization and connectivity; only the search expansion is the caller's.
+    pub fn load(
+        handle: &str,
+        expansion_search: usize,
+        threads: Threads,
+        memory_domains: &[i32],
+    ) -> Result<Self, String> {
+        let executor = Executor::for_ram(memory_domains, threads.0.get(), 0).map_err(failed("for_ram"))?;
+        let index = DenseIndex::load_ram(DenseLoadRamConfig {
+            executor: Some(&executor),
+            memory_domains,
+            ..DenseLoadRamConfig::from(handle)
+        })
+        .map_err(failed("load_ram"))?;
+        let mut backend = Self::wrap(index, executor, 0, expansion_search, threads, memory_domains)?;
+        backend.metadata.insert("loaded_from".into(), json!(handle));
+        write!(backend.description, " · loaded[{handle}]").expect("a String takes any write");
+        Ok(backend)
+    }
 
-        if let Some(idx) = shard_vec.first() {
-            eprintln!("  dispatch[{data_type}/{metric}]: {}", idx.hardware_acceleration());
-        }
-
-        let pool = ThreadPool::try_spawn(threads.0.get()).map_err(|e| format!("failed to create thread pool: {e}"))?;
+    fn wrap(
+        index: DenseIndex,
+        executor: Executor,
+        expansion_add: usize,
+        expansion_search: usize,
+        threads: Threads,
+        memory_domains: &[i32],
+    ) -> Result<Self, String> {
+        let described = index.describe().map_err(failed("describe"))?;
+        let metadata = described.metadata;
+        let (metric, quantization, connectivity) = (metadata.metric, metadata.quantization, metadata.connectivity);
+        eprintln!("  dispatch[{quantization}/{metric}]: {}", described.capabilities);
 
         let mut description = format!(
-            "usearch · {data_type} · {metric} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"
+            "usearch · {quantization} · {metric} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"
         );
-        if shards > 1 {
-            write!(description, " · {shards} shards").unwrap();
+        if !memory_domains.is_empty() {
+            write!(description, " · domains {}", spell_list(memory_domains)).expect("a String takes any write");
         }
-
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("backend".into(), json!("usearch"));
-        metadata.insert("library_version".into(), json!(usearch::version()));
-        metadata.insert(
-            "library_isa_compiled".into(),
-            json!(usearch::hardware_acceleration_compiled()),
-        );
-        metadata.insert(
-            "library_isa_available".into(),
-            json!(usearch::hardware_acceleration_available()),
-        );
-        metadata.insert("data_type".into(), json!(data_type.to_string()));
-        metadata.insert("metric".into(), json!(metric.to_string()));
-        metadata.insert("connectivity".into(), json!(connectivity));
-        metadata.insert("expansion_add".into(), json!(expansion_add));
-        metadata.insert("expansion_search".into(), json!(expansion_search));
-        metadata.insert("threads".into(), json!(threads.0.get()));
-        metadata.insert("shards".into(), json!(shards));
-
+        let metadata = HashMap::from([
+            ("backend".into(), json!("usearch")),
+            ("library_version".into(), json!(usearch::version())),
+            ("library_isa_compiled".into(), json!(usearch::capabilities_compiled())),
+            ("library_isa_available".into(), json!(usearch::capabilities_available())),
+            ("library_isa_dispatched".into(), json!(described.capabilities)),
+            ("data_type".into(), json!(quantization.to_string())),
+            ("metric".into(), json!(metric.to_string())),
+            ("connectivity".into(), json!(connectivity)),
+            ("expansion_add".into(), json!(expansion_add)),
+            ("expansion_search".into(), json!(expansion_search)),
+            ("threads".into(), json!(threads.0.get())),
+            ("memory_domains".into(), json!(memory_domains)),
+        ]);
         Ok(Self {
-            shards: shard_vec,
-            pool,
+            arena: Arena::new_in(&executor).map_err(failed("arena"))?,
+            index,
+            executor,
+            keys: Vec::new(),
+            expansion_add,
+            expansion_search,
             description,
             metadata,
         })
     }
 
-    fn shard_count(&self) -> usize {
-        self.shards.len()
-    }
-
-    /// Path of the i-th shard's saved file. With `shards == 1` the user's path
-    /// is used as-is; with multiple shards each shard appends `.shard_<i>` so
-    /// the on-disk layout is unambiguous.
-    fn shard_path(handle: &str, shard_index: usize, shard_count: usize) -> String {
-        if shard_count <= 1 {
-            handle.to_string()
-        } else {
-            format!("{handle}.shard_{shard_index}")
-        }
-    }
-
-    /// Sibling of `new` for opening a previously-saved index. Build-time
-    /// params (dimensions, metric, quantization, connectivity, expansion_add)
-    /// live in the file header and are read back via accessors after load.
-    /// Only true runtime knobs go on the call: where to load from, how many
-    /// shards on disk, how many threads to drive search with, and the
-    /// `expansion_search` that replaces the file's value.
-    pub fn load(handle: &str, expansion_search: usize, threads: Threads, shards: usize) -> Result<Self, String> {
-        // Throw-away opts: `Index::load` reinitializes the index from the
-        // file header, so all of these get overwritten on load.
-        let placeholder_opts = ::usearch::IndexOptions {
-            dimensions: 1,
-            metric: ::usearch::MetricKind::L2sq,
-            quantization: ::usearch::ScalarKind::F32,
-            connectivity: 0,
-            expansion_add: 0,
-            expansion_search: 0,
-            multi: false,
-        };
-
-        let mut shard_vec = Vec::with_capacity_in(shards, std::alloc::System);
-        for shard_index in 0..shards {
-            let idx =
-                ::usearch::Index::new(&placeholder_opts).map_err(|e| format!("failed to create USearch index: {e}"))?;
-            let path = Self::shard_path(handle, shard_index, shards);
-            idx.load(&path)
-                .map_err(|e| format!("USearch load({path}) failed: {e}"))?;
-            idx.change_expansion_search(expansion_search);
-            shard_vec.push(idx);
-        }
-
-        let pool = ThreadPool::try_spawn(threads.0.get()).map_err(|e| format!("failed to create thread pool: {e}"))?;
-
-        // Read the file's actual values back for description + metadata. The
-        // vector width is not among them: `save_report` records the width the
-        // harness sliced queries at, which is what produced the results.
-        let head = &shard_vec[0];
-        let connectivity = head.connectivity();
-        let exp_add = head.expansion_add();
-        let exp_search = head.expansion_search();
-        let metric_name = metric_kind_name(head.metric_kind());
-        let data_type_name = scalar_kind_name(head.scalar_kind());
-
-        eprintln!(
-            "  dispatch[{data_type_name}/{metric_name}]: {}",
-            head.hardware_acceleration()
-        );
-
-        let mut description = format!(
-            "usearch · {data_type_name} · {metric_name} · M={connectivity} · ef={exp_add}/{exp_search} · {threads} threads · loaded[{handle}]",
-        );
-        if shards > 1 {
-            write!(description, " · {shards} shards").unwrap();
-        }
-
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("backend".into(), json!("usearch"));
-        metadata.insert("library_version".into(), json!(usearch::version()));
-        metadata.insert(
-            "library_isa_compiled".into(),
-            json!(usearch::hardware_acceleration_compiled()),
-        );
-        metadata.insert(
-            "library_isa_available".into(),
-            json!(usearch::hardware_acceleration_available()),
-        );
-        metadata.insert("data_type".into(), json!(data_type_name));
-        metadata.insert("metric".into(), json!(metric_name));
-        metadata.insert("connectivity".into(), json!(connectivity));
-        metadata.insert("expansion_add".into(), json!(exp_add));
-        metadata.insert("expansion_search".into(), json!(exp_search));
-        metadata.insert("threads".into(), json!(threads.0.get()));
-        metadata.insert("shards".into(), json!(shards));
-        metadata.insert("loaded_from".into(), json!(handle));
-
-        Ok(Self {
-            shards: shard_vec,
-            pool,
-            description,
-            metadata,
-        })
+    fn insert<Value: Element>(&self, vectors: usearch::Result<MatrixView<'_, Value>>) -> usearch::Result<()> {
+        self.index.on(&self.executor).insert(
+            &self.keys,
+            DenseInsertConfig {
+                expansion_factor: self.expansion_add,
+                ..DenseInsertConfig::from(vectors?)
+            },
+        )
     }
 }
 
@@ -412,75 +322,24 @@ impl Backend for USearchBackend {
         self.description.clone()
     }
 
-    fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
+    fn metadata(&self) -> HashMap<String, Value> {
         self.metadata.clone()
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let num_vectors = keys.len();
+        self.keys.clear();
+        self.keys
+            .extend(keys.iter().map(|&key| usearch::Key::from(u64::from(key))));
+        let size = self.index.describe().map_err(failed("describe"))?.size;
+        self.index.reserve(size + keys.len()).map_err(failed("reserve"))?;
         let dimensions = vectors.dimensions;
-        let shard_count = self.shard_count();
-        let pool = &mut self.pool;
-        let threads = pool.threads();
-
-        let per_shard = num_vectors.div_ceil(shard_count);
-        for shard in &self.shards {
-            shard
-                .reserve_capacity_and_threads(shard.size() + per_shard, threads)
-                .map_err(|e| format!("failed to reserve capacity: {e}"))?;
+        match vectors.data {
+            VectorSlice::F32(data) => self.insert(rows(data, dimensions)),
+            VectorSlice::I8(data) => self.insert(rows(data, dimensions)),
+            VectorSlice::U8(data) => self.insert(rows(data, dimensions)),
+            VectorSlice::B1x8(data) => self.insert(bit_rows(data, dimensions)),
         }
-
-        let failed = AtomicBool::new(false);
-        let split = IndexedSplit::new(num_vectors, threads);
-        let shards = &self.shards;
-
-        pool.for_threads(|thread_index, _| {
-            for vector_index in split.get(thread_index) {
-                if failed.load(Ordering::Relaxed) {
-                    return;
-                }
-                let shard = &shards[vector_index % shard_count];
-                let ok = match vectors.data {
-                    VectorSlice::F32(data) => shard
-                        .add(
-                            keys[vector_index] as u64,
-                            &data[vector_index * dimensions..(vector_index + 1) * dimensions],
-                        )
-                        .is_ok(),
-                    VectorSlice::I8(data) => shard
-                        .add(
-                            keys[vector_index] as u64,
-                            &data[vector_index * dimensions..(vector_index + 1) * dimensions],
-                        )
-                        .is_ok(),
-                    VectorSlice::U8(data) => shard
-                        .add(
-                            keys[vector_index] as u64,
-                            &data[vector_index * dimensions..(vector_index + 1) * dimensions],
-                        )
-                        .is_ok(),
-                    VectorSlice::B1x8(data) => {
-                        let stride = dimensions.div_ceil(8);
-                        shard
-                            .add(
-                                keys[vector_index] as u64,
-                                ::usearch::b1x8::from_u8s(&data[vector_index * stride..(vector_index + 1) * stride]),
-                            )
-                            .is_ok()
-                    }
-                };
-                if !ok {
-                    failed.store(true, Ordering::Relaxed);
-                    return;
-                }
-            }
-        });
-
-        if failed.load(Ordering::Relaxed) {
-            Err("one or more vectors failed to add".to_string())
-        } else {
-            Ok(())
-        }
+        .map_err(failed("insert"))
     }
 
     fn search(
@@ -491,123 +350,48 @@ impl Backend for USearchBackend {
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String> {
+        let config = DenseSearchConfig {
+            expansion_factor: self.expansion_search,
+            ..DenseSearchConfig::from(count)
+        };
+        let receiver = self.index.on(&self.executor);
+        let arena = &mut self.arena;
         let dimensions = queries.dimensions;
-        let num_queries = queries.len();
-
-        debug_assert_eq!(out_keys.len(), num_queries * count);
-        debug_assert_eq!(out_distances.len(), num_queries * count);
-        debug_assert_eq!(out_counts.len(), num_queries);
-
-        let keys_ptr = SyncMutPtr::new(out_keys.as_mut_ptr());
-        let dists_ptr = SyncMutPtr::new(out_distances.as_mut_ptr());
-        let counts_ptr = SyncMutPtr::new(out_counts.as_mut_ptr());
-        let pool = &mut self.pool;
-        let threads = pool.threads();
-        let failed = AtomicBool::new(false);
-        let split = IndexedSplit::new(num_queries, threads);
-        let shards = &self.shards;
-
-        pool.for_threads(|thread_index, _| {
-            for query_index in split.get(thread_index) {
-                if failed.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                let offset = query_index * count;
-                unsafe {
-                    let keys = keys_ptr.as_ptr().add(offset);
-                    let distances = dists_ptr.as_ptr().add(offset);
-                    for rank in 0..count {
-                        *keys.add(rank) = Key::MAX;
-                        *distances.add(rank) = Distance::INFINITY;
-                    }
-                }
-
-                for shard in shards {
-                    let result = match queries.data {
-                        VectorSlice::F32(data) => {
-                            shard.search(&data[query_index * dimensions..(query_index + 1) * dimensions], count)
-                        }
-                        VectorSlice::I8(data) => {
-                            shard.search(&data[query_index * dimensions..(query_index + 1) * dimensions], count)
-                        }
-                        VectorSlice::U8(data) => {
-                            shard.search(&data[query_index * dimensions..(query_index + 1) * dimensions], count)
-                        }
-                        VectorSlice::B1x8(data) => {
-                            let stride = dimensions.div_ceil(8);
-                            shard.search(
-                                ::usearch::b1x8::from_u8s(&data[query_index * stride..(query_index + 1) * stride]),
-                                count,
-                            )
-                        }
-                    };
-
-                    let matches = match result {
-                        Ok(matches) => matches,
-                        Err(_) => {
-                            failed.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                    };
-
-                    unsafe {
-                        let keys = keys_ptr.as_ptr().add(offset);
-                        let distances = dists_ptr.as_ptr().add(offset);
-
-                        for match_rank in 0..matches.keys.len().min(count) {
-                            let distance = matches.distances[match_rank];
-                            let key = matches.keys[match_rank] as Key;
-                            if distance >= *distances.add(count - 1) {
-                                break;
-                            }
-                            let mut position = count - 1;
-                            while position > 0 && distance < *distances.add(position - 1) {
-                                *keys.add(position) = *keys.add(position - 1);
-                                *distances.add(position) = *distances.add(position - 1);
-                                position -= 1;
-                            }
-                            *keys.add(position) = key;
-                            *distances.add(position) = distance;
-                        }
-                    }
-                }
-
-                unsafe {
-                    let keys = keys_ptr.as_ptr().add(offset);
-                    let mut found = 0;
-                    for rank in 0..count {
-                        if *keys.add(rank) != Key::MAX {
-                            found += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    *counts_ptr.as_ptr().add(query_index) = found;
-                }
-            }
-        });
-
-        if failed.load(Ordering::Relaxed) {
-            Err("one or more search queries failed".to_string())
-        } else {
-            Ok(())
+        let matches = match queries.data {
+            VectorSlice::F32(data) => rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
+            VectorSlice::I8(data) => rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
+            VectorSlice::U8(data) => rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
+            VectorSlice::B1x8(data) => bit_rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
         }
+        .map_err(failed("search"))?;
+
+        let rows = matches.rows().map_err(failed("search"))?;
+        let outputs = out_keys
+            .chunks_exact_mut(count)
+            .zip(out_distances.chunks_exact_mut(count));
+        for ((row, (keys, distances)), found) in rows.zip(outputs).zip(out_counts.iter_mut()) {
+            // Every key this harness inserts is a `Key` widened to 64 bits, so it narrows back losslessly.
+            let hits = row.keys.iter().zip(row.distances).map(|(&key, &distance)| {
+                (
+                    u64::try_from(key).map_or(Key::MAX, |key| key as Key),
+                    distance as Distance,
+                )
+            });
+            *found = write_row(hits, keys, distances);
+        }
+        Ok(())
     }
 
     fn memory_bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.memory_usage()).sum()
+        self.index.describe().map_or(0, |described| described.memory_usage)
+    }
+
+    fn indexed_count(&self) -> Option<usize> {
+        self.index.describe().ok().map(|described| described.size)
     }
 
     fn save(&self, handle: &str) -> Result<(), String> {
-        let shard_count = self.shard_count();
-        for (shard_index, shard) in self.shards.iter().enumerate() {
-            let path = Self::shard_path(handle, shard_index, shard_count);
-            shard
-                .save(&path)
-                .map_err(|e| format!("USearch save({path}) failed: {e}"))?;
-        }
-        Ok(())
+        self.index.on(&self.executor).save(handle).map_err(failed("save"))
     }
 }
 
@@ -617,8 +401,8 @@ fn main() {
     let cli: Cli = retrieval::parse_cli();
 
     eprintln!("USearch {}", usearch::version());
-    eprintln!("- Compiled for: {}", usearch::hardware_acceleration_compiled());
-    eprintln!("- This machine: {}", usearch::hardware_acceleration_available());
+    eprintln!("- Compiled for: {}", usearch::capabilities_compiled());
+    eprintln!("- This machine: {}", usearch::capabilities_available());
 
     let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     eprintln!("- Data types: {}", spell_list(&cli.data_type));
@@ -626,7 +410,7 @@ fn main() {
     eprintln!("- Connectivity: {}", spell_list(&cli.connectivity));
     eprintln!("- Expansion add: {}", spell_list(&cli.expansion_add));
     eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
-    eprintln!("- Shards: {}", spell_list(&cli.shards));
+    eprintln!("- Memory domains: {}", spell_list(&cli.memory_domains));
     eprintln!("- Threads: {}", spell_list(&cli.threads));
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
@@ -637,19 +421,17 @@ fn main() {
         cli.connectivity.len(),
         cli.expansion_add.len(),
         cli.expansion_search.len(),
-        cli.shards.len(),
         cli.threads.len(),
     ]);
 
     let mut summary = SweepSummary::default();
-    for (dimensions, data_type, metric, connectivity, expansion_add, expansion_search, shards, threads) in itertools::iproduct!(
+    for (dimensions, data_type, metric, connectivity, expansion_add, expansion_search, threads) in itertools::iproduct!(
         &dimensions_sweep,
         &cli.data_type,
         &cli.metric,
         &cli.connectivity,
         &cli.expansion_add,
         &cli.expansion_search,
-        &cli.shards,
         &cli.threads
     ) {
         state.check_dimensions(*dimensions).unwrap_or_bail("invalid --dims");
@@ -672,10 +454,10 @@ fn main() {
                         expansion_search: *expansion_search,
                     },
                     *threads,
-                    *shards,
+                    &cli.memory_domains,
                 )
             },
-            |h| USearchBackend::load(h, *expansion_search, *threads, *shards),
+            |handle| USearchBackend::load(handle, *expansion_search, *threads, &cli.memory_domains),
             &mut state,
             *dimensions,
         ));

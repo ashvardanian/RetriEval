@@ -2,7 +2,7 @@
 
 use std::{alloc::System, fs::File, path::Path};
 
-use fork_union::{SyncMutPtr, ThreadPool};
+use forkunion::{SyncMutPtr, ThreadInDomain, ThreadPool, Topology};
 use memmap2::Mmap;
 
 use crate::{error::DatasetError, stream_key, Key, Seed, SplitMix64, VectorSlice, Vectors};
@@ -435,23 +435,14 @@ impl Permutation {
 
         let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get());
         let chunk = n.div_ceil(PERMUTATION_CHUNKS);
-        let mut pool = match ThreadPool::try_spawn(threads) {
-            Ok(pool) => pool,
-            Err(_) => {
-                for (chunk_index, chunk_slice) in indices.chunks_mut(chunk).enumerate() {
-                    fisher_yates_shuffle(chunk_slice, seed, chunk_index);
-                }
-                return Self { indices };
-            }
-        };
         let shared_base = SyncMutPtr::new(indices.as_mut_ptr());
 
         // ForkUnion's `for_n` takes a shared-ref closure (`Fn`), so we can't
         // capture `&mut [usize]` directly. We pass the disjoint ranges via a
         // `SyncMutPtr` and rebuild each chunk's own `&mut [usize]` inside the
         // closure, then run safe `slice.swap(i, j)` in the hot loop.
-        pool.for_n(PERMUTATION_CHUNKS, |prong| {
-            let range_start = prong.task_index * chunk;
+        let shuffle_chunk = |task_index: usize, _: ThreadInDomain| {
+            let range_start = task_index * chunk;
             if range_start >= n {
                 return;
             }
@@ -463,8 +454,16 @@ impl Permutation {
             let chunk_slice: &mut [usize] = unsafe {
                 std::slice::from_raw_parts_mut(shared_base.as_ptr().add(range_start), range_end - range_start)
             };
-            fisher_yates_shuffle(chunk_slice, seed, prong.task_index);
-        });
+            fisher_yates_shuffle(chunk_slice, seed, task_index);
+        };
+        let shuffled = Topology::new()
+            .and_then(|topology| ThreadPool::spawn(&topology, threads))
+            .is_ok_and(|mut pool| pool.for_n(PERMUTATION_CHUNKS, shuffle_chunk).is_ok());
+        if !shuffled {
+            for (chunk_index, chunk_slice) in indices.chunks_mut(chunk).enumerate() {
+                fisher_yates_shuffle(chunk_slice, seed, chunk_index);
+            }
+        }
 
         Self { indices }
     }

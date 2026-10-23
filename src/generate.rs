@@ -3,8 +3,8 @@
 //! This file doubles as:
 //! - the `retri-generate` binary (has a `main()`), and
 //! - the `retrieval::generate` library module, exposing
-//!   [`compute_hamming_top_k`], [`DEFAULT_QUERY_BATCH`], [`binary_view`], and
-//!   [`matrix_span`] for the dataset-download binaries under `scripts/`.
+//!   [`compute_top_k`], [`binary_view`], and [`matrix_span`] for the
+//!   dataset-download binaries under `scripts/`.
 //!
 //! ## Build & Install
 //!
@@ -26,19 +26,16 @@
 //!     --output datasets/binary_1M/
 //! ```
 
-use std::{collections::BinaryHeap, fmt, io::Write, path::PathBuf};
+use std::{fmt, io::Write, path::PathBuf};
 
 use clap::Parser;
-use fork_union::{IndexedSplit, SyncMutPtr, ThreadPool};
-use numkong::{MatrixSpan, MatrixView};
+use forkunion::{IndexedSplit, SyncMutPtr, ThreadPool, Topology};
+use numkong::{self as nk, MatrixSpan, MatrixView};
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 use retrieval::{error::GroundTruthError, packed_distance::PackedDistance, Seed, Threads};
 
 // #region Ground truth helpers — consumed by download scripts
-
-/// Queries per distance-kernel call when `--ground-truth-batch` is not given.
-pub const DEFAULT_QUERY_BATCH: usize = 4096;
 
 /// Bytes of the per-call distance tile, enough cells for one kernel call to keep every core busy.
 /// The base is walked in tiles of this size, so memory stays fixed however large the base grows.
@@ -49,18 +46,16 @@ const DISTANCE_TILE_BYTES: usize = 1 << 30;
 ///
 /// `base` lists the parts of one base set, numbered on from each other.
 /// All views must have contiguous rows; the base parts and `queries` must agree
-/// on width, and `ground_truth` is `[query_count, top_k]`. `batch_size = None`
-/// uses [`DEFAULT_QUERY_BATCH`]. Ties break toward the lower base index.
+/// on width, and `ground_truth` is `[query_count, top_k]`. Every query is scored
+/// against each base tile in one call. Ties break toward the lower base index.
 pub fn compute_top_k<Metric: PackedDistance>(
     base: &[MatrixView<'_, Metric>],
     queries: MatrixView<'_, Metric>,
     ground_truth: MatrixSpan<'_, u32>,
-    batch_size: Option<usize>,
     threads: Threads,
 ) -> Result<(), GroundTruthError> {
-    let batch = batch_size.unwrap_or(DEFAULT_QUERY_BATCH).min(queries.shape()[0].max(1));
-    let tile_rows = DISTANCE_TILE_BYTES / (batch * std::mem::size_of::<Metric::Distance>());
-    compute_top_k_tiled(base, queries, ground_truth, batch, tile_rows, threads)
+    let tile_rows = DISTANCE_TILE_BYTES / (queries.shape()[0].max(1) * std::mem::size_of::<Metric::Distance>());
+    compute_top_k_tiled(base, queries, ground_truth, tile_rows, threads)
 }
 
 /// [`compute_top_k`] with an explicit base tile, which tests shrink to cross tile boundaries.
@@ -68,22 +63,11 @@ fn compute_top_k_tiled<Metric: PackedDistance>(
     base: &[MatrixView<'_, Metric>],
     queries: MatrixView<'_, Metric>,
     mut ground_truth: MatrixSpan<'_, u32>,
-    batch: usize,
     tile_rows: usize,
     threads: Threads,
 ) -> Result<(), GroundTruthError> {
-    if !queries.has_contiguous_rows() {
-        return Err(GroundTruthError::NonContiguousView { which: "queries" });
-    }
-    if !ground_truth.has_contiguous_rows() {
-        return Err(GroundTruthError::NonContiguousView { which: "ground_truth" });
-    }
-
     let dimensions = queries.shape()[1];
     for part in base {
-        if !part.has_contiguous_rows() {
-            return Err(GroundTruthError::NonContiguousView { which: "base" });
-        }
         if part.shape()[1] != dimensions {
             return Err(GroundTruthError::DimensionMismatch {
                 queries: dimensions,
@@ -92,10 +76,80 @@ fn compute_top_k_tiled<Metric: PackedDistance>(
         }
     }
     let base_count: usize = base.iter().map(|part| part.shape()[0]).sum();
+    let query_count = queries.shape()[0];
+    let top_k = checked_top_k(base_count, query_count, &ground_truth)?;
+    let threads = threads.0.get();
+    let tile_rows = tile_rows.clamp(top_k, base_count);
+    eprintln!(
+        "  ground truth ({metric}): base_count={base_count}, query_count={query_count}, \
+         dimensions={dimensions}, top_k={top_k}, tile_rows={tile_rows}, threads={threads}",
+        metric = Metric::metric_name()
+    );
+
+    let mut pool = spawn_pool(threads)?;
+    // One packed tile, one distance tile and one ranking for the whole call, reused tile after tile.
+    let mut packed_tile = nk::DotsPackedMatrix::<Metric>::empty_in(nk::Global);
+    let mut distances = vec![Metric::Distance::default(); query_count * tile_rows];
+    let mut best = vec![(Metric::WORST_KEY, u32::MAX); query_count * top_k];
+    let progress = ground_truth_progress(base_count, Metric::metric_name());
+
+    let mut tile_start = 0;
+    for part in base {
+        let part_count = part.shape()[0];
+        for part_tile_start in (0..part_count).step_by(tile_rows) {
+            let tile_count = tile_rows.min(part_count - part_tile_start);
+            packed_tile.pack_into(&leading_rows(part, part_tile_start, tile_count))?;
+            let scores = &mut distances[..query_count * tile_count];
+            Metric::distances_parallel_into(
+                &queries,
+                &packed_tile,
+                &mut matrix_span(scores, query_count, tile_count),
+                &mut pool,
+            )?;
+            fold_tile(
+                scores,
+                tile_count,
+                tile_start,
+                &mut best,
+                top_k,
+                Metric::ordering_key,
+                &mut pool,
+            );
+            tile_start += tile_count;
+            progress.set_position(tile_start as u64);
+        }
+    }
+    progress.finish_and_clear();
+    land_ranking(&best, top_k, &mut ground_truth);
+    Ok(())
+}
+
+/// Rows `[first, first + count)` of `rows` as a view of the same memory; unlike `slice`, it serves
+/// sub-byte scalars too, since it never cuts a row.
+fn leading_rows<'a, Metric: nk::StorageElement>(
+    rows: &MatrixView<'a, Metric>,
+    first: usize,
+    count: usize,
+) -> MatrixView<'a, Metric> {
+    let row_stride = rows.stride_bytes(0);
+    // SAFETY: the rows exist in `rows`, so offsetting by whole row strides stays inside its memory.
+    unsafe {
+        let data = (rows.as_ptr() as *const u8).offset(first as isize * row_stride) as *const Metric;
+        MatrixView::from_raw_parts(data, &[count, rows.shape()[1]], &[row_stride, rows.stride_bytes(1)])
+    }
+    .expect("a run of whole rows is a valid view")
+}
+
+/// The `top_k` the ground truth's width names, checked against the base, the queries and the
+/// 32-bit IDs it holds.
+fn checked_top_k(
+    base_count: usize,
+    query_count: usize,
+    ground_truth: &MatrixSpan<'_, u32>,
+) -> Result<usize, GroundTruthError> {
     if base_count > 1 << 32 {
         return Err(GroundTruthError::IndexOverflow { base_count });
     }
-    let query_count = queries.shape()[0];
     if ground_truth.shape()[0] != query_count {
         return Err(GroundTruthError::RowCountMismatch {
             ground_truth_rows: ground_truth.shape()[0],
@@ -106,127 +160,70 @@ fn compute_top_k_tiled<Metric: PackedDistance>(
     if top_k == 0 || top_k > base_count {
         return Err(GroundTruthError::TopKTooLarge { top_k, base_count });
     }
-    let threads = threads.0.get();
-    let tile_rows = tile_rows.clamp(top_k, base_count);
+    Ok(top_k)
+}
 
-    eprintln!(
-        "  ground truth ({metric}): base_count={base_count}, query_count={query_count}, \
-         dimensions={dimensions}, top_k={top_k}, batch_size={batch}, tile_rows={tile_rows}, threads={threads}",
-        metric = Metric::metric_name()
-    );
+fn spawn_pool(threads: usize) -> Result<ThreadPool, GroundTruthError> {
+    Topology::new()
+        .and_then(|topology| ThreadPool::spawn(&topology, threads))
+        .map_err(|e| GroundTruthError::ThreadPool(format!("{e}")))
+}
 
-    let mut pool = ThreadPool::try_spawn(threads).map_err(|e| GroundTruthError::ThreadPool(format!("{e}")))?;
-
-    // One reusable `[batch, tile_rows]` distance buffer; each call views a contiguous prefix of it.
-    let mut distance_tensor =
-        numkong::Matrix::<Metric::Distance>::try_full(&[batch, tile_rows], Metric::Distance::default())?;
-
-    // Per-query size-K max-heaps keyed on `(OrderingKey, base_idx)`, carried across tiles.
-    // `BinaryHeap` is a max-heap, so the largest kept distance is evicted first, and
-    // the tuple order breaks ties toward the lower global index.
-    let mut heaps: Vec<BinaryHeap<(Metric::OrderingKey, u32)>> =
-        (0..query_count).map(|_| BinaryHeap::with_capacity(top_k + 1)).collect();
-    let heaps_ptr = SyncMutPtr::new(heaps.as_mut_ptr());
-
+fn ground_truth_progress(base_count: usize, metric: &str) -> indicatif::ProgressBar {
     let progress = indicatif::ProgressBar::new(base_count as u64);
     progress.set_style(
         indicatif::ProgressStyle::with_template("  {msg} [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
             .unwrap()
             .progress_chars("##-"),
     );
-    progress.set_message(format!("ground truth ({})", Metric::metric_name()));
+    progress.set_message(format!("ground truth ({metric})"));
+    progress
+}
 
-    let mut part_start = 0;
-    for part in base {
-        let part_count = part.shape()[0];
-        for part_tile_start in (0..part_count).step_by(tile_rows) {
-            let part_tile_end = (part_tile_start + tile_rows).min(part_count);
-            let (tile_start, tile_end) = (part_start + part_tile_start, part_start + part_tile_end);
-            let tile_count = tile_end - tile_start;
-            let tile_tensor = padded_matrix(part.slice((part_tile_start..part_tile_end, ..))?)?;
-            let packed_tile = numkong::PackedMatrix::pack(&tile_tensor);
-            drop(tile_tensor);
-
-            for batch_start in (0..query_count).step_by(batch) {
-                let batch_end = (batch_start + batch).min(query_count);
-                let batch_count = batch_end - batch_start;
-                let query_tensor = padded_matrix(queries.slice((batch_start..batch_end, ..))?)?;
-
-                let distances = &mut distance_tensor.as_mut_slice()[..batch_count * tile_count];
-                let mut distance_span = matrix_span(distances, batch_count, tile_count);
-                Metric::distances_parallel_into(&query_tensor, &packed_tile, &mut distance_span, &mut pool)?;
-
-                let distances = &distance_tensor.as_slice()[..batch_count * tile_count];
-                let split = IndexedSplit::new(batch_count, threads);
-                pool.for_threads(|thread_index, _| {
-                    for local_idx in split.get(thread_index) {
-                        // SAFETY: `IndexedSplit` hands each query of the batch to exactly one thread.
-                        let heap = unsafe { &mut *heaps_ptr.as_ptr().add(batch_start + local_idx) };
-                        let row = &distances[local_idx * tile_count..][..tile_count];
-                        for (tile_idx, &distance) in row.iter().enumerate() {
-                            let key = Metric::ordering_key(distance);
-                            let base_idx = (tile_start + tile_idx) as u32;
-                            if heap.len() < top_k {
-                                heap.push((key, base_idx));
-                            } else if key < heap.peek().unwrap().0 {
-                                heap.pop();
-                                heap.push((key, base_idx));
-                            }
-                        }
-                    }
-                });
+/// Folds one `[queries, tile_count]` score tile into the queries' rankings, each `top_k` wide and
+/// sorted ascending by `(key, base index)`, one query per thread at a time.
+fn fold_tile<Distance: Copy + Sync, Key: Ord + Copy + Send + Sync>(
+    scores: &[Distance],
+    tile_count: usize,
+    tile_start: usize,
+    best: &mut [(Key, u32)],
+    top_k: usize,
+    key_of: impl Fn(Distance) -> Key + Sync,
+    pool: &mut ThreadPool,
+) {
+    let queries = best.len() / top_k;
+    let split = IndexedSplit::new(queries, pool.threads_count());
+    let best_ptr = SyncMutPtr::new(best.as_mut_ptr());
+    pool.for_threads(&|thread_index, _| {
+        for query in split.get(thread_index) {
+            // SAFETY: `IndexedSplit` hands each query, and so each ranking, to exactly one thread.
+            let ranking = unsafe { std::slice::from_raw_parts_mut(best_ptr.as_ptr().add(query * top_k), top_k) };
+            for (offset, &score) in scores[query * tile_count..][..tile_count].iter().enumerate() {
+                let entry = (key_of(score), (tile_start + offset) as u32);
+                if entry >= ranking[top_k - 1] {
+                    continue;
+                }
+                let mut position = top_k - 1;
+                while position > 0 && entry < ranking[position - 1] {
+                    ranking[position] = ranking[position - 1];
+                    position -= 1;
+                }
+                ranking[position] = entry;
             }
-            progress.set_position(tile_end as u64);
         }
-        part_start += part_count;
-    }
-    progress.finish_and_clear();
-
-    // Drain each heap into its output row in ascending-distance order.
-    let gt_row_stride = (ground_truth.stride_bytes(0) as usize) / std::mem::size_of::<u32>();
-    for (query_idx, heap) in heaps.iter_mut().enumerate() {
-        // SAFETY: rows are contiguous and `query_idx < query_count` rows of `gt_row_stride` were checked above.
-        let row: &mut [u32] =
-            unsafe { std::slice::from_raw_parts_mut(ground_truth.as_mut_ptr().add(query_idx * gt_row_stride), top_k) };
-        for rank in (0..top_k).rev() {
-            // `top_k <= base_count` guarantees every heap holds exactly `top_k` entries.
-            row[rank] = heap.pop().unwrap().1;
-        }
-    }
-    Ok(())
+    });
 }
 
-/// Copies `rows` into an owned matrix whose width is zero-padded to a multiple of 64 dimensions.
-/// NumKong 7.8.3's SME `f32` norm drops odd lanes of a partial tail vector, so every row ends on a full one.
-fn padded_matrix<Metric: PackedDistance>(
-    rows: MatrixView<'_, Metric>,
-) -> Result<numkong::Matrix<Metric>, GroundTruthError> {
-    let (count, dimensions) = (rows.shape()[0], rows.shape()[1]);
-    let row_values = dimensions / Metric::dimensions_per_value();
-    let padded_dimensions = dimensions.next_multiple_of(64);
-    let row_stride = rows.stride_bytes(0) as usize / std::mem::size_of::<Metric>();
-    // SAFETY: rows are contiguous, so `count` rows of `row_stride` values start at `as_ptr`.
-    let source = unsafe { std::slice::from_raw_parts(rows.as_ptr(), count * row_stride) };
-    let mut padded = numkong::Matrix::<Metric>::try_full(&[count, padded_dimensions], Metric::zero())?;
-    let padded_rows = padded
-        .as_mut_slice()
-        .chunks_exact_mut(padded_dimensions / Metric::dimensions_per_value());
-    for (target, row) in padded_rows.zip(source.chunks_exact(row_stride)) {
-        target[..row_values].copy_from_slice(&row[..row_values]);
+/// Lands every ranking's base indices in `ground_truth`, row by row.
+fn land_ranking<Key>(best: &[(Key, u32)], top_k: usize, ground_truth: &mut MatrixSpan<'_, u32>) {
+    let row_stride = (ground_truth.stride_bytes(0) as usize) / std::mem::size_of::<u32>();
+    for (query, ranking) in best.chunks_exact(top_k).enumerate() {
+        // SAFETY: `checked_top_k` matched the rows to the queries and the width to `top_k`.
+        let row = unsafe { std::slice::from_raw_parts_mut(ground_truth.as_mut_ptr().add(query * row_stride), top_k) };
+        for (slot, &(_, index)) in row.iter_mut().zip(ranking) {
+            *slot = index;
+        }
     }
-    Ok(padded)
-}
-
-/// Backward-compat alias for the Hamming path. Preferred for new callers:
-/// use [`compute_top_k::<numkong::u1x8>`] directly.
-pub fn compute_hamming_top_k(
-    base: &[MatrixView<'_, numkong::u1x8>],
-    queries: MatrixView<'_, numkong::u1x8>,
-    ground_truth: MatrixSpan<'_, u32>,
-    batch_size: Option<usize>,
-    threads: Threads,
-) -> Result<(), GroundTruthError> {
-    compute_top_k::<numkong::u1x8>(base, queries, ground_truth, batch_size, threads)
 }
 
 /// Build a zero-copy `MatrixView<u1x8>` of shape `[rows, bits_per_vector]`
@@ -240,7 +237,7 @@ pub fn compute_hamming_top_k(
 /// - if `bytes.len() != rows * (bits_per_vector / 8)` (buffer shape must
 ///   match the declared matrix shape exactly — no trailing padding, no
 ///   underfill).
-pub fn binary_view<'a>(bytes: &'a [u8], rows: usize, bits_per_vector: usize) -> MatrixView<'a, numkong::u1x8> {
+pub fn binary_view<'a>(bytes: &'a [u8], rows: usize, bits_per_vector: usize) -> MatrixView<'a, nk::u1x8> {
     assert_eq!(
         bits_per_vector % 8,
         0,
@@ -254,9 +251,10 @@ pub fn binary_view<'a>(bytes: &'a [u8], rows: usize, bits_per_vector: usize) -> 
         bytes.len(),
         rows * bytes_per_vector
     );
-    let data = bytes.as_ptr() as *const numkong::u1x8;
+    let data = bytes.as_ptr() as *const nk::u1x8;
     let row_stride_bytes = bytes_per_vector as isize;
     unsafe { MatrixView::from_raw_parts(data, &[rows, bits_per_vector], &[row_stride_bytes, 1]) }
+        .expect("a contiguous byte matrix is a valid view")
 }
 
 /// Build a read-only `MatrixView<T>` of shape `[rows, cols]` over a flat
@@ -266,7 +264,7 @@ pub fn binary_view<'a>(bytes: &'a [u8], rows: usize, bits_per_vector: usize) -> 
 ///
 /// Panics if `data.len() != rows * cols` — buffer shape must match the
 /// declared matrix shape exactly.
-pub fn matrix_view<'a, T>(data: &'a [T], rows: usize, cols: usize) -> MatrixView<'a, T> {
+pub fn matrix_view<'a, T: nk::StorageElement>(data: &'a [T], rows: usize, cols: usize) -> MatrixView<'a, T> {
     assert_eq!(
         data.len(),
         rows * cols,
@@ -278,6 +276,7 @@ pub fn matrix_view<'a, T>(data: &'a [T], rows: usize, cols: usize) -> MatrixView
     let inner = std::mem::size_of::<T>() as isize;
     let row = (cols as isize) * inner;
     unsafe { MatrixView::from_raw_parts(ptr, &[rows, cols], &[row, inner]) }
+        .expect("a contiguous matrix is a valid view")
 }
 
 /// Build a `MatrixSpan<T>` of shape `[rows, cols]` over a flat mutable slice.
@@ -287,7 +286,7 @@ pub fn matrix_view<'a, T>(data: &'a [T], rows: usize, cols: usize) -> MatrixView
 ///
 /// Panics if `data.len() != rows * cols` — buffer shape must match the
 /// declared matrix shape exactly.
-pub fn matrix_span<'a, T>(data: &'a mut [T], rows: usize, cols: usize) -> MatrixSpan<'a, T> {
+pub fn matrix_span<'a, T: nk::StorageElement>(data: &'a mut [T], rows: usize, cols: usize) -> MatrixSpan<'a, T> {
     assert_eq!(
         data.len(),
         rows * cols,
@@ -299,6 +298,7 @@ pub fn matrix_span<'a, T>(data: &'a mut [T], rows: usize, cols: usize) -> Matrix
     let inner = std::mem::size_of::<T>() as isize;
     let row = (cols as isize) * inner;
     unsafe { MatrixSpan::from_raw_parts(ptr, &[rows, cols], &[row, inner]) }
+        .expect("a contiguous matrix is a valid span")
 }
 
 // #endregion
@@ -342,10 +342,6 @@ struct Cli {
     /// Neighbors to compute per query (the k in the ground-truth file)
     #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
     top_k: usize,
-
-    /// Queries per ground-truth kernel call; memory stays bounded by the distance tile either way.
-    #[arg(long, value_parser = retrieval::parse_count_flag)]
-    ground_truth_batch: Option<usize>,
 
     /// Threads for ground-truth top-K extraction (defaults to all logical cores).
     #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
@@ -514,10 +510,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("- Clusters: {}", cli.clusters);
     eprintln!("- Noise: {}", cli.noise);
     eprintln!("- Top k: {}", cli.top_k);
-    eprintln!(
-        "- Ground-truth batch: {}",
-        cli.ground_truth_batch.unwrap_or(DEFAULT_QUERY_BATCH)
-    );
     eprintln!("- Threads: {}", cli.threads);
     eprintln!("- Seed: {}", cli.seed);
     eprintln!("- Output: {}", cli.output.display());
@@ -583,13 +575,7 @@ fn run_b1bin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         values
     };
     let ground_truth_span = matrix_span(&mut ground_truth_storage, cli.query_count, cli.top_k);
-    compute_hamming_top_k(
-        &[base_view],
-        query_view,
-        ground_truth_span,
-        cli.ground_truth_batch,
-        cli.threads,
-    )?;
+    compute_top_k(&[base_view], query_view, ground_truth_span, cli.threads)?;
 
     write_dataset::<u8>(cli, "b1bin", &base, &queries, &ground_truth_storage)
 }
@@ -622,13 +608,7 @@ fn run_fbin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         values
     };
     let ground_truth_span = matrix_span(&mut ground_truth, cli.query_count, cli.top_k);
-    compute_top_k::<f32>(
-        &[base_view],
-        query_view,
-        ground_truth_span,
-        cli.ground_truth_batch,
-        cli.threads,
-    )?;
+    compute_top_k(&[base_view], query_view, ground_truth_span, cli.threads)?;
 
     write_dataset::<f32>(cli, "fbin", &base, &queries, &ground_truth)
 }
@@ -684,7 +664,7 @@ mod tests {
 
     use rand::{rngs::StdRng, RngExt, SeedableRng};
 
-    use super::{binary_view, compute_top_k_tiled, generate_gaussian_f32, matrix_span, matrix_view};
+    use super::{binary_view, compute_top_k_tiled, generate_gaussian_f32, matrix_span, matrix_view, nk};
     use retrieval::Threads;
 
     const BASE_COUNT: usize = 300;
@@ -692,15 +672,15 @@ mod tests {
     const TOP_K: usize = 10;
     const PART_ROWS: usize = 137;
 
-    /// Runs the tiled top-K across several query batches and base tiles, the last tile short,
+    /// Runs the tiled top-K across several base tiles, the last tile short,
     /// and returns each query's neighbor ids.
     fn top_k<Metric: retrieval::packed_distance::PackedDistance>(
-        base: &[numkong::MatrixView<'_, Metric>],
-        queries: numkong::MatrixView<'_, Metric>,
+        base: &[nk::MatrixView<'_, Metric>],
+        queries: nk::MatrixView<'_, Metric>,
     ) -> Vec<u32> {
         let mut ground_truth = vec![0u32; QUERY_COUNT * TOP_K];
         let span = matrix_span(&mut ground_truth, QUERY_COUNT, TOP_K);
-        compute_top_k_tiled(base, queries, span, 7, 64, Threads(NonZeroUsize::new(2).unwrap())).unwrap();
+        compute_top_k_tiled(base, queries, span, 64, Threads(NonZeroUsize::new(2).unwrap())).unwrap();
         ground_truth
     }
 

@@ -70,6 +70,7 @@ use std::{fmt, ptr::NonNull};
 use clap::Parser;
 use cuvs::distance_type::DistanceType;
 use itertools::iproduct;
+use numkong as nk;
 use serde_json::json;
 
 use retrieval::{
@@ -86,7 +87,7 @@ use retrieval::{
 #[derive(Clone)]
 struct CudaAllocator(cuvs_sys::cuvsResources_t);
 
-unsafe impl numkong::Allocator for CudaAllocator {
+unsafe impl nk::Allocator for CudaAllocator {
     fn allocate(&self, layout: std::alloc::Layout) -> Option<NonNull<u8>> {
         if layout.size() == 0 {
             return Some(NonNull::dangling());
@@ -108,7 +109,7 @@ unsafe impl numkong::Allocator for CudaAllocator {
     }
 }
 
-type GpuTensor<T> = numkong::Tensor<T, CudaAllocator>;
+type GpuTensor<T> = nk::Tensor<T, CudaAllocator>;
 
 // #region DLPack
 
@@ -200,7 +201,7 @@ impl CuvsDataType {
             Self::F16 => {
                 output.reserve(source.len() * 2);
                 for &value in source {
-                    output.extend_from_slice(&numkong::f16::from_f32(value).0.to_ne_bytes());
+                    output.extend_from_slice(&nk::f16::from_f32(value).0.to_ne_bytes());
                 }
             }
             Self::I8 => {
@@ -395,7 +396,7 @@ fn read_host_keys(path: &str) -> Result<(Vec<Key, std::alloc::System>, usize), S
 /// Typed GPU query buffer, matching the `VectorSlice` enum pattern.
 enum GpuQueries {
     F32(GpuTensor<f32>),
-    F16(GpuTensor<numkong::f16>),
+    F16(GpuTensor<nk::f16>),
     I8(GpuTensor<i8>),
     U8(GpuTensor<u8>),
 }

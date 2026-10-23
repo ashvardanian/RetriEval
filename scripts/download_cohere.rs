@@ -41,7 +41,7 @@ use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, Seeda
 use serde_json::Value;
 
 use retrieval::{
-    generate::{binary_view, compute_hamming_top_k, matrix_span, DEFAULT_QUERY_BATCH},
+    generate::{binary_view, compute_top_k, matrix_span},
     Seed, Threads,
 };
 
@@ -87,10 +87,6 @@ struct Cli {
     /// Top-K neighbors to record per query in the ground truth file.
     #[arg(long, default_value_t = 10, value_parser = retrieval::parse_count_flag)]
     top_k: usize,
-
-    /// Queries per ground-truth kernel call; memory stays bounded by the distance tile either way.
-    #[arg(long, value_parser = retrieval::parse_count_flag)]
-    ground_truth_batch: Option<usize>,
 
     /// Threads for the ground-truth pass, 0 for all cores.
     #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
@@ -330,10 +326,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("- Query count: {}", cli.query_count);
     eprintln!("- Top k: {}", cli.top_k);
-    eprintln!(
-        "- Ground-truth batch: {}",
-        cli.ground_truth_batch.unwrap_or(DEFAULT_QUERY_BATCH)
-    );
     eprintln!("- Threads: {}", cli.threads);
     eprintln!("- Download concurrency: {}", cli.download_concurrency);
     eprintln!("- No text: {}", cli.no_text);
@@ -498,13 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         values
     };
     let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, cli.top_k);
-    compute_hamming_top_k(
-        &[base_view],
-        query_view,
-        ground_truth_span,
-        cli.ground_truth_batch,
-        cli.threads,
-    )?;
+    compute_top_k(&[base_view], query_view, ground_truth_span, cli.threads)?;
 
     let gt_path = cli.output.join(format!("groundtruth.{query_count}.ibin"));
     let mut gt_file = File::create(&gt_path)?;

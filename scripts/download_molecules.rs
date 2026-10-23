@@ -21,7 +21,7 @@
 //!     --output datasets/pubchem_10M_maccs/
 //! ```
 //!
-//! 100M GDB-13 molecules with ECFP4 (2048-bit) fingerprints, auto-tuned batch:
+//! 100M GDB-13 molecules with ECFP4 (2048-bit) fingerprints:
 //! ```sh
 //! retri-download-molecules \
 //!     --source gdb13 \
@@ -49,7 +49,7 @@ use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMa
 use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, SeedableRng};
 
 use retrieval::{
-    generate::{binary_view, compute_hamming_top_k, matrix_span, DEFAULT_QUERY_BATCH},
+    generate::{binary_view, compute_top_k, matrix_span},
     Seed, Threads,
 };
 
@@ -101,10 +101,6 @@ struct Cli {
     /// Without it, only the base parts are written, for self-recall benchmarks.
     #[arg(long, value_parser = retrieval::parse_count_flag)]
     top_k: Option<usize>,
-
-    /// Queries per ground-truth kernel call; memory stays bounded by the distance tile either way.
-    #[arg(long, value_parser = retrieval::parse_count_flag)]
-    ground_truth_batch: Option<usize>,
 
     /// Threads for the ground-truth pass, 0 for all cores.
     #[arg(long, default_value = "0", value_parser = retrieval::parse_threads_flag)]
@@ -361,10 +357,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(top_k) => eprintln!("- Top k: {top_k}"),
         None => eprintln!("- Top k: none, no queries or ground truth"),
     }
-    eprintln!(
-        "- Ground-truth batch: {}",
-        cli.ground_truth_batch.unwrap_or(DEFAULT_QUERY_BATCH)
-    );
     eprintln!("- Threads: {}", cli.threads);
     eprintln!("- Download concurrency: {}", cli.download_concurrency);
     eprintln!("- Seed: {}", cli.seed);
@@ -559,13 +551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         values
     };
     let ground_truth_span = matrix_span(&mut ground_truth_indices, query_count, top_k);
-    compute_hamming_top_k(
-        &base_views,
-        query_view,
-        ground_truth_span,
-        cli.ground_truth_batch,
-        cli.threads,
-    )?;
+    compute_top_k(&base_views, query_view, ground_truth_span, cli.threads)?;
 
     let gt_path = cli.output.join(format!("groundtruth.{query_count}.ibin"));
     let mut gt_file = File::create(&gt_path)?;

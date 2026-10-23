@@ -80,8 +80,8 @@ rand = { version = "0.10", optional = true }
 thiserror = "2"
 
 # USearch backend
-usearch = { git = "https://github.com/unum-cloud/usearch.git", branch = "main-dev", optional = true }
-fork_union = { version = "2" }
+usearch = { version = "3.0.0-rc.1", optional = true }
+forkunion = "4.0.0-rc.1"
 itertools = { version = "0.15", optional = true }
 
 # FAISS backend — use `faiss-static` feature to bundle FAISS from source,
@@ -113,7 +113,7 @@ turso = { version = "=0.8.1", default-features = false, optional = true }
 # cuVS
 cuvs = { version = "26.4", optional = true }
 cuvs-sys = { version = "26.4", optional = true }
-numkong = { version = "7.8", features = ["parallel"] }
+numkong = { version = "8.0.0-rc.1", features = ["parallel"] }
 
 # Dataset download binaries (Parquet readers for USearchMolecules / Cohere Wikipedia)
 parquet = { version = "58", default-features = false, features = [

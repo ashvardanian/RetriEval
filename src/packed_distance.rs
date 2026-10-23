@@ -10,14 +10,17 @@
 //!
 //! Add new metrics (Jaccard, Angular, Cosine, …) by implementing
 //! [`PackedDistance`] for the relevant scalar type and delegating to the
-//! corresponding NumKong `try_*_packed_parallel_into` method.
+//! corresponding NumKong `*_packed_parallel_into` method.
 
-use numkong::{Dots, Matrix, MatrixSpan, PackedMatrix, StorageElement, TensorError};
+use numkong::{
+    self as nk, Dots, DotsPackedMatrix, Error, EuclideansPackedParallelOps, HammingsPackedParallelOps, MatrixSpan,
+    MatrixView, StorageElement,
+};
 
 /// A distance metric that NumKong can compute via its packed-matrix kernels.
 ///
 /// Implementations are expected to be zero-sized — all behaviour lives on
-/// the scalar type itself via `numkong::Hammings` / `numkong::Euclideans`.
+/// the scalar type itself via `nk::Hammings` / `nk::Euclideans`.
 ///
 /// # Associated types
 ///
@@ -39,6 +42,9 @@ where
     /// Ordered key used inside the top-K heap.
     type OrderingKey;
 
+    /// A key past every distance the kernel produces, filling rankings before their first tile.
+    const WORST_KEY: Self::OrderingKey;
+
     /// Project one raw distance into its ordering key. Cheap, branchless.
     fn ordering_key(distance: Self::Distance) -> Self::OrderingKey;
 
@@ -48,11 +54,11 @@ where
     /// NumKong's kernel overwrites every entry — callers need not
     /// pre-initialize beyond the allocation.
     fn distances_parallel_into(
-        queries: &Matrix<Self>,
-        packed_base: &PackedMatrix<Self>,
+        queries: &MatrixView<'_, Self>,
+        packed_base: &DotsPackedMatrix<Self>,
         out: &mut MatrixSpan<'_, Self::Distance>,
-        pool: &mut fork_union::ThreadPool,
-    ) -> Result<(), TensorError>;
+        pool: &mut forkunion::ThreadPool,
+    ) -> Result<(), Error>;
 
     /// Human-readable label for progress-bar / log messages. Stable across
     /// runs so consumers can grep log output.
@@ -61,9 +67,10 @@ where
 
 // #region Hamming (u1x8 → u32)
 
-impl PackedDistance for numkong::u1x8 {
+impl PackedDistance for nk::u1x8 {
     type Distance = u32;
     type OrderingKey = u32;
+    const WORST_KEY: u32 = u32::MAX;
 
     #[inline(always)]
     fn ordering_key(distance: u32) -> u32 {
@@ -71,12 +78,12 @@ impl PackedDistance for numkong::u1x8 {
     }
 
     fn distances_parallel_into(
-        queries: &Matrix<Self>,
-        packed_base: &PackedMatrix<Self>,
+        queries: &MatrixView<'_, Self>,
+        packed_base: &DotsPackedMatrix<Self>,
         out: &mut MatrixSpan<'_, u32>,
-        pool: &mut fork_union::ThreadPool,
-    ) -> Result<(), TensorError> {
-        queries.try_hammings_packed_parallel_into(packed_base, out, pool)
+        pool: &mut forkunion::ThreadPool,
+    ) -> Result<(), Error> {
+        queries.hammings_packed_parallel_into(packed_base, out, pool)
     }
 
     fn metric_name() -> &'static str {
@@ -99,6 +106,7 @@ impl PackedDistance for f32 {
     /// non-negative finite results for finite non-negative input, so the
     /// projection is monotonic across all outputs we ever see.
     type OrderingKey = u64;
+    const WORST_KEY: u64 = u64::MAX;
 
     #[inline(always)]
     fn ordering_key(distance: f64) -> u64 {
@@ -110,12 +118,12 @@ impl PackedDistance for f32 {
     }
 
     fn distances_parallel_into(
-        queries: &Matrix<Self>,
-        packed_base: &PackedMatrix<Self>,
+        queries: &MatrixView<'_, Self>,
+        packed_base: &DotsPackedMatrix<Self>,
         out: &mut MatrixSpan<'_, f64>,
-        pool: &mut fork_union::ThreadPool,
-    ) -> Result<(), TensorError> {
-        queries.try_euclideans_packed_parallel_into(packed_base, out, pool)
+        pool: &mut forkunion::ThreadPool,
+    ) -> Result<(), Error> {
+        queries.euclideans_packed_parallel_into(packed_base, out, pool)
     }
 
     fn metric_name() -> &'static str {

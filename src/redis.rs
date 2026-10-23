@@ -25,6 +25,7 @@ use std::{fmt, time::Duration};
 
 use clap::Parser;
 use itertools::iproduct;
+use numkong as nk;
 use serde_json::json;
 
 use retrieval::{
@@ -108,8 +109,8 @@ impl From<DataType> for RedisDataType {
 enum WireScratch {
     F32(Vec<f32, std::alloc::System>),
     F64(Vec<f64, std::alloc::System>),
-    F16(Vec<numkong::f16, std::alloc::System>),
-    BF16(Vec<numkong::bf16, std::alloc::System>),
+    F16(Vec<nk::f16, std::alloc::System>),
+    BF16(Vec<nk::bf16, std::alloc::System>),
     U8(Vec<u8, std::alloc::System>),
     I8(Vec<i8, std::alloc::System>),
 }
@@ -142,7 +143,7 @@ impl WireScratch {
         }
     }
 }
-fn cast_into<'a, T: numkong::CastDtype + Copy + Default>(
+fn cast_into<'a, T: nk::CastDType + Copy + Default>(
     source: &VectorSlice<'_>,
     start: usize,
     end: usize,
@@ -150,9 +151,9 @@ fn cast_into<'a, T: numkong::CastDtype + Copy + Default>(
 ) -> &'a [u8] {
     target.resize(end - start, T::default());
     let result = match source {
-        VectorSlice::F32(v) => numkong::cast(&v[start..end], target),
-        VectorSlice::I8(v) => numkong::cast(&v[start..end], target),
-        VectorSlice::U8(v) => numkong::cast(&v[start..end], target),
+        VectorSlice::F32(v) => nk::cast(&v[start..end], target),
+        VectorSlice::I8(v) => nk::cast(&v[start..end], target),
+        VectorSlice::U8(v) => nk::cast(&v[start..end], target),
         VectorSlice::B1x8(_) => unreachable!(),
     };
     result.expect("matching conversion lengths");

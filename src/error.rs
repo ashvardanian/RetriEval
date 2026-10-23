@@ -60,10 +60,6 @@ pub enum DatasetError {
 /// truth computation.
 #[derive(Debug, thiserror::Error)]
 pub enum GroundTruthError {
-    /// One of the three input views has non-contiguous rows.
-    #[error("{which} view must have contiguous rows")]
-    NonContiguousView { which: &'static str },
-
     /// NumKong's `u1x8` storage requires the logical dimension to be a
     /// multiple of 8. Fingerprints like MACCS (166 logical bits) must be
     /// rounded up to 168 by the caller before packing.
@@ -98,18 +94,18 @@ pub enum GroundTruthError {
         expected: usize,
     },
 
-    /// `fork_union::ThreadPool::try_spawn` failed (usually OOM or
+    /// `forkunion::ThreadPool::spawn` failed (usually OOM or
     /// permission-related on constrained systems).
-    #[error("fork_union::ThreadPool::try_spawn: {0}")]
+    #[error("forkunion::ThreadPool::spawn: {0}")]
     ThreadPool(String),
 
     /// Shape / allocation / kernel failure inside NumKong.
     #[error("numkong tensor error: {0:?}")]
-    Tensor(numkong::TensorError),
+    Tensor(numkong::Error),
 }
 
-impl From<numkong::TensorError> for GroundTruthError {
-    fn from(error: numkong::TensorError) -> Self {
+impl From<numkong::Error> for GroundTruthError {
+    fn from(error: numkong::Error) -> Self {
         Self::Tensor(error)
     }
 }
