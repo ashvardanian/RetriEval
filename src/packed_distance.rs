@@ -12,6 +12,7 @@
 //! [`PackedDistance`] for the relevant scalar type and delegating to the
 //! corresponding NumKong `*_packed_parallel_into` method.
 
+use forkunion as fu;
 use numkong::{
     self as nk, Dots, DotsPackedMatrix, Error, EuclideansPackedParallelOps, HammingsPackedParallelOps, MatrixSpan,
     MatrixView, StorageElement,
@@ -57,7 +58,7 @@ where
         queries: &MatrixView<'_, Self>,
         packed_base: &DotsPackedMatrix<Self>,
         out: &mut MatrixSpan<'_, Self::Distance>,
-        pool: &mut forkunion::ThreadPool,
+        pool: &mut fu::ThreadPool,
     ) -> Result<(), Error>;
 
     /// Human-readable label for progress-bar / log messages. Stable across
@@ -81,7 +82,7 @@ impl PackedDistance for nk::u1x8 {
         queries: &MatrixView<'_, Self>,
         packed_base: &DotsPackedMatrix<Self>,
         out: &mut MatrixSpan<'_, u32>,
-        pool: &mut forkunion::ThreadPool,
+        pool: &mut fu::ThreadPool,
     ) -> Result<(), Error> {
         queries.hammings_packed_parallel_into(packed_base, out, pool)
     }
@@ -121,7 +122,7 @@ impl PackedDistance for f32 {
         queries: &MatrixView<'_, Self>,
         packed_base: &DotsPackedMatrix<Self>,
         out: &mut MatrixSpan<'_, f64>,
-        pool: &mut forkunion::ThreadPool,
+        pool: &mut fu::ThreadPool,
     ) -> Result<(), Error> {
         queries.euclideans_packed_parallel_into(packed_base, out, pool)
     }

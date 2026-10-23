@@ -3,7 +3,9 @@
 //! Backends still return `Result<_, String>` — their failure messages are
 //! engine-specific strings with no shared shape worth matching on.
 
-use std::{io, path::PathBuf};
+use std::path::PathBuf;
+
+use numkong as nk;
 
 // #region Dataset errors
 
@@ -47,9 +49,6 @@ pub enum DatasetError {
         expected_dims: u32,
         got_dims: u32,
     },
-
-    #[error(transparent)]
-    Io(#[from] io::Error),
 }
 
 // #endregion
@@ -60,12 +59,6 @@ pub enum DatasetError {
 /// truth computation.
 #[derive(Debug, thiserror::Error)]
 pub enum GroundTruthError {
-    /// NumKong's `u1x8` storage requires the logical dimension to be a
-    /// multiple of 8. Fingerprints like MACCS (166 logical bits) must be
-    /// rounded up to 168 by the caller before packing.
-    #[error("bits_per_vector={bits} must be a multiple of 8 for u1x8 storage")]
-    BitsPerVectorMisaligned { bits: usize },
-
     /// Queries and base disagree on the vector width.
     #[error("dimension mismatch: queries.dimensions={queries}, base.dimensions={base}")]
     DimensionMismatch { queries: usize, base: usize },
@@ -86,88 +79,14 @@ pub enum GroundTruthError {
     #[error("base_count={base_count} exceeds the 2^32 rows `u32` neighbor ids can name")]
     IndexOverflow { base_count: usize },
 
-    /// A view's row stride doesn't match `bytes_per_vector`.
-    #[error("{which} row stride {got} != bytes_per_vector {expected}")]
-    StrideMismatch {
-        which: &'static str,
-        got: usize,
-        expected: usize,
-    },
-
-    /// `forkunion::ThreadPool::spawn` failed (usually OOM or
-    /// permission-related on constrained systems).
-    #[error("forkunion::ThreadPool::spawn: {0}")]
+    /// ForkUnion failed to spawn the pool or dispatch to it, usually from OOM or permissions on
+    /// constrained systems.
+    #[error("ForkUnion pool: {0}")]
     ThreadPool(String),
 
     /// Shape / allocation / kernel failure inside NumKong.
     #[error("numkong tensor error: {0:?}")]
-    Tensor(numkong::Error),
-}
-
-impl From<numkong::Error> for GroundTruthError {
-    fn from(error: numkong::Error) -> Self {
-        Self::Tensor(error)
-    }
-}
-
-// #endregion
-
-// #region Perf-counter errors
-
-/// Linux hardware performance-counter wiring failures.
-#[derive(Debug, thiserror::Error)]
-pub enum PerfCountersError {
-    /// No online CPU accepted a group — usually means permissions or the
-    /// host has ≤0 online CPUs (should never happen in practice).
-    #[error("no online CPUs accepted a perf-counter group")]
-    NoGroupsAccepted,
-
-    /// Either `target_os != linux` or the `perf-counters` feature is off.
-    #[error("perf-counters feature disabled or target_os != linux")]
-    Unsupported,
-
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
-// #endregion
-
-// #region Download errors
-
-/// Network, parquet, or schema failures inside the dataset download binaries.
-#[cfg(feature = "download")]
-#[derive(Debug, thiserror::Error)]
-pub enum DownloadError {
-    /// HTTP GET returned a non-success status.
-    #[error("GET {url} → {status}")]
-    HttpStatus { url: String, status: reqwest::StatusCode },
-
-    /// Parquet column we need isn't in the shard's schema.
-    #[error("parquet schema missing column `{column}` — wrong source?")]
-    SchemaMissingColumn { column: String },
-
-    /// Parquet column is present but has a type we can't consume.
-    #[error("parquet column `{column}` has unexpected type {ty}")]
-    ColumnUnexpectedType { column: String, ty: String },
-
-    /// All shards downloaded but zero usable rows extracted.
-    #[error("no rows downloaded — check --source / --url-prefix")]
-    NoRowsDownloaded,
-
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
-
-    #[error(transparent)]
-    Parquet(#[from] parquet::errors::ParquetError),
-
-    #[error(transparent)]
-    Io(#[from] io::Error),
-
-    #[error(transparent)]
-    Dataset(#[from] DatasetError),
-
-    #[error(transparent)]
-    GroundTruth(#[from] GroundTruthError),
+    Tensor(#[from] nk::Error),
 }
 
 // #endregion

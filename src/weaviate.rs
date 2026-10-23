@@ -31,8 +31,8 @@ use itertools::iproduct;
 use serde_json::{json, Value};
 
 use retrieval::{
-    bail, docker::ContainerHandle, spell_duration, spell_list, try_run_config, Backend, BenchState, CommonArgs,
-    Distance, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BenchState, CommonArgs, Distance, Hits,
+    IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const CLASS_NAME: &str = "Bench";
@@ -65,12 +65,12 @@ impl fmt::Display for Metric {
 
 /// Server-side quantization, as `--quantization` spells it.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum WeaviateQuant {
+enum WeaviateQuantization {
     None,
     Binary,
 }
 
-impl fmt::Display for WeaviateQuant {
+impl fmt::Display for WeaviateQuantization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         retrieval::spell_value(self, formatter)
     }
@@ -100,7 +100,7 @@ struct Cli {
         value_enum,
         default_value = "none"
     )]
-    quantization: Vec<WeaviateQuant>,
+    quantization: Vec<WeaviateQuantization>,
 
     /// HNSW connectivity M (comma-separated for sweep)
     #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
@@ -124,35 +124,71 @@ struct Cli {
     port: Port,
 }
 
-struct WeaviateBackend {
+/// One config's class on the shared server.
+struct WeaviateBackend<'a> {
     scratch: Vec<f32, std::alloc::System>,
     query: String,
-    http: reqwest::Client,
-    http_base: String,
-    container: Option<ContainerHandle>,
-    runtime: tokio::runtime::Handle,
-    description: String,
+    http: &'a reqwest::Client,
+    http_base: &'a str,
+    container: &'a ContainerHandle,
+    runtime: &'a tokio::runtime::Runtime,
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
-impl Backend for WeaviateBackend {
-    fn description(&self) -> String {
-        self.description.clone()
-    }
+/// The settings that shape one config's class.
+#[derive(Clone, Copy)]
+struct ClassSettings {
+    metric: Metric,
+    quantization: WeaviateQuantization,
+    connectivity: usize,
+    expansion_add: usize,
+    expansion_search: usize,
+}
 
+impl<'a> WeaviateBackend<'a> {
+    /// Drops and recreates the benchmark class for `settings` on the running server.
+    fn new(
+        http: &'a reqwest::Client,
+        http_base: &'a str,
+        container: &'a ContainerHandle,
+        runtime: &'a tokio::runtime::Runtime,
+        settings: ClassSettings,
+    ) -> Result<Self, String> {
+        runtime.block_on(create_class(http, http_base, settings))?;
+        Ok(Self {
+            scratch: Vec::new_in(std::alloc::System),
+            query: String::new(),
+            http,
+            http_base,
+            container,
+            runtime,
+            metadata: std::collections::HashMap::from([
+                ("backend".into(), json!("weaviate")),
+                ("metric".into(), json!(settings.metric.to_string())),
+                ("quantization".into(), json!(settings.quantization.to_string())),
+                ("connectivity".into(), json!(settings.connectivity)),
+                ("expansion_add".into(), json!(settings.expansion_add)),
+                ("expansion_search".into(), json!(settings.expansion_search)),
+            ]),
+        })
+    }
+}
+
+impl Backend for WeaviateBackend<'_> {
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
         self.metadata.clone()
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let data = vectors.data.to_f32_in(&mut self.scratch)?;
+        let dimensions = vectors.dimensions();
+        let data = vectors.to_f32_in(&mut self.scratch)?;
         let objects: Vec<_> = data
-            .chunks_exact(vectors.dimensions)
+            .chunks_exact(dimensions)
             .zip(keys)
             .map(|(row, &key)| json!({"class": CLASS_NAME, "properties": {"idx": key}, "vector": row}))
             .collect();
         let response = self.runtime.block_on(post_json(
-            &self.http,
+            self.http,
             &format!("{}/v1/batch/objects", self.http_base),
             &json!({"objects": objects}),
         ))?;
@@ -160,84 +196,58 @@ impl Backend for WeaviateBackend {
         if results.len() != keys.len() {
             return Err("Weaviate batch response length mismatch".into());
         }
-        for result in results {
-            if result.pointer("/result/status").and_then(Value::as_str) != Some("SUCCESS") {
-                return Err(format!("Weaviate batch insert failed: {result}"));
-            }
+        match results
+            .iter()
+            .find(|result| result.pointer("/result/status").and_then(Value::as_str) != Some("SUCCESS"))
+        {
+            Some(failed) => Err(format!("Weaviate batch insert failed: {failed}")),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    fn search(
-        &mut self,
-        queries: Vectors,
-        count: usize,
-        out_keys: &mut [Key],
-        out_distances: &mut [Distance],
-        out_counts: &mut [usize],
-    ) -> Result<(), String> {
-        let data = queries.data.to_f32_in(&mut self.scratch)?;
+    fn search(&mut self, queries: Vectors, mut hits: Hits<'_>) -> Result<(), String> {
+        let count = hits.count();
+        let dimensions = queries.dimensions();
+        let data = queries.to_f32_in(&mut self.scratch)?;
         self.query.clear();
         self.query.push_str("{ Get {");
-        for (i, row) in data.chunks_exact(queries.dimensions).enumerate() {
-            write!(self.query, "q{i}: {CLASS_NAME}(nearVector: {{ vector: {row:?} }} limit: {count}) {{ idx _additional {{ distance }} }} ").unwrap();
+        for (query_index, row) in data.chunks_exact(dimensions).enumerate() {
+            write!(self.query, "q{query_index}: {CLASS_NAME}(nearVector: {{ vector: {row:?} }} limit: {count}) {{ idx _additional {{ distance }} }} ").expect("a String takes any write");
         }
         self.query.push_str("} }");
         let response = self.runtime.block_on(post_json(
-            &self.http,
+            self.http,
             &format!("{}/v1/graphql", self.http_base),
             &json!({"query": self.query}),
         ))?;
         if let Some(errors) = response.get("errors") {
             return Err(format!("Weaviate query failed: {errors}"));
         }
-        for (i, output_count) in out_counts.iter_mut().enumerate() {
-            let name = format!("q{i}");
+        for (query_index, row) in hits.rows().enumerate() {
             let items = response
-                .get("data")
-                .and_then(|v| v.get("Get"))
-                .and_then(|v| v.get(&name))
+                .pointer(&format!("/data/Get/q{query_index}"))
                 .and_then(Value::as_array)
                 .ok_or("Weaviate query response missing results")?;
-            let keys = &mut out_keys[i * count..(i + 1) * count];
-            let distances = &mut out_distances[i * count..(i + 1) * count];
-            keys.fill(Key::MAX);
-            distances.fill(Distance::INFINITY);
-            if items.len() > count {
-                return Err("Weaviate returned too many results".into());
-            }
-            for (j, item) in items.iter().enumerate() {
-                keys[j] = item
+            row.write(items.iter().map(|item| {
+                let key = item
                     .get("idx")
                     .and_then(Value::as_u64)
-                    .and_then(|k| Key::try_from(k).ok())
+                    .and_then(|key| Key::try_from(key).ok())
                     .ok_or("Weaviate returned invalid key")?;
-                distances[j] = item
+                let distance = item
                     .pointer("/_additional/distance")
                     .and_then(Value::as_f64)
-                    .ok_or("Weaviate returned invalid distance")? as Distance;
-                if !distances[j].is_finite() {
-                    return Err("Weaviate returned nonfinite distance".into());
-                }
-            }
-            *output_count = items.len();
+                    .map(|distance| distance as Distance)
+                    .filter(|distance| distance.is_finite())
+                    .ok_or("Weaviate returned an invalid distance")?;
+                Ok((key, distance))
+            }))?;
         }
         Ok(())
     }
 
     fn memory_bytes(&self) -> usize {
-        self.container
-            .as_ref()
-            .map(|c| self.runtime.block_on(c.memory_usage_bytes()) as usize)
-            .unwrap_or(0)
-    }
-}
-
-impl Drop for WeaviateBackend {
-    fn drop(&mut self) {
-        if let Some(c) = self.container.take() {
-            let _ = self.runtime.block_on(c.stop());
-        }
+        self.runtime.block_on(self.container.memory_usage_bytes()) as usize
     }
 }
 
@@ -248,7 +258,7 @@ async fn post_json(http: &reqwest::Client, url: &str, body: &Value) -> Result<Va
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("POST {url} failed: {e}"))?;
+        .map_err(|error| format!("POST {url} failed: {error}"))?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -257,19 +267,11 @@ async fn post_json(http: &reqwest::Client, url: &str, body: &Value) -> Result<Va
     response
         .json()
         .await
-        .map_err(|e| format!("POST {url} returned invalid JSON: {e}"))
+        .map_err(|error| format!("POST {url} returned invalid JSON: {error}"))
 }
 
 /// Drop and recreate the benchmark class with the given HNSW parameters.
-async fn create_class(
-    http: &reqwest::Client,
-    http_base: &str,
-    distance: &str,
-    quant: WeaviateQuant,
-    max_connections: u64,
-    ef_construction: u64,
-    ef: i64,
-) -> Result<(), String> {
+async fn create_class(http: &reqwest::Client, http_base: &str, settings: ClassSettings) -> Result<(), String> {
     let _ = http.delete(format!("{http_base}/v1/schema/{CLASS_NAME}")).send().await;
     let body = json!({
         "class": CLASS_NAME,
@@ -277,11 +279,11 @@ async fn create_class(
         "vectorizer": "none",
         "vectorIndexType": "hnsw",
         "vectorIndexConfig": {
-            "distance": distance,
-            "ef": ef,
-            "efConstruction": ef_construction,
-            "maxConnections": max_connections,
-            "bq": { "enabled": matches!(quant, WeaviateQuant::Binary) }
+            "distance": settings.metric.schema_name(),
+            "ef": settings.expansion_search,
+            "efConstruction": settings.expansion_add,
+            "maxConnections": settings.connectivity,
+            "bq": { "enabled": matches!(settings.quantization, WeaviateQuantization::Binary) }
         },
         "properties": [
             { "name": "idx", "dataType": ["int"] }
@@ -294,14 +296,14 @@ async fn create_class(
 
 /// Reject argument combinations Weaviate will refuse, before a container starts.
 fn validate(cli: &Cli) -> Result<(), String> {
-    for &connectivity in &cli.connectivity {
-        for &expansion_add in &cli.expansion_add {
-            if expansion_add < connectivity {
-                return Err(format!(
-                    "--expansion-add {expansion_add} is below --connectivity {connectivity}; \
-                     efConstruction below maxConnections leaves the graph under-linked"
-                ));
-            }
+    let smallest_expansion = cli.expansion_add.iter().min();
+    let largest_connectivity = cli.connectivity.iter().max();
+    if let (Some(&expansion_add), Some(&connectivity)) = (smallest_expansion, largest_connectivity) {
+        if expansion_add < connectivity {
+            return Err(format!(
+                "--expansion-add {expansion_add} is below --connectivity {connectivity}; \
+                 efConstruction below maxConnections leaves the graph under-linked"
+            ));
         }
     }
     Ok(())
@@ -310,19 +312,22 @@ fn validate(cli: &Cli) -> Result<(), String> {
 fn main() {
     let cli: Cli = retrieval::parse_cli();
     validate(&cli).unwrap_or_bail("invalid arguments");
-
-    if cli.common.index.is_some() {
-        bail("--index is not supported for this backend");
-    }
+    let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
+    eprintln!("- Metrics: {}", spell_list(&cli.metric));
+    eprintln!("- Quantization: {}", spell_list(&cli.quantization));
+    eprintln!("- Connectivity: {}", spell_list(&cli.connectivity));
+    eprintln!("- Expansion add: {}", spell_list(&cli.expansion_add));
+    eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
+    eprintln!("- Startup time limit: {}", spell_duration(cli.startup_time_limit));
+    eprintln!("- Port: {}", cli.port);
+    let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("tokio");
-    let timeout = cli.startup_time_limit;
-
-    let handle = runtime.block_on(async {
-        let handle = ContainerHandle::start(
+        .unwrap_or_bail("tokio runtime");
+    let container = runtime
+        .block_on(ContainerHandle::start(
             "semitechnologies/weaviate:1.39.7",
             "retrieval-weaviate",
             &[(cli.port.into(), 8080), (50051, 50051)],
@@ -334,96 +339,47 @@ fn main() {
                 "CLUSTER_HOSTNAME=node1".into(),
             ],
             &[],
-            timeout,
-        )
-        .await
-        .expect("docker start");
-        handle
-            .wait_for_http(&format!("http://localhost:{}/v1/.well-known/ready", cli.port), timeout)
-            .await
-            .expect("weaviate not ready");
-        handle
-    });
-
+        ))
+        .unwrap_or_bail("Weaviate container");
     let http_base = format!("http://localhost:{}", cli.port);
     let http = reqwest::Client::new();
+    let ready =
+        runtime.block_on(container.wait_for_http(&format!("{http_base}/v1/.well-known/ready"), cli.startup_time_limit));
 
-    let mut state = BenchState::load(&cli.common).unwrap_or_else(|e| {
-        eprintln!("Failed to load benchmark state: {e}");
-        std::process::exit(1);
-    });
-    eprintln!("- Metrics: {}", spell_list(&cli.metric));
-    eprintln!("- Quantization: {}", spell_list(&cli.quantization));
-    eprintln!("- Connectivity: {}", spell_list(&cli.connectivity));
-    eprintln!("- Expansion add: {}", spell_list(&cli.expansion_add));
-    eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
-    eprintln!("- Startup time limit: {}", spell_duration(cli.startup_time_limit));
-    eprintln!("- Port: {}", cli.port);
-    if cli.common.dims.len() > 1 {
-        retrieval::bail("--dims sweep with >1 value isn't supported on Weaviate; rerun the binary per dimensions");
-    }
-    let dimensions = cli.common.dims.first().copied().unwrap_or_else(|| state.dimensions());
-    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dims");
-
-    let mut container_slot = Some(handle);
-    let configs = iproduct!(
-        &cli.metric,
-        &cli.quantization,
-        &cli.connectivity,
-        &cli.expansion_add,
-        &cli.expansion_search
-    );
-    let num_configs = configs.clone().count();
     let mut summary = SweepSummary::default();
-    for (idx, (&metric, &quant, connectivity, expansion_add, expansion_search)) in configs.enumerate() {
-        let is_last = idx + 1 == num_configs;
-
-        runtime.block_on(async {
-            create_class(
-                &http,
-                &http_base,
-                metric.schema_name(),
-                quant,
-                *connectivity as u64,
-                *expansion_add as u64,
-                *expansion_search as i64,
-            )
-            .await
-            .expect("create class");
-        });
-
-        let container_for_this_run = if is_last { container_slot.take() } else { None };
-
-        let description = format!(
-            "weaviate · {metric} · quant={quant} · \
-             M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"
-        );
-        let backend = WeaviateBackend {
-            scratch: Vec::new_in(std::alloc::System),
-            query: String::new(),
-            http: http.clone(),
-            http_base: http_base.clone(),
-            container: container_for_this_run,
-            runtime: runtime.handle().clone(),
-            description: description.clone(),
-            metadata: {
-                let mut metadata = std::collections::HashMap::new();
-                metadata.insert("backend".into(), json!("weaviate"));
-                metadata.insert("metric".into(), json!(metric.to_string()));
-                metadata.insert("quantization".into(), json!(quant.to_string()));
-                metadata.insert("connectivity".into(), json!(connectivity));
-                metadata.insert("expansion_add".into(), json!(expansion_add));
-                metadata.insert("expansion_search".into(), json!(expansion_search));
-                metadata
-            },
-        };
-
-        summary.record(try_run_config(
-            &description,
-            Ok::<_, String>(backend),
-            &mut state,
-            dimensions,
-        ));
+    match ready {
+        Ok(()) => {
+            for (&dimensions, &metric, &quantization, &connectivity, &expansion_add, &expansion_search) in iproduct!(
+                &dimensions_sweep,
+                &cli.metric,
+                &cli.quantization,
+                &cli.connectivity,
+                &cli.expansion_add,
+                &cli.expansion_search
+            ) {
+                let description = format!(
+                    "weaviate · {metric} · quant={quantization} · \
+                     M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"
+                );
+                let settings = ClassSettings {
+                    metric,
+                    quantization,
+                    connectivity,
+                    expansion_add,
+                    expansion_search,
+                };
+                let backend = WeaviateBackend::new(&http, &http_base, &container, &runtime, settings);
+                summary.record(run_config(
+                    &description,
+                    IndexFile::None,
+                    backend,
+                    &mut state,
+                    dimensions,
+                ));
+            }
+        }
+        Err(error) => eprintln!("Weaviate did not come up: {error}"),
     }
-    summary.print();
+    runtime.block_on(container.stop()).ok();
+    summary.finish();
 }

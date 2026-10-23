@@ -21,7 +21,10 @@ use std::{alloc::System, collections::HashMap, fmt};
 use clap::Parser;
 use serde_json::{json, Value};
 
-use retrieval::{run, Backend, BenchState, CommonArgs, Distance, Key, UnwrapOrBail, VectorSlice, Vectors};
+use retrieval::{
+    run_config, Backend, BenchState, CommonArgs, Distance, Hits, IndexFile, Key, SweepSummary, UnwrapOrBail,
+    VectorSlice, Vectors,
+};
 
 /// Turso vector distances, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,10 +77,10 @@ impl TursoBackend {
         let database = turso::Builder::new_local(path)
             .build()
             .await
-            .map_err(|e| e.to_string())?;
-        let connection = database.connect().map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
+        let connection = database.connect().map_err(|error| error.to_string())?;
         connection.execute_batch("PRAGMA synchronous=FULL; DROP TABLE IF EXISTS bench; CREATE TABLE bench (id INTEGER PRIMARY KEY, vector BLOB NOT NULL)")
-            .await.map_err(|e| e.to_string())?;
+            .await.map_err(|error| error.to_string())?;
         Ok(Self {
             connection,
             runtime,
@@ -103,9 +106,6 @@ fn encode(row: &[f32], wire: &mut Vec<u8, System>) -> Result<(), String> {
 }
 
 impl Backend for TursoBackend {
-    fn description(&self) -> String {
-        format!("turso · {} · F32 exact scan", self.metric)
-    }
     fn metadata(&self) -> HashMap<String, Value> {
         HashMap::from([
             ("backend".into(), json!("turso")),
@@ -116,70 +116,63 @@ impl Backend for TursoBackend {
             ("synchronous".into(), json!("FULL")),
         ])
     }
+
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let VectorSlice::F32(data) = vectors.data else {
+        let VectorSlice::F32(values) = vectors.values() else {
             return Err("Turso supports F32 source vectors only".into());
         };
         self.runtime.block_on(async {
-            let transaction = self.connection.transaction().await.map_err(|e| e.to_string())?;
+            let transaction = self.connection.transaction().await.map_err(|error| error.to_string())?;
             let mut statement = transaction
                 .prepare("INSERT INTO bench VALUES (?1, ?2)")
                 .await
-                .map_err(|e| e.to_string())?;
-            for (row, &key) in data.chunks_exact(vectors.dimensions).zip(keys) {
+                .map_err(|error| error.to_string())?;
+            for (row, &key) in values.chunks_exact(vectors.dimensions()).zip(keys) {
                 encode(row, &mut self.wire)?;
                 statement
                     .execute((i64::from(key), self.wire.as_slice()))
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|error| error.to_string())?;
             }
-            transaction.commit().await.map_err(|e| e.to_string())
+            transaction.commit().await.map_err(|error| error.to_string())
         })
     }
-    fn search(
-        &mut self,
-        queries: Vectors,
-        count: usize,
-        keys: &mut [Key],
-        distances: &mut [Distance],
-        counts: &mut [usize],
-    ) -> Result<(), String> {
-        let VectorSlice::F32(data) = queries.data else {
+
+    fn search(&mut self, queries: Vectors, mut hits: Hits<'_>) -> Result<(), String> {
+        let VectorSlice::F32(values) = queries.values() else {
             return Err("Turso supports F32 source vectors only".into());
         };
-        keys.fill(Key::MAX);
-        distances.fill(Distance::INFINITY);
-        counts.fill(0);
+        let count = hits.count();
         self.runtime.block_on(async {
             let mut statement = self
                 .connection
                 .prepare_cached(&self.search_sql)
                 .await
-                .map_err(|e| e.to_string())?;
-            for (i, query) in data.chunks_exact(queries.dimensions).enumerate() {
+                .map_err(|error| error.to_string())?;
+            for (query, hit_row) in values.chunks_exact(queries.dimensions()).zip(hits.rows()) {
                 encode(query, &mut self.wire)?;
                 let mut rows = statement
                     .query((self.wire.as_slice(), count as i64))
                     .await
-                    .map_err(|e| e.to_string())?;
-                while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
-                    let rank = counts[i];
-                    if rank == count {
-                        return Err("Turso exceeded result limit".into());
-                    }
-                    let id = row.get::<i64>(0).map_err(|e| e.to_string())?;
-                    let distance = row.get::<f64>(1).map_err(|e| e.to_string())? as Distance;
-                    if !distance.is_finite() {
-                        return Err("Turso returned nonfinite distance".into());
-                    }
-                    keys[i * count + rank] = Key::try_from(id).map_err(|e| e.to_string())?;
-                    distances[i * count + rank] = distance;
-                    counts[i] += 1;
+                    .map_err(|error| error.to_string())?;
+                let mut found = Vec::with_capacity_in(count, System);
+                while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+                    let id = row.get::<i64>(0).map_err(|error| error.to_string())?;
+                    let distance = row.get::<f64>(1).map_err(|error| error.to_string())? as Distance;
+                    found.push((id, distance));
                 }
+                hit_row.write(found.into_iter().map(|(id, distance)| {
+                    let key = Key::try_from(id).map_err(|error| error.to_string())?;
+                    match distance.is_finite() {
+                        true => Ok((key, distance)),
+                        false => Err("Turso returned nonfinite distance".into()),
+                    }
+                }))?;
             }
             Ok(())
         })
     }
+
     fn memory_bytes(&self) -> usize {
         0
     }
@@ -187,33 +180,40 @@ impl Backend for TursoBackend {
 
 fn main() {
     let cli: Cli = retrieval::parse_cli();
-
-    if cli.common.index.is_some() {
-        retrieval::bail("--index is not supported for this backend");
-    }
-
     let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     eprintln!("- Metric: {}", cli.metric);
     eprintln!("- Database path: {}", cli.db_path);
-    if cli.common.dims.len() > 1 {
-        retrieval::bail("--dims sweep with >1 value isn't supported on Turso; rerun the binary per dimensions");
-    }
-    let dimensions = cli.common.dims.first().copied().unwrap_or_else(|| state.dimensions());
-    state.check_dimensions(dimensions).unwrap_or_bail("invalid --dims");
+    let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("tokio");
-    let mut backend = runtime
-        .block_on(TursoBackend::open(&cli.db_path, cli.metric, runtime.handle().clone()))
-        .unwrap_or_bail("open Turso");
-    run(&mut backend, &mut state, dimensions).unwrap_or_bail("benchmark");
+        .unwrap_or_bail("tokio runtime");
+    let mut summary = SweepSummary::default();
+    for &dimensions in &dimensions_sweep {
+        let description = format!("turso · {} · F32 exact scan · {dimensions}d", cli.metric);
+        let backend = runtime.block_on(TursoBackend::open(&cli.db_path, cli.metric, runtime.handle().clone()));
+        summary.record(run_config(
+            &description,
+            IndexFile::None,
+            backend,
+            &mut state,
+            dimensions,
+        ));
+    }
+    summary.finish();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use retrieval::SearchBuffers;
+
+    fn open(metric: Metric, runtime: &tokio::runtime::Runtime) -> TursoBackend {
+        runtime
+            .block_on(TursoBackend::open(":memory:", metric, runtime.handle().clone()))
+            .unwrap()
+    }
 
     #[test]
     fn exact_search_reuses_wire_and_reports_short_rows() {
@@ -221,75 +221,40 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let mut backend = runtime
-            .block_on(TursoBackend::open(":memory:", Metric::L2, runtime.handle().clone()))
-            .unwrap();
+        let mut backend = open(Metric::L2, &runtime);
         backend
-            .add(
-                &[9, 2],
-                Vectors {
-                    data: VectorSlice::F32(&[3.0, 4.0, 0.0, 0.0]),
-                    dimensions: 2,
-                },
-            )
+            .add(&[9, 2], Vectors::new(VectorSlice::F32(&[3.0, 4.0, 0.0, 0.0]), 2))
             .unwrap();
         let pointer = backend.wire.as_ptr();
-        let mut keys = [0; 3];
-        let mut distances = [0.0; 3];
-        let mut counts = [0];
+        let mut buffers = SearchBuffers::new(1, 3).unwrap();
         backend
-            .search(
-                Vectors {
-                    data: VectorSlice::F32(&[0.0, 0.0]),
-                    dimensions: 2,
-                },
-                3,
-                &mut keys,
-                &mut distances,
-                &mut counts,
-            )
+            .search(Vectors::new(VectorSlice::F32(&[0.0, 0.0]), 2), buffers.hits(0..1))
             .unwrap();
+        let (keys, distances, found) = buffers.rows().next().unwrap();
         assert_eq!(keys, [2, 9, Key::MAX]);
         assert_eq!(distances, [0.0, 5.0, Distance::INFINITY]);
-        assert_eq!(counts, [2]);
+        assert_eq!(found, 2);
         assert_eq!(pointer, backend.wire.as_ptr());
     }
+
     #[test]
     fn cosine_distance_is_evaluated_by_engine() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let mut backend = runtime
-            .block_on(TursoBackend::open(":memory:", Metric::Cos, runtime.handle().clone()))
-            .unwrap();
+        let mut backend = open(Metric::Cos, &runtime);
         backend
-            .add(
-                &[9, 2],
-                Vectors {
-                    data: VectorSlice::F32(&[0.0, 1.0, 1.0, 0.0]),
-                    dimensions: 2,
-                },
-            )
+            .add(&[9, 2], Vectors::new(VectorSlice::F32(&[0.0, 1.0, 1.0, 0.0]), 2))
             .unwrap();
-        let mut keys = [0; 2];
-        let mut distances = [0.0; 2];
-        let mut counts = [0];
+        let mut buffers = SearchBuffers::new(1, 2).unwrap();
         backend
-            .search(
-                Vectors {
-                    data: VectorSlice::F32(&[1.0, 0.0]),
-                    dimensions: 2,
-                },
-                2,
-                &mut keys,
-                &mut distances,
-                &mut counts,
-            )
+            .search(Vectors::new(VectorSlice::F32(&[1.0, 0.0]), 2), buffers.hits(0..1))
             .unwrap();
+        let (keys, distances, found) = buffers.rows().next().unwrap();
         assert_eq!(keys, [2, 9]);
         assert!(distances[0].abs() < 1e-6);
         assert!((distances[1] - 1.0).abs() < 1e-6);
-        assert_eq!(counts, [2]);
+        assert_eq!(found, 2);
     }
 }

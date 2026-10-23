@@ -10,6 +10,8 @@ use serde::Serialize;
 use serde_json::Value;
 use sysinfo::System;
 
+use crate::perf_counters::CounterSample;
+
 /// Machine descriptor.
 #[derive(Debug, Serialize)]
 pub struct MachineInfo {
@@ -20,7 +22,7 @@ pub struct MachineInfo {
 }
 
 /// Dataset descriptor — describes the input files, not the configuration.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DatasetInfo {
     pub base_vectors_path: String,
     pub query_vectors_path: String,
@@ -58,7 +60,7 @@ pub struct StepAddEntry {
     pub elapsed: f64,
     pub throughput: u64,
     #[serde(flatten)]
-    pub counters: PhaseCounters,
+    pub counters: Option<CounterSample>,
 }
 
 /// One pass of a query set against the index, timed and scored. The same shape
@@ -83,40 +85,10 @@ pub struct StepSearchEntry {
     pub intersection_at_k: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ndcg_at_k: Option<f64>,
+    /// Hardware counters summed across all online CPUs, present only with `--features
+    /// perf-counters` on Linux and `CAP_PERFMON` or `kernel.perf_event_paranoid <= 1`.
     #[serde(flatten)]
-    pub counters: PhaseCounters,
-}
-
-/// Hardware counters for one phase, summed across all online CPUs. Populated
-/// only with `--features perf-counters` on Linux and `CAP_PERFMON` (or
-/// `kernel.perf_event_paranoid <= 1`); every field is serde-skipped otherwise.
-#[derive(Debug, Default, Serialize)]
-pub struct PhaseCounters {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cycles: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_references: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_misses: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch_misses: Option<u64>,
-}
-
-impl PhaseCounters {
-    pub fn from_sample(sample: Option<&crate::perf_counters::CounterSample>) -> Self {
-        match sample {
-            None => Self::default(),
-            Some(s) => Self {
-                cycles: Some(s.cycles),
-                instructions: Some(s.instructions),
-                cache_references: Some(s.cache_references),
-                cache_misses: Some(s.cache_misses),
-                branch_misses: Some(s.branch_misses),
-            },
-        }
-    }
+    pub counters: Option<CounterSample>,
 }
 
 /// Complete report for one backend configuration.
@@ -130,18 +102,14 @@ pub struct ConfigReport {
 
 /// Collects machine info using the `sysinfo` crate.
 pub fn collect_machine_info() -> MachineInfo {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let cpu_model = sys
+    let system = System::new_all();
+    let cpu_model = system
         .cpus()
         .first()
-        .map(|cpu| cpu.brand().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
+        .map_or_else(|| "unknown".into(), |cpu| cpu.brand().to_string());
     let physical_cores = System::physical_core_count().unwrap_or(0);
-    let logical_cores = sys.cpus().len();
-    let ram_bytes = sys.total_memory();
+    let logical_cores = system.cpus().len();
+    let ram_bytes = system.total_memory();
 
     MachineInfo {
         cpu_model,

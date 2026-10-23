@@ -93,16 +93,15 @@ struct CpuCounters {
 #[cfg(all(target_os = "linux", feature = "perf-counters"))]
 impl PerfCounters {
     pub fn new() -> io::Result<Self> {
-        let logical_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let logical_cpus = crate::Threads::all_cores().0.get();
 
         let mut per_cpu = Vec::with_capacity_in(logical_cpus, std::alloc::System);
         for cpu in 0..logical_cpus {
             match open_cpu_counters(cpu) {
                 Ok(entry) => per_cpu.push(entry),
-                // Fail fast on the first CPU — almost always a permission
-                // problem, not a hot-unplugged core.
-                Err(err) if per_cpu.is_empty() => return Err(err),
-                // Later failures are tolerated: some cores may be offline.
+                // The first CPU failing is almost always a permission problem, not an offline core.
+                Err(error) if per_cpu.is_empty() => return Err(error),
+                // Later CPUs may be offline.
                 Err(_) => continue,
             }
         }
@@ -142,10 +141,7 @@ impl PerfCounters {
 /// Open a five-counter group for `perf stat -a` equivalent capture on one CPU.
 #[cfg(all(target_os = "linux", feature = "perf-counters"))]
 fn open_cpu_counters(cpu: usize) -> io::Result<CpuCounters> {
-    // Leader anchor: a no-op software event created by `Group::builder()`
-    // whose sole purpose is to own the group's leader fd. The five real
-    // counters below share its settings and are read through the group's
-    // atomic read path.
+    // A no-op software leader owns the group, so the five counters below read atomically through it.
     let mut leader = Group::builder();
     leader.any_pid().one_cpu(cpu).include_kernel();
     let mut kernel_group = leader.build_group()?;

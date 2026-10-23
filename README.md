@@ -277,6 +277,7 @@ Microsoft's 100-dimensional `f32` web-search embeddings under L2, compared at th
 Each backend is a separate binary, and the manuals below list every flag of every binary with its default.
 A value spelled `<…,...>` takes comma-separated values and runs one configuration per combination.
 A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
+A sweep also exits with status 1 when any configuration fails or none runs, while configurations a backend refuses to open are reported as skipped.
 Every `retri-eval-*` flag also reads `RETRIEVAL_<FLAG>` as its default, upper-cased with dashes as underscores, so `--top-k` reads `RETRIEVAL_TOP_K`.
 The flag on the command line overrides the variable, and switches like `--self-search` read `1`, `0`, `true` or `false`.
 

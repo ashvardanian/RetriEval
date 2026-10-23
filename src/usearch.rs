@@ -65,16 +65,16 @@
 use std::{collections::HashMap, fmt::Write};
 
 use clap::Parser;
-use numkong::{self as nk, MatrixView};
+use numkong as nk;
 use serde_json::{json, Value};
 use usearch::{
-    rows, Arena, DenseIndex, DenseInsertConfig, DenseLoadRamConfig, DenseMetric, DenseOptions, DenseSearchConfig,
-    DenseVerbs, Element, Executor, Scalar,
+    Arena, DenseIndex, DenseInsertConfig, DenseLoadRamConfig, DenseMetric, DenseOptions, DenseSearchConfig, DenseVerbs,
+    Element, Executor, Scalar,
 };
 
 use retrieval::{
-    run_config, spell_list, write_row, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary,
-    Threads, UnwrapOrBail, VectorSlice, Vectors,
+    run_config, spell_list, Backend, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key, SweepSummary,
+    Threads, UnwrapOrBail, Vectors,
 };
 
 #[derive(Parser, Debug)]
@@ -122,6 +122,10 @@ struct Cli {
     /// Number of threads, 0 for all cores (comma-separated for sweep)
     #[arg(long, env = "RETRIEVAL_THREADS", value_delimiter = ',', default_value = "0", value_parser = retrieval::parse_threads_flag)]
     threads: Vec<Threads>,
+
+    /// Persisted index: loaded and searched if the path exists, else built and saved; needs a single config
+    #[arg(long, env = "RETRIEVAL_INDEX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    index: Option<String>,
 }
 
 /// Stored quantization types, as `--data-type` spells them.
@@ -198,21 +202,11 @@ pub struct USearchBackend {
     keys: Vec<usearch::Key>,
     expansion_add: usize,
     expansion_search: usize,
-    description: String,
     metadata: HashMap<String, Value>,
 }
 
 fn failed(verb: &'static str) -> impl Fn(usearch::Error) -> String {
     move |error| format!("USearch {verb} failed with {}: {error}", error.status)
-}
-
-/// Views a bit-packed slab as `u1x8` rows, `dimensions` bits wide.
-fn bit_rows(bytes: &[u8], dimensions: usize) -> usearch::Result<MatrixView<'_, nk::u1x8>> {
-    // `u1x8` is a transparent `u8`, so the bytes are already its rows.
-    rows(
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) },
-        dimensions,
-    )
 }
 
 impl USearchBackend {
@@ -242,22 +236,16 @@ impl USearchBackend {
 
     /// Opens a saved `.safegraphs` monolith or `.safegraphs.json` manifest, whose header carries the
     /// geometry, metric, quantization and connectivity; only the search expansion is the caller's.
-    pub fn load(
-        handle: &str,
-        expansion_search: usize,
-        threads: Threads,
-        memory_domains: &[i32],
-    ) -> Result<Self, String> {
+    pub fn load(path: &str, expansion_search: usize, threads: Threads, memory_domains: &[i32]) -> Result<Self, String> {
         let executor = Executor::for_ram(memory_domains, threads.0.get(), 0).map_err(failed("for_ram"))?;
         let index = DenseIndex::load_ram(DenseLoadRamConfig {
             executor: Some(&executor),
             memory_domains,
-            ..DenseLoadRamConfig::from(handle)
+            ..DenseLoadRamConfig::from(path)
         })
         .map_err(failed("load_ram"))?;
         let mut backend = Self::wrap(index, executor, 0, expansion_search, threads, memory_domains)?;
-        backend.metadata.insert("loaded_from".into(), json!(handle));
-        write!(backend.description, " · loaded[{handle}]").expect("a String takes any write");
+        backend.metadata.insert("loaded_from".into(), json!(path));
         Ok(backend)
     }
 
@@ -273,13 +261,6 @@ impl USearchBackend {
         let metadata = described.metadata;
         let (metric, quantization, connectivity) = (metadata.metric, metadata.quantization, metadata.connectivity);
         eprintln!("  dispatch[{quantization}/{metric}]: {}", described.capabilities);
-
-        let mut description = format!(
-            "usearch · {quantization} · {metric} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"
-        );
-        if !memory_domains.is_empty() {
-            write!(description, " · domains {}", spell_list(memory_domains)).expect("a String takes any write");
-        }
         let metadata = HashMap::from([
             ("backend".into(), json!("usearch")),
             ("library_version".into(), json!(usearch::version())),
@@ -301,27 +282,22 @@ impl USearchBackend {
             keys: Vec::new(),
             expansion_add,
             expansion_search,
-            description,
             metadata,
         })
     }
 
-    fn insert<Value: Element>(&self, vectors: usearch::Result<MatrixView<'_, Value>>) -> usearch::Result<()> {
+    fn insert<Value: Element>(&self, vectors: nk::MatrixView<'_, Value>) -> usearch::Result<()> {
         self.index.on(&self.executor).insert(
             &self.keys,
             DenseInsertConfig {
                 expansion_factor: self.expansion_add,
-                ..DenseInsertConfig::from(vectors?)
+                ..DenseInsertConfig::from(vectors)
             },
         )
     }
 }
 
 impl Backend for USearchBackend {
-    fn description(&self) -> String {
-        self.description.clone()
-    }
-
     fn metadata(&self) -> HashMap<String, Value> {
         self.metadata.clone()
     }
@@ -332,52 +308,40 @@ impl Backend for USearchBackend {
             .extend(keys.iter().map(|&key| usearch::Key::from(u64::from(key))));
         let size = self.index.describe().map_err(failed("describe"))?.size;
         self.index.reserve(size + keys.len()).map_err(failed("reserve"))?;
-        let dimensions = vectors.dimensions;
-        match vectors.data {
-            VectorSlice::F32(data) => self.insert(rows(data, dimensions)),
-            VectorSlice::I8(data) => self.insert(rows(data, dimensions)),
-            VectorSlice::U8(data) => self.insert(rows(data, dimensions)),
-            VectorSlice::B1x8(data) => self.insert(bit_rows(data, dimensions)),
+        match vectors {
+            Vectors::F32(view) => self.insert(view),
+            Vectors::I8(view) => self.insert(view),
+            Vectors::U8(view) => self.insert(view),
+            Vectors::B1x8(view) => self.insert(view),
         }
         .map_err(failed("insert"))
     }
 
-    fn search(
-        &mut self,
-        queries: Vectors,
-        count: usize,
-        out_keys: &mut [Key],
-        out_distances: &mut [Distance],
-        out_counts: &mut [usize],
-    ) -> Result<(), String> {
+    fn search(&mut self, queries: Vectors, mut hits: Hits<'_>) -> Result<(), String> {
         let config = DenseSearchConfig {
             expansion_factor: self.expansion_search,
-            ..DenseSearchConfig::from(count)
+            ..DenseSearchConfig::from(hits.count())
         };
         let receiver = self.index.on(&self.executor);
         let arena = &mut self.arena;
-        let dimensions = queries.dimensions;
-        let matches = match queries.data {
-            VectorSlice::F32(data) => rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
-            VectorSlice::I8(data) => rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
-            VectorSlice::U8(data) => rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
-            VectorSlice::B1x8(data) => bit_rows(data, dimensions).and_then(|view| receiver.search(view, config, arena)),
+        let matches = match queries {
+            Vectors::F32(view) => receiver.search(view, config, arena),
+            Vectors::I8(view) => receiver.search(view, config, arena),
+            Vectors::U8(view) => receiver.search(view, config, arena),
+            Vectors::B1x8(view) => receiver.search(view, config, arena),
         }
         .map_err(failed("search"))?;
 
-        let rows = matches.rows().map_err(failed("search"))?;
-        let outputs = out_keys
-            .chunks_exact_mut(count)
-            .zip(out_distances.chunks_exact_mut(count));
-        for ((row, (keys, distances)), found) in rows.zip(outputs).zip(out_counts.iter_mut()) {
+        for (found, row) in matches.rows().map_err(failed("search"))?.zip(hits.rows()) {
             // Every key this harness inserts is a `Key` widened to 64 bits, so it narrows back losslessly.
-            let hits = row.keys.iter().zip(row.distances).map(|(&key, &distance)| {
-                (
-                    u64::try_from(key).map_or(Key::MAX, |key| key as Key),
-                    distance as Distance,
-                )
-            });
-            *found = write_row(hits, keys, distances);
+            let narrowed = |key: &usearch::Key| u64::try_from(*key).map_or(Key::MAX, |key| key as Key);
+            row.write(
+                found
+                    .keys
+                    .iter()
+                    .zip(found.distances)
+                    .map(|(key, &distance)| Ok((narrowed(key), distance as Distance))),
+            )?;
         }
         Ok(())
     }
@@ -390,8 +354,8 @@ impl Backend for USearchBackend {
         self.index.describe().ok().map(|described| described.size)
     }
 
-    fn save(&self, handle: &str) -> Result<(), String> {
-        self.index.on(&self.executor).save(handle).map_err(failed("save"))
+    fn save(&self, path: &str) -> Result<(), String> {
+        self.index.on(&self.executor).save(path).map_err(failed("save"))
     }
 }
 
@@ -413,19 +377,7 @@ fn main() {
     eprintln!("- Memory domains: {}", spell_list(&cli.memory_domains));
     eprintln!("- Threads: {}", spell_list(&cli.threads));
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
-
-    cli.common.ensure_single_config(&[
-        dimensions_sweep.len(),
-        cli.data_type.len(),
-        cli.metric.len(),
-        cli.connectivity.len(),
-        cli.expansion_add.len(),
-        cli.expansion_search.len(),
-        cli.threads.len(),
-    ]);
-
-    let mut summary = SweepSummary::default();
-    for (dimensions, data_type, metric, connectivity, expansion_add, expansion_search, threads) in itertools::iproduct!(
+    let configs = itertools::iproduct!(
         &dimensions_sweep,
         &cli.data_type,
         &cli.metric,
@@ -433,35 +385,35 @@ fn main() {
         &cli.expansion_add,
         &cli.expansion_search,
         &cli.threads
-    ) {
-        state.check_dimensions(*dimensions).unwrap_or_bail("invalid --dims");
+    );
+    let index_file = IndexFile::new(cli.index.as_deref(), configs.clone().count());
+    eprintln!("- Index: {index_file}");
 
-        let description = format!(
+    let mut summary = SweepSummary::default();
+    for (&dimensions, &data_type, &metric, &connectivity, &expansion_add, &expansion_search, &threads) in configs {
+        let mut description = format!(
             "usearch · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"
         );
-
-        summary.record(run_config(
-            &description,
-            cli.common.index.as_deref(),
-            || {
-                USearchBackend::new(
-                    IndexConfig {
-                        dimensions: *dimensions,
-                        data_type: *data_type,
-                        metric: *metric,
-                        connectivity: *connectivity,
-                        expansion_add: *expansion_add,
-                        expansion_search: *expansion_search,
-                    },
-                    *threads,
-                    &cli.memory_domains,
-                )
-            },
-            |handle| USearchBackend::load(handle, *expansion_search, *threads, &cli.memory_domains),
-            &mut state,
-            *dimensions,
-        ));
+        if !cli.memory_domains.is_empty() {
+            write!(description, " · domains {}", spell_list(&cli.memory_domains)).expect("a String takes any write");
+        }
+        let backend = match index_file {
+            IndexFile::Load(path) => USearchBackend::load(path, expansion_search, threads, &cli.memory_domains),
+            IndexFile::None | IndexFile::Save(_) => USearchBackend::new(
+                IndexConfig {
+                    dimensions,
+                    data_type,
+                    metric,
+                    connectivity,
+                    expansion_add,
+                    expansion_search,
+                },
+                threads,
+                &cli.memory_domains,
+            ),
+        };
+        summary.record(run_config(&description, index_file, backend, &mut state, dimensions));
     }
 
-    summary.print();
+    summary.finish();
 }

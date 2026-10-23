@@ -30,8 +30,8 @@ use itertools::iproduct;
 use serde_json::{json, Value};
 
 use retrieval::{
-    bail, docker::ContainerHandle, spell_duration, spell_list, try_run_config, Backend, BenchState, CommonArgs,
-    Distance, Key, Port, SweepSummary, UnwrapOrBail, VectorSlice, Vectors,
+    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BenchState, CommonArgs, Distance, Hits,
+    IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const IMAGE: &str = "surrealdb/surrealdb:v3.3.0";
@@ -138,32 +138,31 @@ impl SurrealServer {
                 "root".into(),
                 "memory".into(),
             ],
-            timeout,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
         let base = format!("http://127.0.0.1:{port}");
         let setup = async {
             container
                 .wait_for_http(&format!("{base}/health"), timeout)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
             let http = reqwest::Client::builder()
                 .timeout(timeout)
                 .build()
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
             let response: Value = http
                 .post(format!("{base}/signin"))
                 .header("Accept", "application/json")
                 .json(&json!({"user":"root","pass":"root"}))
                 .send()
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|error| error.to_string())?
                 .error_for_status()
-                .map_err(|e| e.to_string())?
+                .map_err(|error| error.to_string())?
                 .json()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
             let token = response
                 .get("token")
                 .and_then(Value::as_str)
@@ -198,7 +197,7 @@ impl SurrealServer {
             .body(sql.to_owned())
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!(
@@ -206,7 +205,7 @@ impl SurrealServer {
                 response.text().await.unwrap_or_default()
             ));
         }
-        let body: Value = response.json().await.map_err(|e| e.to_string())?;
+        let body: Value = response.json().await.map_err(|error| error.to_string())?;
         let statements = body.as_array().ok_or("SurrealDB SQL response is not an array")?;
         for statement in statements {
             if statement.get("status").and_then(Value::as_str) != Some("OK") {
@@ -228,7 +227,7 @@ fn uses_hnsw(plan: &Value) -> bool {
             fields.get("operator").and_then(Value::as_str) == Some("KnnScan")
                 && fields
                     .get("attributes")
-                    .and_then(|v| v.get("index"))
+                    .and_then(|attributes| attributes.get("index"))
                     .and_then(Value::as_str)
                     == Some(INDEX)
                 || fields.values().any(uses_hnsw)
@@ -238,7 +237,8 @@ fn uses_hnsw(plan: &Value) -> bool {
     }
 }
 fn append_search(sql: &mut String, row: &[f32], count: usize, expansion: usize) {
-    write!(sql,"SELECT idx, vector::distance::knn() AS distance FROM bench WHERE embedding <|{count},{expansion}|> {row:?} ORDER BY distance").unwrap();
+    write!(sql, "SELECT idx, vector::distance::knn() AS distance FROM bench WHERE embedding <|{count},{expansion}|> {row:?} ORDER BY distance")
+        .expect("a String takes any write");
 }
 
 struct SurrealBackend<'a> {
@@ -246,8 +246,6 @@ struct SurrealBackend<'a> {
     scratch: Vec<f32, System>,
     sql: String,
     expansion_search: usize,
-    indexed: usize,
-    description: String,
     metadata: HashMap<String, Value>,
 }
 impl<'a> SurrealBackend<'a> {
@@ -261,7 +259,7 @@ impl<'a> SurrealBackend<'a> {
         batch_capacity: usize,
     ) -> Result<Self, String> {
         let distance = metric.token();
-        let schema=format!("DEFINE NAMESPACE IF NOT EXISTS retrieval; DEFINE DATABASE IF NOT EXISTS benchmark; REMOVE TABLE IF EXISTS bench; DEFINE TABLE bench SCHEMALESS; DEFINE INDEX {INDEX} ON bench FIELDS embedding HNSW DIMENSION {dimensions} TYPE F32 DIST {distance} EFC {expansion_add} M {connectivity};");
+        let schema = format!("DEFINE NAMESPACE IF NOT EXISTS retrieval; DEFINE DATABASE IF NOT EXISTS benchmark; REMOVE TABLE IF EXISTS bench; DEFINE TABLE bench SCHEMALESS; DEFINE INDEX {INDEX} ON bench FIELDS embedding HNSW DIMENSION {dimensions} TYPE F32 DIST {distance} EFC {expansion_add} M {connectivity};");
         server.runtime.block_on(server.query(&schema))?;
         let mut probe = Vec::with_capacity_in(dimensions, System);
         probe.resize(dimensions, 1.0);
@@ -276,159 +274,131 @@ impl<'a> SurrealBackend<'a> {
             .checked_mul(batch_capacity)
             .ok_or("SurrealDB batch dimensions exceed address space")?;
         let mut scratch = Vec::new_in(System);
-        scratch.try_reserve(elements).map_err(|e| e.to_string())?;
+        scratch.try_reserve(elements).map_err(|error| error.to_string())?;
         let bytes = sql_body_capacity(dimensions, batch_capacity)?;
-        query.try_reserve(bytes).map_err(|e| e.to_string())?;
+        query.try_reserve(bytes).map_err(|error| error.to_string())?;
         Ok(Self {
-            server,scratch,sql:query,expansion_search,indexed:0,
-            description:format!("surrealdb · {metric} · F32 HNSW · M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"),
-            metadata:HashMap::from([
-                ("backend".into(),json!("surrealdb")),("image".into(),json!(IMAGE)),("metric".into(),json!(metric.to_string())),
-                ("data_type".into(),json!("f32")),("index".into(),json!("HNSW")),("connectivity".into(),json!(connectivity)),
-                ("expansion_add".into(),json!(expansion_add)),("expansion_search".into(),json!(expansion_search)),
-                ("sql_body_limit_bytes".into(),json!(server.sql_body_limit)),
-                ("index_plan_verified".into(),json!(true)),("storage".into(),json!("memory")),
-                ("batch_add".into(),json!("native INSERT array")),("batch_search".into(),json!("SQL statements pipelined in one HTTP request")),
+            server,
+            scratch,
+            sql: query,
+            expansion_search,
+            metadata: HashMap::from([
+                ("backend".into(), json!("surrealdb")),
+                ("image".into(), json!(IMAGE)),
+                ("metric".into(), json!(metric.to_string())),
+                ("data_type".into(), json!("f32")),
+                ("index".into(), json!("HNSW")),
+                ("connectivity".into(), json!(connectivity)),
+                ("expansion_add".into(), json!(expansion_add)),
+                ("expansion_search".into(), json!(expansion_search)),
+                ("sql_body_limit_bytes".into(), json!(server.sql_body_limit)),
+                ("index_plan_verified".into(), json!(true)),
+                ("storage".into(), json!("memory")),
+                ("batch_add".into(), json!("native INSERT array")),
+                (
+                    "batch_search".into(),
+                    json!("SQL statements pipelined in one HTTP request"),
+                ),
             ]),
         })
     }
 }
 impl Backend for SurrealBackend<'_> {
-    fn description(&self) -> String {
-        self.description.clone()
-    }
     fn metadata(&self) -> HashMap<String, Value> {
         self.metadata.clone()
     }
+
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        if matches!(vectors.data, VectorSlice::B1x8(_)) {
-            return Err("SurrealDB HNSW requires numeric vectors".into());
-        }
-        let values = vectors.data.to_f32_in(&mut self.scratch)?;
-        if vectors.dimensions == 0
-            || Some(values.len()) != keys.len().checked_mul(vectors.dimensions)
-            || values.iter().any(|v| !v.is_finite())
-        {
-            return Err("invalid SurrealDB input vectors".into());
-        }
-        if keys.is_empty() {
-            return Ok(());
+        let dimensions = vectors.dimensions();
+        let values = vectors.to_f32_in(&mut self.scratch)?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("SurrealDB requires finite vectors".into());
         }
         self.sql.clear();
         self.sql.push_str("INSERT INTO bench [");
-        for (index, (row, key)) in values.chunks_exact(vectors.dimensions).zip(keys).enumerate() {
-            if index != 0 {
-                self.sql.push(',');
-            }
-            write!(self.sql, "{{id:bench:{key},idx:{key},embedding:{row:?}}}").unwrap();
+        for (index, (row, key)) in values.chunks_exact(dimensions).zip(keys).enumerate() {
+            let separator = if index == 0 { "" } else { "," };
+            write!(self.sql, "{separator}{{id:bench:{key},idx:{key},embedding:{row:?}}}")
+                .expect("a String takes any write");
         }
         self.sql.push_str("] RETURN VALUE idx;");
         let response = self.server.runtime.block_on(self.server.query(&self.sql))?;
         let inserted = response
-            .get(0)
-            .and_then(|v| v.get("result"))
+            .pointer("/0/result")
             .and_then(Value::as_array)
             .ok_or("missing SurrealDB insert results")?;
-        if inserted.len() != keys.len() {
-            return Err("SurrealDB insert count mismatch".into());
+        match inserted.len() == keys.len() {
+            true => Ok(()),
+            false => Err("SurrealDB insert count mismatch".into()),
         }
-        self.indexed += keys.len();
-        Ok(())
     }
-    fn search(
-        &mut self,
-        queries: Vectors,
-        count: usize,
-        out_keys: &mut [Key],
-        out_distances: &mut [Distance],
-        out_counts: &mut [usize],
-    ) -> Result<(), String> {
-        if matches!(queries.data, VectorSlice::B1x8(_)) {
-            return Err("SurrealDB HNSW requires numeric vectors".into());
-        }
-        let values = queries.data.to_f32_in(&mut self.scratch)?;
-        if queries.dimensions == 0
-            || !values.len().is_multiple_of(queries.dimensions)
-            || values.iter().any(|v| !v.is_finite())
-        {
-            return Err("invalid SurrealDB queries".into());
-        }
-        let rows = values.len() / queries.dimensions;
-        if count == 0
-            || out_counts.len() != rows
-            || Some(out_keys.len()) != rows.checked_mul(count)
-            || Some(out_distances.len()) != rows.checked_mul(count)
-        {
-            return Err("invalid SurrealDB output buffer shape".into());
-        }
-        if rows == 0 {
-            return Ok(());
+
+    fn search(&mut self, queries: Vectors, mut hits: Hits<'_>) -> Result<(), String> {
+        let count = hits.count();
+        let dimensions = queries.dimensions();
+        let values = queries.to_f32_in(&mut self.scratch)?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("SurrealDB requires finite queries".into());
         }
         self.sql.clear();
-        for row in values.chunks_exact(queries.dimensions) {
+        for row in values.chunks_exact(dimensions) {
             append_search(&mut self.sql, row, count, self.expansion_search);
             self.sql.push(';');
         }
         let response = self.server.runtime.block_on(self.server.query(&self.sql))?;
         let statements = response.as_array().ok_or("missing SurrealDB query results")?;
-        if statements.len() != rows {
+        if statements.len() != queries.len() {
             return Err("SurrealDB query result count mismatch".into());
         }
-        for (index, statement) in statements.iter().enumerate() {
-            let hits = statement
+        for (statement, row) in statements.iter().zip(hits.rows()) {
+            let neighbors = statement
                 .get("result")
                 .and_then(Value::as_array)
                 .ok_or("invalid SurrealDB neighbors")?;
-            if hits.len() > count {
-                return Err("SurrealDB returned too many neighbors".into());
-            }
-            let keys = &mut out_keys[index * count..(index + 1) * count];
-            let distances = &mut out_distances[index * count..(index + 1) * count];
-            keys.fill(Key::MAX);
-            distances.fill(Distance::INFINITY);
-            for (rank, hit) in hits.iter().enumerate() {
-                let key = hit
+            row.write(neighbors.iter().enumerate().map(|(rank, neighbor)| {
+                let key = neighbor
                     .get("idx")
                     .and_then(Value::as_u64)
                     .and_then(|key| Key::try_from(key).ok())
                     .ok_or("invalid SurrealDB neighbor key")?;
-                let distance = hit
+                let distance = neighbor
                     .get("distance")
                     .and_then(Value::as_f64)
-                    .ok_or("invalid SurrealDB neighbor distance")? as Distance;
-                if !distance.is_finite() || keys[..rank].contains(&key) {
-                    return Err("invalid or duplicate SurrealDB neighbor".into());
+                    .map(|distance| distance as Distance)
+                    .filter(|distance| distance.is_finite())
+                    .ok_or("invalid SurrealDB neighbor distance")?;
+                if neighbors[..rank]
+                    .iter()
+                    .any(|earlier| earlier.get("idx") == neighbor.get("idx"))
+                {
+                    return Err("duplicate SurrealDB neighbor".into());
                 }
-                keys[rank] = key;
-                distances[rank] = distance;
-            }
-            out_counts[index] = hits.len();
+                Ok((key, distance))
+            }))?;
         }
         Ok(())
     }
+
     fn memory_bytes(&self) -> usize {
         self.server.runtime.block_on(self.server.container.memory_usage_bytes()) as usize
-    }
-    fn indexed_count(&self) -> Option<usize> {
-        Some(self.indexed)
     }
 }
 
 /// Reject argument combinations SurrealDB will refuse, before a container is started.
 fn validate(cli: &Cli) -> Result<(), String> {
-    for &connectivity in &cli.connectivity {
-        if connectivity < 2 {
+    if let Some(&connectivity) = cli.connectivity.iter().find(|&&connectivity| connectivity < 2) {
+        return Err(format!(
+            "--connectivity {connectivity} is below the 2 SurrealDB's HNSW needs"
+        ));
+    }
+    let smallest_expansion = cli.expansion_add.iter().min();
+    let largest_connectivity = cli.connectivity.iter().max();
+    if let (Some(&expansion_add), Some(&connectivity)) = (smallest_expansion, largest_connectivity) {
+        if expansion_add < connectivity {
             return Err(format!(
-                "--connectivity {connectivity} is below the 2 SurrealDB's HNSW needs"
+                "--expansion-add {expansion_add} is below --connectivity {connectivity}; \
+                 SurrealDB cannot build a graph with fewer candidates than edges"
             ));
-        }
-        for &expansion_add in &cli.expansion_add {
-            if expansion_add < connectivity {
-                return Err(format!(
-                    "--expansion-add {expansion_add} is below --connectivity {connectivity}; \
-                     SurrealDB cannot build a graph with fewer candidates than edges"
-                ));
-            }
         }
     }
     Ok(())
@@ -437,11 +407,6 @@ fn validate(cli: &Cli) -> Result<(), String> {
 fn main() {
     let cli: Cli = retrieval::parse_cli();
     validate(&cli).unwrap_or_bail("invalid arguments");
-
-    if cli.common.index.is_some() {
-        bail("--index is not supported for this backend");
-    }
-
     let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     eprintln!("- Metrics: {}", spell_list(&cli.metric));
     eprintln!("- Connectivity: {}", spell_list(&cli.connectivity));
@@ -449,12 +414,9 @@ fn main() {
     eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
     eprintln!("- Startup time limit: {}", spell_duration(cli.startup_time_limit));
     eprintln!("- Port: {}", cli.port);
-    let dimensions = cli.common.dimensions_sweep(state.dimensions());
-    for &dimension in &dimensions {
-        state.check_dimensions(dimension).unwrap_or_bail("invalid --dims");
-    }
+    let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
     let rows_per_request = cli.common.inserts_per_core.max(cli.common.queries_per_core);
-    let widest = dimensions
+    let widest = dimensions_sweep
         .iter()
         .copied()
         .max()
@@ -463,7 +425,7 @@ fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("tokio");
+        .unwrap_or_bail("tokio runtime");
     let server = runtime
         .block_on(SurrealServer::start(
             runtime.handle().clone(),
@@ -474,14 +436,15 @@ fn main() {
         .unwrap_or_bail("SurrealDB start");
     let mut summary = SweepSummary::default();
     for (&dimensions, &metric, &connectivity, &expansion_add, &expansion_search) in iproduct!(
-        &dimensions,
+        &dimensions_sweep,
         &cli.metric,
         &cli.connectivity,
         &cli.expansion_add,
         &cli.expansion_search
     ) {
-        let description =
-            format!("surrealdb · {metric} · M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d");
+        let description = format!(
+            "surrealdb · {metric} · F32 HNSW · M={connectivity} · ef={expansion_add}/{expansion_search} · {dimensions}d"
+        );
         let backend = SurrealBackend::new(
             &server,
             dimensions,
@@ -491,13 +454,16 @@ fn main() {
             expansion_search,
             rows_per_request,
         );
-        summary.record(try_run_config(&description, backend, &mut state, dimensions));
+        summary.record(run_config(
+            &description,
+            IndexFile::None,
+            backend,
+            &mut state,
+            dimensions,
+        ));
     }
-    summary.print();
-    if summary.failed != 0 || summary.ran == 0 {
-        drop(server);
-        bail("SurrealDB sweep did not complete successfully");
-    }
+    drop(server);
+    summary.finish();
 }
 
 #[cfg(test)]

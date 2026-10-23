@@ -74,8 +74,8 @@ use numkong as nk;
 use serde_json::json;
 
 use retrieval::{
-    run_config, spell_list, Backend, BenchState, CastScratch, CommonArgs, Distance, IndexConfig, Key, SweepSummary,
-    UnwrapOrBail, Vectors,
+    run_config, spell_list, Backend, BenchState, CastScratch, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key,
+    SweepSummary, UnwrapOrBail, Vectors,
 };
 
 // #region CudaAllocator
@@ -88,23 +88,25 @@ use retrieval::{
 struct CudaAllocator(cuvs_sys::cuvsResources_t);
 
 unsafe impl nk::Allocator for CudaAllocator {
-    fn allocate(&self, layout: std::alloc::Layout) -> Option<NonNull<u8>> {
+    fn allocate(&self, layout: std::alloc::Layout) -> Result<NonNull<[u8]>, nk::AllocError> {
         if layout.size() == 0 {
-            return Some(NonNull::dangling());
+            let dangling = NonNull::new(std::ptr::without_provenance_mut(layout.align())).ok_or(nk::AllocError)?;
+            return Ok(NonNull::slice_from_raw_parts(dangling, 0));
         }
-        unsafe {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let err = cuvs_sys::cuvsRMMAlloc(self.0, &mut ptr, layout.size());
-            if err != cuvs_sys::cuvsError_t::CUVS_SUCCESS || ptr.is_null() {
-                return None;
-            }
-            NonNull::new(ptr as *mut u8)
+        let mut pointer: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: RMM either writes a device pointer to `layout.size()` bytes or reports the failure.
+        let status = unsafe { cuvs_sys::cuvsRMMAlloc(self.0, &mut pointer, layout.size()) };
+        if status != cuvs_sys::cuvsError_t::CUVS_SUCCESS {
+            return Err(nk::AllocError);
         }
+        let pointer = NonNull::new(pointer.cast::<u8>()).ok_or(nk::AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(pointer, layout.size()))
     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: std::alloc::Layout) {
+    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: std::alloc::Layout) {
         if layout.size() > 0 {
-            let _ = cuvs_sys::cuvsRMMFree(self.0, ptr.as_ptr() as *mut std::ffi::c_void, layout.size());
+            // SAFETY: `pointer` came from `cuvsRMMAlloc` on these resources with this size.
+            let _ = unsafe { cuvs_sys::cuvsRMMFree(self.0, pointer.as_ptr().cast(), layout.size()) };
         }
     }
 }
@@ -118,7 +120,7 @@ type GpuTensor<T> = nk::Tensor<T, CudaAllocator>;
 /// The caller must keep the underlying data and `shape` alive for the
 /// lifetime of the returned struct.  `deleter` is always `None` — ownership
 /// stays with the caller (either a host buffer or a `GpuTensor`).
-unsafe fn dl_tensor(
+fn dl_tensor(
     data: *mut std::ffi::c_void,
     shape: *mut i64,
     ndim: i32,
@@ -160,15 +162,6 @@ pub enum CuvsDataType {
 }
 
 impl CuvsDataType {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::F32 => "f32",
-            Self::F16 => "f16",
-            Self::I8 => "i8",
-            Self::U8 => "u8",
-        }
-    }
-
     fn dl_type(self) -> cuvs_sys::DLDataType {
         let (code, bits) = match self {
             Self::F32 => (cuvs_sys::DLDataTypeCode::kDLFloat, 32),
@@ -210,21 +203,15 @@ fn dl_distance() -> cuvs_sys::DLDataType {
 
 // #region CagraIndex
 //
-// Local thin wrapper around `cuvs_sys::cuvsCagraIndex_t`. We can't use
-// `cuvs::cagra::Index` because its inner pointer field is private and the
-// crate exposes no `serialize` / `deserialize` methods (CAGRA save/load
-// landed in the C API but the Rust 26.4 wrapper hasn't surfaced it yet).
-// Building on cuvs-sys directly lets us reach `cuvsCagraSerialize` /
-// `cuvsCagraDeserialize` while keeping `IndexParams` / `SearchParams` from
-// the high-level crate (their `.0` fields are public).
+// Built on cuvs-sys, since `cuvs::cagra::Index` hides its pointer and exposes no serialize or deserialize.
 
 struct CagraIndex(cuvs_sys::cuvsCagraIndex_t);
 
-fn cuvs_check(err: cuvs_sys::cuvsError_t, ctx: &str) -> Result<(), String> {
-    if err == cuvs_sys::cuvsError_t::CUVS_SUCCESS {
+fn cuvs_check(status: cuvs_sys::cuvsError_t, context: &str) -> Result<(), String> {
+    if status == cuvs_sys::cuvsError_t::CUVS_SUCCESS {
         Ok(())
     } else {
-        Err(format!("{ctx}: cuvsError_t = {err:?}"))
+        Err(format!("{context}: cuvsError_t = {status:?}"))
     }
 }
 
@@ -244,13 +231,13 @@ impl CagraIndex {
     /// keeps `dataset_dl` alive for the duration of the call.
     fn build(
         &self,
-        res: &cuvs::Resources,
+        resources: &cuvs::Resources,
         params: cuvs_sys::cuvsCagraIndexParams_t,
         dataset_dl: *mut cuvs_sys::DLManagedTensor,
     ) -> Result<(), String> {
         unsafe {
             cuvs_check(
-                cuvs_sys::cuvsCagraBuild(res.0, params, dataset_dl, self.0),
+                cuvs_sys::cuvsCagraBuild(resources.0, params, dataset_dl, self.0),
                 "cuvsCagraBuild",
             )
         }
@@ -259,8 +246,8 @@ impl CagraIndex {
     /// Search the index. All three tensors must reference live memory
     /// (typically GPU buffers wrapped in `DLManagedTensor` views).
     fn search(
-        &mut self,
-        res: &cuvs::Resources,
+        &self,
+        resources: &cuvs::Resources,
         params: cuvs_sys::cuvsCagraSearchParams_t,
         queries: *mut cuvs_sys::DLManagedTensor,
         neighbors: *mut cuvs_sys::DLManagedTensor,
@@ -272,27 +259,28 @@ impl CagraIndex {
         };
         unsafe {
             cuvs_check(
-                cuvs_sys::cuvsCagraSearch(res.0, params, self.0, queries, neighbors, distances, prefilter),
+                cuvs_sys::cuvsCagraSearch(resources.0, params, self.0, queries, neighbors, distances, prefilter),
                 "cuvsCagraSearch",
             )
         }
     }
 
-    fn serialize(&self, res: &cuvs::Resources, path: &str, include_dataset: bool) -> Result<(), String> {
-        let c_path = std::ffi::CString::new(path).map_err(|e| format!("path contains NUL: {e}"))?;
+    /// Saves the graph with its dataset, so a load needs nothing else.
+    fn serialize(&self, resources: &cuvs::Resources, path: &str) -> Result<(), String> {
+        let path_cstring = std::ffi::CString::new(path).map_err(|error| format!("path contains NUL: {error}"))?;
         unsafe {
             cuvs_check(
-                cuvs_sys::cuvsCagraSerialize(res.0, c_path.as_ptr(), self.0, include_dataset),
+                cuvs_sys::cuvsCagraSerialize(resources.0, path_cstring.as_ptr(), self.0, true),
                 "cuvsCagraSerialize",
             )
         }
     }
 
-    fn deserialize(&self, res: &cuvs::Resources, path: &str) -> Result<(), String> {
-        let c_path = std::ffi::CString::new(path).map_err(|e| format!("path contains NUL: {e}"))?;
+    fn deserialize(&self, resources: &cuvs::Resources, path: &str) -> Result<(), String> {
+        let path_cstring = std::ffi::CString::new(path).map_err(|error| format!("path contains NUL: {error}"))?;
         unsafe {
             cuvs_check(
-                cuvs_sys::cuvsCagraDeserialize(res.0, c_path.as_ptr(), self.0),
+                cuvs_sys::cuvsCagraDeserialize(resources.0, path_cstring.as_ptr(), self.0),
                 "cuvsCagraDeserialize",
             )
         }
@@ -302,8 +290,7 @@ impl CagraIndex {
 impl Drop for CagraIndex {
     fn drop(&mut self) {
         unsafe {
-            // Ignore destroy errors during drop — there's nothing useful to do
-            // and the Rust crate does the same dance.
+            // Drop cannot report a failed destroy.
             let _ = cuvs_sys::cuvsCagraIndexDestroy(self.0);
         }
     }
@@ -339,11 +326,11 @@ fn write_host_keys(path: &str, keys: &[Key], graph_degree: usize) -> Result<(), 
     for &key in keys {
         bytes.extend_from_slice(&key.to_le_bytes());
     }
-    std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))
+    std::fs::write(path, &bytes).map_err(|error| format!("write {path}: {error}"))
 }
 
 fn read_host_keys(path: &str) -> Result<(Vec<Key, std::alloc::System>, usize), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     if bytes.len() < KEYS_SIDECAR_HEADER_BYTES || &bytes[0..8] != KEYS_SIDECAR_MAGIC {
         return Err(format!(
             "{path}: not a versioned key sidecar — it predates graph-degree persistence, rebuild the index"
@@ -375,13 +362,14 @@ enum GpuQueries {
 
 impl GpuQueries {
     fn allocate(data_type: CuvsDataType, shape: &[usize], allocator: CudaAllocator) -> Result<Self, String> {
-        let error = |e| format!("GPU query alloc failed: {e}");
+        let error = |error| format!("GPU query alloc failed: {error}");
+        // SAFETY: device memory is only written by the H2D copies and cuVS, never read from the host.
         unsafe {
             Ok(match data_type {
-                CuvsDataType::F32 => Self::F32(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDataType::F16 => Self::F16(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDataType::I8 => Self::I8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
-                CuvsDataType::U8 => Self::U8(GpuTensor::try_empty_in(shape, allocator).map_err(error)?),
+                CuvsDataType::F32 => Self::F32(GpuTensor::uninitialized_in(shape, allocator).map_err(error)?),
+                CuvsDataType::F16 => Self::F16(GpuTensor::uninitialized_in(shape, allocator).map_err(error)?),
+                CuvsDataType::I8 => Self::I8(GpuTensor::uninitialized_in(shape, allocator).map_err(error)?),
+                CuvsDataType::U8 => Self::U8(GpuTensor::uninitialized_in(shape, allocator).map_err(error)?),
             })
         }
     }
@@ -415,8 +403,8 @@ struct SearchBuffers {
     neighbor_count: usize,
 
     queries_shape: [i64; 2],
-    neighbors_shape: [i64; 2],
-    distances_shape: [i64; 2],
+    /// The neighbors' and distances' shared `[queries, neighbor_count]` shape.
+    results_shape: [i64; 2],
 
     neighbors_host: Vec<Key, std::alloc::System>,
     distances_host: Vec<Distance, std::alloc::System>,
@@ -435,13 +423,17 @@ impl SearchBuffers {
         data_type: CuvsDataType,
         search_params: cuvs::cagra::SearchParams,
     ) -> Result<Self, String> {
-        let error = |e| format!("GPU alloc failed: {e}");
+        let error = |error| format!("GPU alloc failed: {error}");
         let queries = GpuQueries::allocate(data_type, &[capacity_queries, dimensions], allocator.clone())?;
+        let mut neighbors_host = Vec::with_capacity_in(capacity_queries * neighbor_count, std::alloc::System);
+        neighbors_host.resize(capacity_queries * neighbor_count, Key::default());
+        let mut distances_host = Vec::with_capacity_in(capacity_queries * neighbor_count, std::alloc::System);
+        distances_host.resize(capacity_queries * neighbor_count, Distance::default());
         let neighbors = unsafe {
-            GpuTensor::<Key>::try_empty_in(&[capacity_queries, neighbor_count], allocator.clone()).map_err(error)?
+            GpuTensor::<Key>::uninitialized_in(&[capacity_queries, neighbor_count], allocator.clone()).map_err(error)?
         };
         let distances = unsafe {
-            GpuTensor::<Distance>::try_empty_in(&[capacity_queries, neighbor_count], allocator).map_err(error)?
+            GpuTensor::<Distance>::uninitialized_in(&[capacity_queries, neighbor_count], allocator).map_err(error)?
         };
         Ok(Self {
             queries,
@@ -450,34 +442,24 @@ impl SearchBuffers {
             capacity_queries,
             neighbor_count,
             queries_shape: [capacity_queries as i64, dimensions as i64],
-            neighbors_shape: [capacity_queries as i64, neighbor_count as i64],
-            distances_shape: [capacity_queries as i64, neighbor_count as i64],
-            neighbors_host: {
-                let mut v = Vec::new_in(std::alloc::System);
-                v.resize(capacity_queries * neighbor_count, Key::default());
-                v
-            },
-            distances_host: {
-                let mut v = Vec::new_in(std::alloc::System);
-                v.resize(capacity_queries * neighbor_count, Distance::default());
-                v
-            },
+            results_shape: [capacity_queries as i64, neighbor_count as i64],
+            neighbors_host,
+            distances_host,
             search_params,
         })
     }
 
-    /// Whether this allocation can serve a `num_queries` × `neighbor_count` batch.
-    fn fits(&self, num_queries: usize, neighbor_count: usize) -> bool {
-        num_queries <= self.capacity_queries && neighbor_count == self.neighbor_count
+    /// Whether this allocation can serve a `query_count` × `neighbor_count` batch.
+    fn fits(&self, query_count: usize, neighbor_count: usize) -> bool {
+        query_count <= self.capacity_queries && neighbor_count == self.neighbor_count
     }
 
     /// Point the DLPack shapes at the current batch, leaving the allocation
     /// alone. Without this a trailing partial batch would keep the previous
     /// batch's row count and make CAGRA search stale rows.
-    fn set_batch_rows(&mut self, num_queries: usize) {
-        self.queries_shape[0] = num_queries as i64;
-        self.neighbors_shape[0] = num_queries as i64;
-        self.distances_shape[0] = num_queries as i64;
+    fn set_batch_rows(&mut self, query_count: usize) {
+        self.queries_shape[0] = query_count as i64;
+        self.results_shape[0] = query_count as i64;
     }
 }
 
@@ -543,6 +525,10 @@ struct Cli {
     /// Graph build algorithm.
     #[arg(long, env = "RETRIEVAL_BUILD_ALGO", value_enum, default_value = "auto")]
     build_algo: BuildAlgo,
+
+    /// Persisted index: loaded and searched if the path exists, else built and saved; needs a single config
+    #[arg(long, env = "RETRIEVAL_INDEX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    index: Option<String>,
 }
 
 /// Parses a positive count, or `auto` as `None` for cuVS's own choice.
@@ -632,13 +618,13 @@ impl fmt::Display for BuildAlgo {
 pub struct CuvsBackend {
     /// Input cast to `data_type` on the host, before it is appended or copied to the device.
     cast: CastScratch,
-    // GPU resources that depend on `res` are declared BEFORE `res`
-    // so they drop first (Rust drops fields in declaration order).
+    // GPU resources that depend on `resources` are declared BEFORE it, so they drop first.
     search_buffers: Option<SearchBuffers>,
+    /// The built graph, or `None` until the next search builds it from the host buffers.
     index: Option<CagraIndex>,
 
-    res: cuvs::Resources,
-    cuda_alloc: CudaAllocator,
+    resources: cuvs::Resources,
+    cuda_allocator: CudaAllocator,
     dimensions: usize,
     metric: DistanceType,
     data_type: CuvsDataType,
@@ -653,9 +639,7 @@ pub struct CuvsBackend {
 
     host_vectors: Vec<u8, std::alloc::System>,
     host_keys: Vec<Key, std::alloc::System>,
-    dirty: bool,
 
-    description: String,
     metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
@@ -676,57 +660,46 @@ impl CuvsBackend {
         let IndexConfig {
             dimensions,
             data_type,
-            metric: metric_name,
+            metric,
             connectivity,
             expansion_add,
             expansion_search,
         } = config;
         let CagraTuning {
-            build_algo: build_algo_name,
+            build_algo,
             search_width,
             min_iterations,
             max_iterations,
             num_random_samplings,
         } = tuning;
-
-        let metric = metric_name.into();
-        let build_algo = build_algo_name.into();
-        let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
-        let cuda_alloc = CudaAllocator(res.0);
-
-        let description = format!(
-            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} M={connectivity} \u{b7} \
-             ef={expansion_add}/{expansion_search} \u{b7} sw={}",
-            data_type.as_str(),
-            spell_count_or_auto(search_width),
-        );
-
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("backend".into(), json!("cuvs-cagra"));
-        metadata.insert("data_type".into(), json!(data_type.as_str()));
-        metadata.insert("metric".into(), json!(metric_name.to_string()));
-        metadata.insert("connectivity".into(), json!(connectivity));
-        metadata.insert("expansion_add".into(), json!(expansion_add));
-        metadata.insert("expansion_search".into(), json!(expansion_search));
-        // cuVS's own `0` for "choose for me", which keeps result hashes from before `auto`.
-        metadata.insert("search_width".into(), json!(search_width.unwrap_or(0)));
-        metadata.insert("build_algo".into(), json!(build_algo_name.to_string()));
-        metadata.insert("min_iterations".into(), json!(min_iterations.unwrap_or(0)));
-        metadata.insert("max_iterations".into(), json!(max_iterations.unwrap_or(0)));
-        metadata.insert("num_random_samplings".into(), json!(num_random_samplings.unwrap_or(0)));
-
+        let resources = cuvs::Resources::new().map_err(|error| format!("failed to create cuVS resources: {error}"))?;
+        let cuda_allocator = CudaAllocator(resources.0);
+        let metadata = std::collections::HashMap::from([
+            ("backend".into(), json!("cuvs-cagra")),
+            ("data_type".into(), json!(data_type.to_string())),
+            ("metric".into(), json!(metric.to_string())),
+            ("connectivity".into(), json!(connectivity)),
+            ("expansion_add".into(), json!(expansion_add)),
+            ("expansion_search".into(), json!(expansion_search)),
+            // cuVS's own `0` for "choose for me", which keeps result hashes from before `auto`.
+            ("search_width".into(), json!(search_width.unwrap_or(0))),
+            ("build_algo".into(), json!(build_algo.to_string())),
+            ("min_iterations".into(), json!(min_iterations.unwrap_or(0))),
+            ("max_iterations".into(), json!(max_iterations.unwrap_or(0))),
+            ("num_random_samplings".into(), json!(num_random_samplings.unwrap_or(0))),
+        ]);
         Ok(Self {
             cast: data_type.into(),
             search_buffers: None,
             index: None,
-            res,
-            cuda_alloc,
+            resources,
+            cuda_allocator,
             dimensions,
-            metric,
+            metric: metric.into(),
             data_type,
             connectivity,
             expansion_add,
-            build_algo,
+            build_algo: build_algo.into(),
             expansion_search,
             search_width,
             min_iterations,
@@ -734,93 +707,40 @@ impl CuvsBackend {
             num_random_samplings,
             host_vectors: Vec::new_in(std::alloc::System),
             host_keys: Vec::new_in(std::alloc::System),
-            dirty: false,
-            description,
             metadata,
         })
     }
 
-    /// Open a saved CAGRA index. CAGRA's deserializer reports no build params,
-    /// so the graph degree comes from the key sidecar written alongside the
-    /// index; `config`'s build-time fields are ignored on this path.
-    pub fn load(handle: &str, config: IndexConfig<CuvsDataType, Metric>, tuning: CagraTuning) -> Result<Self, String> {
-        let IndexConfig {
-            dimensions,
-            data_type,
-            metric: metric_name,
-            expansion_search,
-            ..
-        } = config;
-        let CagraTuning {
-            search_width,
-            min_iterations,
-            max_iterations,
-            num_random_samplings,
-            ..
-        } = tuning;
-
-        let metric = metric_name.into();
-        let res = cuvs::Resources::new().map_err(|e| format!("failed to create cuVS resources: {e}"))?;
-        let cuda_alloc = CudaAllocator(res.0);
-
+    /// Open a saved CAGRA index. CAGRA's deserializer reports no build params, so the graph degree
+    /// comes from the key sidecar written alongside the index, and the other build-time settings
+    /// are reported as null.
+    pub fn load(path: &str, config: IndexConfig<CuvsDataType, Metric>, tuning: CagraTuning) -> Result<Self, String> {
+        let mut backend = Self::new(config, tuning)?;
         let index = CagraIndex::new()?;
-        index.deserialize(&res, handle)?;
-        // The sidecar, not `config.connectivity`, is the authority here — it
-        // records what the index was actually built with.
-        let (host_keys, connectivity) = read_host_keys(&keys_sidecar_path(handle))?;
-
-        let description = format!(
-            "cuvs-cagra \u{b7} {} \u{b7} {metric_name} \u{b7} M={connectivity} \u{b7} ef={expansion_search} \u{b7} sw={} \u{b7} loaded[{handle}]",
-            data_type.as_str(),
-            spell_count_or_auto(search_width),
-        );
-
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("backend".into(), json!("cuvs-cagra"));
-        metadata.insert("data_type".into(), json!(data_type.as_str()));
-        metadata.insert("metric".into(), json!(metric_name.to_string()));
-        metadata.insert("connectivity".into(), json!(connectivity));
-        metadata.insert("expansion_search".into(), json!(expansion_search));
-        metadata.insert("search_width".into(), json!(search_width.unwrap_or(0)));
-        metadata.insert("loaded_from".into(), json!(handle));
-        // Build-time knobs the serialized index does not carry. `connectivity`
-        // escapes this because the key sidecar records it.
-        metadata.insert("expansion_add".into(), serde_json::Value::Null);
-        metadata.insert("build_algo".into(), serde_json::Value::Null);
-        metadata.insert("min_iterations".into(), serde_json::Value::Null);
-        metadata.insert("max_iterations".into(), serde_json::Value::Null);
-        metadata.insert("num_random_samplings".into(), serde_json::Value::Null);
-
-        Ok(Self {
-            cast: data_type.into(),
-            search_buffers: None,
-            index: Some(index),
-            res,
-            cuda_alloc,
-            dimensions,
-            metric,
-            data_type,
-            connectivity,
-            expansion_add: 0,
-            build_algo: cuvs_sys::cuvsCagraGraphBuildAlgo::AUTO_SELECT,
-            expansion_search,
-            search_width,
-            min_iterations,
-            max_iterations,
-            num_random_samplings,
-            host_vectors: Vec::new_in(std::alloc::System),
-            host_keys,
-            dirty: false,
-            description,
-            metadata,
-        })
+        index.deserialize(&backend.resources, path)?;
+        let (host_keys, connectivity) = read_host_keys(&keys_sidecar_path(path))?;
+        backend.index = Some(index);
+        backend.host_keys = host_keys;
+        backend.connectivity = connectivity;
+        backend.metadata.insert("connectivity".into(), json!(connectivity));
+        backend.metadata.insert("loaded_from".into(), json!(path));
+        for unknown in [
+            "expansion_add",
+            "build_algo",
+            "min_iterations",
+            "max_iterations",
+            "num_random_samplings",
+        ] {
+            backend.metadata.insert(unknown.into(), serde_json::Value::Null);
+        }
+        Ok(backend)
     }
 
     /// Create search params once, reused across all search calls.
     fn build_search_params(&self, neighbor_count: usize) -> Result<cuvs::cagra::SearchParams, String> {
         let effective_itopk = self.expansion_search.max(neighbor_count);
         let params = cuvs::cagra::SearchParams::new()
-            .map_err(|e| format!("search params: {e}"))?
+            .map_err(|error| format!("search params: {error}"))?
             .set_itopk_size(effective_itopk);
         unsafe {
             let raw = params.0;
@@ -840,205 +760,181 @@ impl CuvsBackend {
         Ok(params)
     }
 
-    /// Build (or rebuild) the CAGRA index from accumulated host buffers.
+    /// Build the CAGRA index from the accumulated host buffers.
     fn build_index(&mut self) -> Result<(), String> {
-        let num_vectors = self.host_keys.len();
+        let vector_count = self.host_keys.len();
         let dimensions = self.dimensions;
-        let mut shape = [num_vectors as i64, dimensions as i64];
+        let mut shape = [vector_count as i64, dimensions as i64];
 
-        let mut host_dl = unsafe {
-            dl_tensor(
-                self.host_vectors.as_ptr() as *mut _,
-                shape.as_mut_ptr(),
-                2,
-                self.data_type.dl_type(),
-                false,
-            )
-        };
+        let mut host_dl = dl_tensor(
+            self.host_vectors.as_ptr() as *mut _,
+            shape.as_mut_ptr(),
+            2,
+            self.data_type.dl_type(),
+            false,
+        );
 
         let build_params = cuvs::cagra::IndexParams::new()
-            .map_err(|e| format!("failed to create CAGRA index params: {e}"))?
+            .map_err(|error| format!("failed to create CAGRA index params: {error}"))?
             .set_graph_degree(self.connectivity)
             .set_intermediate_graph_degree(self.expansion_add)
             .set_build_algo(self.build_algo);
         unsafe { (*build_params.0).metric = self.metric };
 
         let index = CagraIndex::new()?;
-        index.build(&self.res, build_params.0, &mut host_dl)?;
-
+        index.build(&self.resources, build_params.0, &mut host_dl)?;
         self.index = Some(index);
-        self.dirty = false;
         Ok(())
     }
 
     /// Copy device tensor to a pre-allocated host slice, synchronising the stream.
-    unsafe fn device_to_host<T>(res: &cuvs::Resources, device_ptr: *const T, host: &mut [T]) -> Result<(), String> {
+    unsafe fn device_to_host<T>(
+        resources: &cuvs::Resources,
+        device_ptr: *const T,
+        host: &mut [T],
+    ) -> Result<(), String> {
         let bytes = std::mem::size_of_val(host);
-        let stream = res.get_cuda_stream().map_err(|e| format!("{e}"))?;
-        let err = cuvs_sys::cudaMemcpyAsync(
+        let stream = resources.get_cuda_stream().map_err(|error| format!("{error}"))?;
+        let status = cuvs_sys::cudaMemcpyAsync(
             host.as_mut_ptr() as *mut _,
             device_ptr as *const _,
             bytes,
             cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
             stream,
         );
-        if err != cuvs_sys::cudaError::cudaSuccess {
-            return Err(format!("cudaMemcpyAsync D2H failed: {err:?}"));
+        if status != cuvs_sys::cudaError::cudaSuccess {
+            return Err(format!("cudaMemcpyAsync D2H failed: {status:?}"));
         }
-        res.sync_stream().map_err(|e| format!("{e}"))
+        resources.sync_stream().map_err(|error| format!("{error}"))
     }
 
     /// Copy host bytes to a pre-allocated device pointer.
     unsafe fn host_to_device(
-        res: &cuvs::Resources,
+        resources: &cuvs::Resources,
         host: &[u8],
         device_ptr: *mut std::ffi::c_void,
     ) -> Result<(), String> {
-        let stream = res.get_cuda_stream().map_err(|e| format!("{e}"))?;
-        let err = cuvs_sys::cudaMemcpyAsync(
+        let stream = resources.get_cuda_stream().map_err(|error| format!("{error}"))?;
+        let status = cuvs_sys::cudaMemcpyAsync(
             device_ptr,
             host.as_ptr() as *const _,
             host.len(),
             cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
             stream,
         );
-        if err != cuvs_sys::cudaError::cudaSuccess {
-            return Err(format!("cudaMemcpyAsync H2D failed: {err:?}"));
+        if status != cuvs_sys::cudaError::cudaSuccess {
+            return Err(format!("cudaMemcpyAsync H2D failed: {status:?}"));
         }
         Ok(())
     }
 }
 
 impl Backend for CuvsBackend {
-    fn description(&self) -> String {
-        self.description.clone()
-    }
-
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
         self.metadata.clone()
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let bytes = self.cast.encode(&vectors.data)?;
+        let bytes = self.cast.encode(&vectors)?;
         self.host_vectors.extend_from_slice(bytes);
         self.host_keys.extend_from_slice(keys);
-        self.dirty = true;
+        self.index = None;
         Ok(())
     }
 
-    fn search(
-        &mut self,
-        queries: Vectors,
-        count: usize,
-        out_keys: &mut [Key],
-        out_distances: &mut [Distance],
-        out_counts: &mut [usize],
-    ) -> Result<(), String> {
-        if self.dirty || self.index.is_none() {
+    fn search(&mut self, queries: Vectors, mut hits: Hits<'_>) -> Result<(), String> {
+        if self.index.is_none() {
             self.build_index()?;
         }
+        let query_count = queries.len();
+        let count = hits.count();
 
-        let num_queries = queries.len();
-
-        // Allocate GPU buffers and search params on first use, and again whenever
-        // a batch outgrows them or asks for a different neighbor count — the
-        // `--self-search` pass replays the whole base at its own count, and the
-        // capacity never shrinks so alternating batch sizes don't thrash.
-        if !self.search_buffers.as_ref().is_some_and(|b| b.fits(num_queries, count)) {
+        // Buffers only grow and the old ones free first, so alternating batches never thrash scarce device memory.
+        if !self
+            .search_buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.fits(query_count, count))
+        {
             let search_params = self.build_search_params(count)?;
-            let capacity = num_queries.max(self.search_buffers.as_ref().map_or(0, |b| b.capacity_queries));
-            // Free the old buffers before allocating the new ones: reallocation
-            // is rare and device memory is the scarce resource here.
+            let capacity = query_count.max(
+                self.search_buffers
+                    .as_ref()
+                    .map_or(0, |buffers| buffers.capacity_queries),
+            );
             self.search_buffers = None;
             self.search_buffers = Some(SearchBuffers::allocate(
-                self.cuda_alloc.clone(),
+                self.cuda_allocator.clone(),
                 capacity,
-                queries.dimensions,
+                queries.dimensions(),
                 count,
                 self.data_type,
                 search_params,
             )?);
         }
-        let buffers = self.search_buffers.as_mut().unwrap();
-        buffers.set_batch_rows(num_queries);
+        let Some(buffers) = self.search_buffers.as_mut() else {
+            unreachable!("the buffers were just allocated")
+        };
+        buffers.set_batch_rows(query_count);
 
         // Queries already in `data_type` upload straight from the source rows.
-        let bytes = self.cast.encode(&queries.data)?;
-        unsafe { Self::host_to_device(&self.res, bytes, buffers.queries.as_mut_ptr())? };
+        let bytes = self.cast.encode(&queries)?;
+        unsafe { Self::host_to_device(&self.resources, bytes, buffers.queries.as_mut_ptr())? };
 
-        // Non-owning DLPack views over the pre-allocated GpuTensor memory.
-        // We pass raw `*mut DLManagedTensor` pointers into cuvs-sys directly,
-        // so there's no `cuvs::ManagedTensor` wrapper to mem::forget afterward.
-        let mut queries_dl = unsafe {
-            dl_tensor(
-                buffers.queries.as_mut_ptr(),
-                buffers.queries_shape.as_mut_ptr(),
-                2,
-                self.data_type.dl_type(),
-                true,
-            )
-        };
-        let mut neighbors_dl = unsafe {
-            dl_tensor(
-                buffers.neighbors.as_mut_ptr() as _,
-                buffers.neighbors_shape.as_mut_ptr(),
-                2,
-                dl_key(),
-                true,
-            )
-        };
-        let mut distances_dl = unsafe {
-            dl_tensor(
-                buffers.distances.as_mut_ptr() as _,
-                buffers.distances_shape.as_mut_ptr(),
-                2,
-                dl_distance(),
-                true,
-            )
-        };
-
+        let mut queries_tensor = dl_tensor(
+            buffers.queries.as_mut_ptr(),
+            buffers.queries_shape.as_mut_ptr(),
+            2,
+            self.data_type.dl_type(),
+            true,
+        );
+        let mut neighbors_tensor = dl_tensor(
+            buffers.neighbors.as_mut_ptr() as _,
+            buffers.results_shape.as_mut_ptr(),
+            2,
+            dl_key(),
+            true,
+        );
+        let mut distances_tensor = dl_tensor(
+            buffers.distances.as_mut_ptr() as _,
+            buffers.results_shape.as_mut_ptr(),
+            2,
+            dl_distance(),
+            true,
+        );
         let index = self.index.as_ref().ok_or("index not built")?;
-
         index.search(
-            &self.res,
+            &self.resources,
             buffers.search_params.0,
-            &mut queries_dl,
-            &mut neighbors_dl,
-            &mut distances_dl,
+            &mut queries_tensor,
+            &mut neighbors_tensor,
+            &mut distances_tensor,
         )?;
 
-        // D2H copy results — only the rows this batch actually filled, which is
-        // a prefix of the (possibly larger) capacity.
-        let filled = num_queries * count;
+        // Only the rows this batch filled, a prefix of the possibly larger capacity.
+        let filled = query_count * count;
         unsafe {
             Self::device_to_host(
-                &self.res,
+                &self.resources,
                 buffers.neighbors.as_ptr(),
                 &mut buffers.neighbors_host[..filled],
             )?;
             Self::device_to_host(
-                &self.res,
+                &self.resources,
                 buffers.distances.as_ptr(),
                 &mut buffers.distances_host[..filled],
             )?;
         }
 
-        // Map CAGRA's 0-based row indices back to the caller's keys. Out-of-range
-        // indices are CAGRA's tail padding.
-        for (query_index, found_count) in out_counts[..num_queries].iter_mut().enumerate() {
-            let offset = query_index * count;
-            let hits = (0..count).filter_map(|rank| {
-                let neighbor_index = buffers.neighbors_host[offset + rank] as usize;
-                let key = *self.host_keys.get(neighbor_index)?;
-                Some((key, buffers.distances_host[offset + rank]))
-            });
-            *found_count = retrieval::write_row(
-                hits,
-                &mut out_keys[offset..offset + count],
-                &mut out_distances[offset..offset + count],
-            );
+        // CAGRA answers with 0-based row indices; out-of-range ones are its tail padding.
+        let answers = buffers.neighbors_host[..filled]
+            .chunks_exact(count)
+            .zip(buffers.distances_host[..filled].chunks_exact(count));
+        for ((neighbors, distances), row) in answers.zip(hits.rows()) {
+            row.write(neighbors.iter().zip(distances).filter_map(|(&neighbor, &distance)| {
+                let key = *self.host_keys.get(neighbor as usize)?;
+                Some(Ok((key, distance)))
+            }))?;
         }
-
         Ok(())
     }
 
@@ -1049,18 +945,17 @@ impl Backend for CuvsBackend {
     }
 
     fn memory_bytes(&self) -> usize {
-        let num_vectors = self.host_keys.len();
-        let host_bytes = self.host_vectors.len() + num_vectors * std::mem::size_of::<Key>();
-        let gpu_bytes = num_vectors * self.dimensions * self.data_type.bytes_per_element()
-            + num_vectors * self.connectivity * std::mem::size_of::<u32>();
+        let vector_count = self.host_keys.len();
+        let host_bytes = self.host_vectors.len() + vector_count * std::mem::size_of::<Key>();
+        let gpu_bytes = vector_count * self.dimensions * self.data_type.bytes_per_element()
+            + vector_count * self.connectivity * std::mem::size_of::<u32>();
         host_bytes + gpu_bytes
     }
 
-    fn save(&self, handle: &str) -> Result<(), String> {
-        let index_ref = &self.index;
-        let index = index_ref.as_ref().ok_or("CAGRA index not built — nothing to save")?;
-        index.serialize(&self.res, handle, /*include_dataset=*/ true)?;
-        write_host_keys(&keys_sidecar_path(handle), &self.host_keys, self.connectivity)
+    fn save(&self, path: &str) -> Result<(), String> {
+        let index = self.index.as_ref().ok_or("CAGRA index not built — nothing to save")?;
+        index.serialize(&self.resources, path)?;
+        write_host_keys(&keys_sidecar_path(path), &self.host_keys, self.connectivity)
     }
 }
 
@@ -1084,19 +979,7 @@ fn main() {
     eprintln!("- Random samplings: {}", spell_count_or_auto(cli.num_random_samplings));
     eprintln!("- Build algorithm: {}", cli.build_algo);
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
-
-    cli.common.ensure_single_config(&[
-        dimensions_sweep.len(),
-        cli.data_type.len(),
-        cli.metric.len(),
-        cli.connectivity.len(),
-        cli.expansion_add.len(),
-        cli.expansion_search.len(),
-        cli.search_width.len(),
-    ]);
-
-    let mut summary = SweepSummary::default();
-    for (&dimensions, &data_type, &metric, connectivity, expansion_add, expansion_search, &search_width) in iproduct!(
+    let configs = iproduct!(
         &dimensions_sweep,
         &cli.data_type,
         &cli.metric,
@@ -1104,56 +987,37 @@ fn main() {
         &cli.expansion_add,
         &cli.expansion_search,
         &cli.search_width
-    ) {
-        state.check_dimensions(dimensions).unwrap_or_bail("invalid --dims");
+    );
+    let index_file = IndexFile::new(cli.index.as_deref(), configs.clone().count());
+    eprintln!("- Index: {index_file}");
 
+    let mut summary = SweepSummary::default();
+    for (&dimensions, &data_type, &metric, &connectivity, &expansion_add, &expansion_search, &search_width) in configs {
         let description = format!(
             "cuvs-cagra · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search} · sw={}",
             spell_count_or_auto(search_width),
         );
-
-        let cagra_tuning = CagraTuning {
+        let config = IndexConfig {
+            dimensions,
+            data_type,
+            metric,
+            connectivity,
+            expansion_add,
+            expansion_search,
+        };
+        let tuning = CagraTuning {
             build_algo: cli.build_algo,
             search_width,
             min_iterations: cli.min_iterations,
             max_iterations: cli.max_iterations,
             num_random_samplings: cli.num_random_samplings,
         };
-
-        summary.record(run_config(
-            &description,
-            cli.common.index.as_deref(),
-            || {
-                CuvsBackend::new(
-                    IndexConfig {
-                        dimensions,
-                        data_type,
-                        metric,
-                        connectivity: *connectivity,
-                        expansion_add: *expansion_add,
-                        expansion_search: *expansion_search,
-                    },
-                    cagra_tuning,
-                )
-            },
-            |h| {
-                CuvsBackend::load(
-                    h,
-                    IndexConfig {
-                        dimensions,
-                        data_type,
-                        metric,
-                        connectivity: *connectivity,
-                        expansion_add: *expansion_add,
-                        expansion_search: *expansion_search,
-                    },
-                    cagra_tuning,
-                )
-            },
-            &mut state,
-            dimensions,
-        ));
+        let backend = match index_file {
+            IndexFile::Load(path) => CuvsBackend::load(path, config, tuning),
+            IndexFile::None | IndexFile::Save(_) => CuvsBackend::new(config, tuning),
+        };
+        summary.record(run_config(&description, index_file, backend, &mut state, dimensions));
     }
 
-    summary.print();
+    summary.finish();
 }

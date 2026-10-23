@@ -21,7 +21,6 @@ impl ContainerHandle {
         ports: &[(u16, u16)],
         env: &[String],
         command: &[String],
-        _timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let docker = Docker::connect_with_local_defaults()?;
 
@@ -31,8 +30,8 @@ impl ContainerHandle {
             .build();
         let mut pull_stream = docker.create_image(Some(pull_opts), None, None);
         while let Some(result) = pull_stream.next().await {
-            if let Err(e) = result {
-                eprintln!("  Pull warning: {e}");
+            if let Err(error) = result {
+                eprintln!("  Pull warning: {error}");
             }
         }
 
@@ -107,21 +106,13 @@ impl ContainerHandle {
         self.wait_until(url, timeout, || {
             let client = client.clone();
             let url = url.to_string();
-            async move { client.get(&url).send().await.is_ok_and(|r| r.status().is_success()) }
-        })
-        .await
-    }
-
-    pub async fn wait_for_tcp(
-        &self,
-        host: &str,
-        port: u16,
-        timeout: Duration,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let address = format!("{host}:{port}");
-        self.wait_until(&address, timeout, || {
-            let address = address.clone();
-            async move { tokio::net::TcpStream::connect(&address).await.is_ok() }
+            async move {
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+            }
         })
         .await
     }
@@ -134,7 +125,7 @@ impl ContainerHandle {
             .build();
         let mut stream = self.docker.stats(&self.container_id, Some(opts));
         if let Some(Ok(stats)) = stream.next().await {
-            stats.memory_stats.and_then(|m| m.usage).unwrap_or(0)
+            stats.memory_stats.and_then(|memory| memory.usage).unwrap_or(0)
         } else {
             0
         }

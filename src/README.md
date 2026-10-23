@@ -64,7 +64,7 @@ This covers the whole process lifetime, dataset loading and ground-truth I/O inc
 
 `steps[].memory_bytes` is whatever the backend reports after each step, so the figures differ in what they count:
 
-- __USearch__ sums `memory_usage()` over its shards, the index footprint without the dataset mapping.
+- __USearch__ reports the index's own `memory_usage`, without the dataset mapping.
 - __FAISS__ reports the resident set of the whole process, dataset pages included.
 - __cuVS__ computes it: the host copy of the vectors and keys, plus the device vectors and a graph of `--connectivity` edges per vector.
 - __Qdrant, Redis, Weaviate and SurrealDB__ sample the Docker stats API, the container's whole resident set; see [`docker/README.md`](../docker/README.md).

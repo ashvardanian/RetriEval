@@ -3,16 +3,15 @@
 //! This is the library root. Backend binaries (`usearch.rs`, `faiss.rs`, etc.)
 //! import from here and provide their own `main()`.
 
-// The generator is also compiled as a standalone binary.
-extern crate self as retrieval;
-
 pub mod dataset;
 #[cfg(feature = "tier2")]
 pub mod docker;
+#[cfg(feature = "download")]
+pub mod download;
 pub mod error;
 pub mod eval;
 #[cfg(any(feature = "generate", feature = "download"))]
-pub mod generate;
+pub mod ground_truth;
 pub mod output;
 #[cfg(any(feature = "generate", feature = "download"))]
 pub mod packed_distance;
@@ -24,23 +23,20 @@ use std::{
     fmt,
     hash::{BuildHasher, Hasher},
     num::{NonZeroU16, NonZeroUsize},
-    path::PathBuf,
+    ops::Range,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
+use forkunion::{self as fu, ThreadPool, Topology};
 use indicatif::{ProgressBar, ProgressStyle};
-use numkong as nk;
+use numkong::{self as nk, MatrixSpan, MatrixView};
 use serde_json::Value;
 
-#[cfg(feature = "download")]
-pub use crate::error::DownloadError;
 pub use crate::{
-    dataset::{Dataset, GroundTruth, Keys},
-    error::{DatasetError, GroundTruthError, PerfCountersError},
-    output::{
-        collect_machine_info, config_hash, write_report, ConfigReport, DatasetInfo, MachineInfo, PhaseCounters,
-        StepAddEntry, StepEntry, StepSearchEntry,
-    },
+    dataset::{Dataset, GroundTruth, Keys, Permutation},
+    error::{DatasetError, GroundTruthError},
+    output::{config_hash, write_report, ConfigReport, DatasetInfo, StepAddEntry, StepEntry, StepSearchEntry},
 };
 
 // #region Core types
@@ -53,26 +49,77 @@ pub type Distance = f32;
 
 // #region Vector types
 
-/// Borrowed batch of row-major vectors with known dimensionality.
-pub struct Vectors<'a> {
-    pub data: VectorSlice<'a>,
-    pub dimensions: usize,
+/// A batch of row-major vectors, one matrix row per vector; `B1x8` rows hold `dimensions` bits.
+#[derive(Clone, Copy)]
+pub enum Vectors<'a> {
+    F32(MatrixView<'a, f32>),
+    I8(MatrixView<'a, i8>),
+    U8(MatrixView<'a, u8>),
+    B1x8(MatrixView<'a, nk::u1x8>),
 }
 
+/// A batch's values end to end, the layout files and wire formats take.
 pub enum VectorSlice<'a> {
     F32(&'a [f32]),
     I8(&'a [i8]),
     U8(&'a [u8]),
-    /// Binary vectors: 1-bit values packed 8 per byte. Dimensions is in bits.
+    /// Binary vectors: 1-bit values packed 8 per byte.
     B1x8(&'a [u8]),
 }
 
-impl VectorSlice<'_> {
-    pub fn to_f32_in<'a, A: Allocator>(&'a self, scratch: &'a mut Vec<f32, A>) -> Result<&'a [f32], &'static str> {
-        if let Self::F32(values) = self {
-            return Ok(values);
+impl<'a> Vectors<'a> {
+    /// Shapes `values` into rows `dimensions` wide, counted in bits for `B1x8`.
+    pub fn new(values: VectorSlice<'a>, dimensions: usize) -> Self {
+        match values {
+            VectorSlice::F32(values) => Self::F32(matrix_view(values, values.len() / dimensions, dimensions)),
+            VectorSlice::I8(values) => Self::I8(matrix_view(values, values.len() / dimensions, dimensions)),
+            VectorSlice::U8(values) => Self::U8(matrix_view(values, values.len() / dimensions, dimensions)),
+            VectorSlice::B1x8(bytes) => Self::B1x8(binary_view(bytes, bytes.len() / (dimensions / 8), dimensions)),
         }
-        cast_in(self, scratch)
+    }
+
+    fn shape(&self) -> &[usize] {
+        match self {
+            Self::F32(view) => view.shape(),
+            Self::I8(view) => view.shape(),
+            Self::U8(view) => view.shape(),
+            Self::B1x8(view) => view.shape(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.shape()[0]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Values per row, counted in bits for `B1x8`.
+    pub fn dimensions(&self) -> usize {
+        self.shape()[1]
+    }
+
+    /// The rows end to end.
+    pub fn values(&self) -> VectorSlice<'_> {
+        const WHOLE_ROWS: &str = "a batch holds whole contiguous rows";
+        match self {
+            Self::F32(view) => VectorSlice::F32(view.as_packed_slice().expect(WHOLE_ROWS)),
+            Self::I8(view) => VectorSlice::I8(view.as_packed_slice().expect(WHOLE_ROWS)),
+            Self::U8(view) => VectorSlice::U8(view.as_packed_slice().expect(WHOLE_ROWS)),
+            // SAFETY: `u1x8` is a transparent byte.
+            Self::B1x8(view) => {
+                VectorSlice::B1x8(unsafe { pod_slice_as_bytes(view.as_packed_slice().expect(WHOLE_ROWS)) })
+            }
+        }
+    }
+
+    /// The values as `f32`, cast into `scratch` unless they already are.
+    pub fn to_f32_in<'s, A: Allocator>(&'s self, scratch: &'s mut Vec<f32, A>) -> Result<&'s [f32], &'static str> {
+        match self.values() {
+            VectorSlice::F32(values) => Ok(values),
+            values => cast_in(&values, scratch),
+        }
     }
 }
 
@@ -112,84 +159,82 @@ pub enum CastScratch {
 }
 
 impl CastScratch {
-    /// The bytes of `source` in this buffer's scalar type.
-    pub fn encode<'a>(&'a mut self, source: &'a VectorSlice<'_>) -> Result<&'a [u8], &'static str> {
-        match (&mut *self, source) {
-            // SAFETY: `f32` and `i8` are POD.
-            (Self::F32(_), VectorSlice::F32(values)) => return Ok(unsafe { pod_slice_as_bytes(values) }),
-            (Self::I8(_), VectorSlice::I8(values)) => return Ok(unsafe { pod_slice_as_bytes(values) }),
-            (Self::U8(_), VectorSlice::U8(values)) => return Ok(values),
-            _ => {}
-        }
+    /// The bytes of `vectors` in this buffer's scalar type.
+    pub fn encode<'a>(&'a mut self, vectors: &'a Vectors<'_>) -> Result<&'a [u8], &'static str> {
+        let source = vectors.values();
         // SAFETY: every scalar type here is POD.
-        Ok(match self {
-            Self::F64(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
-            Self::F32(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
-            Self::BF16(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
-            Self::F16(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
-            Self::I8(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
-            Self::U8(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
+        Ok(match (self, source) {
+            (Self::F32(_), VectorSlice::F32(values)) => unsafe { pod_slice_as_bytes(values) },
+            (Self::I8(_), VectorSlice::I8(values)) => unsafe { pod_slice_as_bytes(values) },
+            (Self::U8(_), VectorSlice::U8(values)) => values,
+            (Self::F64(target), source) => unsafe { pod_slice_as_bytes(cast_in(&source, target)?) },
+            (Self::F32(target), source) => unsafe { pod_slice_as_bytes(cast_in(&source, target)?) },
+            (Self::BF16(target), source) => unsafe { pod_slice_as_bytes(cast_in(&source, target)?) },
+            (Self::F16(target), source) => unsafe { pod_slice_as_bytes(cast_in(&source, target)?) },
+            (Self::I8(target), source) => unsafe { pod_slice_as_bytes(cast_in(&source, target)?) },
+            (Self::U8(target), source) => unsafe { pod_slice_as_bytes(cast_in(&source, target)?) },
         })
     }
 }
 
-impl Vectors<'_> {
-    pub fn len(&self) -> usize {
-        let dimensions = self.dimensions;
-        match self.data {
-            VectorSlice::F32(data) => data.len() / dimensions,
-            VectorSlice::I8(data) => data.len() / dimensions,
-            VectorSlice::U8(data) => data.len() / dimensions,
-            VectorSlice::B1x8(data) => data.len() / dimensions.div_ceil(8),
-        }
-    }
+/// A `[rows, bits]` view of bit-packed rows; `bits` must be a whole number of bytes.
+pub fn binary_view(bytes: &[u8], rows: usize, bits: usize) -> MatrixView<'_, nk::u1x8> {
+    assert!(
+        bits.is_multiple_of(8) && bytes.len() == rows * (bits / 8),
+        "{} bytes do not hold {rows} rows of {bits} bits",
+        bytes.len()
+    );
+    // SAFETY: the bytes hold `rows` packed rows of `bits / 8` bytes, and `u1x8` is a transparent byte.
+    unsafe { MatrixView::from_raw_parts(bytes.as_ptr().cast(), &[rows, bits], &[(bits / 8) as isize, 1]) }
+        .expect("whole packed rows are a valid view")
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+/// A `[rows, columns]` view of row-major values.
+pub fn matrix_view<T: nk::StorageElement>(values: &[T], rows: usize, columns: usize) -> MatrixView<'_, T> {
+    assert_eq!(
+        values.len(),
+        rows * columns,
+        "values do not hold {rows} rows of {columns}"
+    );
+    let element = std::mem::size_of::<T>() as isize;
+    // SAFETY: the values hold `rows` rows of `columns` elements end to end.
+    unsafe {
+        MatrixView::from_raw_parts(
+            values.as_ptr(),
+            &[rows, columns],
+            &[columns as isize * element, element],
+        )
     }
+    .expect("whole rows are a valid view")
 }
 
 /// Get the current process resident set size (RSS) in bytes.
 pub fn process_rss_bytes() -> u64 {
-    let pid = sysinfo::get_current_pid().expect("get current pid");
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    sys.process(pid).map(|p| p.memory()).unwrap_or(0)
+    let process_id = sysinfo::get_current_pid().expect("get current pid");
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[process_id]), true);
+    system.process(process_id).map(|process| process.memory()).unwrap_or(0)
 }
 
 // #region Backend trait
 
 /// Common trait for all vector search backends.
 pub trait Backend: Send {
-    fn description(&self) -> String;
     fn metadata(&self) -> HashMap<String, Value>;
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String>;
-    fn search(
-        &mut self,
-        queries: Vectors,
-        count: usize,
-        out_keys: &mut [Key],
-        out_distances: &mut [Distance],
-        out_counts: &mut [usize],
-    ) -> Result<(), String>;
+    /// Answers every row of `queries` into the matching row of `hits`.
+    fn search(&mut self, queries: Vectors, hits: Hits<'_>) -> Result<(), String>;
     fn memory_bytes(&self) -> usize;
 
-    /// How many vectors the backend actually holds, when it can say.
-    ///
-    /// The harness otherwise infers this from the dataset, which is wrong on
-    /// the `--index` load path: a saved index may have been built over a
-    /// different slice of the base than the current run's `--max-base-vectors`
-    /// implies. Self-recall depends on the answer — it queries base rows and
-    /// asserts each one is in the index — so a backend that knows its own
-    /// population should report it. `None` means "no idea, trust the dataset".
+    /// How many vectors the backend holds, when it can say. A loaded index may
+    /// cover a different slice of the base than this run's flags imply, and
+    /// self-recall queries base rows assuming each one is indexed.
     fn indexed_count(&self) -> Option<usize> {
         None
     }
 
-    /// Persist the index under `handle`. For embedded backends `handle` is a
-    /// filesystem path; for server-style backends it's a collection / table /
-    /// index name. Default returns Err so backends opt in by overriding.
-    fn save(&self, _handle: &str) -> Result<(), String> {
+    /// Persist the index at `path`.
+    fn save(&self, _path: &str) -> Result<(), String> {
         Err("--index: save not yet implemented for this backend".into())
     }
 }
@@ -210,52 +255,140 @@ pub struct IndexConfig<DataType, Metric> {
     pub expansion_search: usize,
 }
 
-// #region Result buffers
-
-/// Write one query's hits into its slice of the output buffers and return how
-/// many landed. Hits are compacted to the front and the tail is padded with
-/// `Key::MAX` / `Distance::INFINITY`.
-///
-/// `eval` scores `out_keys[..found_count]`, so a backend that leaves a hole at
-/// a non-terminal rank pushes real hits outside the scanned window. Backends
-/// filter their engine's misses out of `hits` rather than yielding sentinels.
-pub fn write_row(
-    hits: impl IntoIterator<Item = (Key, Distance)>,
-    out_keys: &mut [Key],
-    out_distances: &mut [Distance],
-) -> usize {
-    let count = out_keys.len().min(out_distances.len());
-    let mut found = 0;
-    for (key, distance) in hits.into_iter().take(count) {
-        out_keys[found] = key;
-        out_distances[found] = distance;
-        found += 1;
-    }
-    for slot in found..count {
-        out_keys[slot] = Key::MAX;
-        out_distances[slot] = Distance::INFINITY;
-    }
-    found
+/// Where a config's index comes from and goes to, decided once from `--index`.
+#[derive(Clone, Copy)]
+pub enum IndexFile<'a> {
+    None,
+    Save(&'a str),
+    Load(&'a str),
 }
 
-/// Reusable owned search storage; adapters receive only borrowed output slices.
-pub struct SearchBuffers<A: Allocator = System> {
-    pub keys: Vec<Key, A>,
-    pub distances: Vec<Distance, A>,
-    pub counts: Vec<usize, A>,
-}
-impl<A: Allocator + Clone> SearchBuffers<A> {
-    pub fn new_in(allocator: A) -> Self {
-        Self {
-            keys: Vec::new_in(allocator.clone()),
-            distances: Vec::new_in(allocator.clone()),
-            counts: Vec::new_in(allocator),
+impl<'a> IndexFile<'a> {
+    /// Loads `path` when it exists and saves to it otherwise; a path serves a single config,
+    /// since several would write to or read from the same file.
+    pub fn new(path: Option<&'a str>, configs: usize) -> Self {
+        match path {
+            None => Self::None,
+            Some(_) if configs > 1 => bail(&format!(
+                "--index requires a single config; got {configs} configs from the sweep"
+            )),
+            Some(path) if Path::new(path).exists() => Self::Load(path),
+            Some(path) => Self::Save(path),
         }
     }
-    pub fn resize(&mut self, queries: usize, count: usize) {
-        self.keys.resize(queries * count, Key::MAX);
-        self.distances.resize(queries * count, Distance::INFINITY);
-        self.counts.resize(queries, 0);
+}
+
+impl fmt::Display for IndexFile<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => formatter.write_str("none"),
+            Self::Save(path) => write!(formatter, "save to {path}"),
+            Self::Load(path) => write!(formatter, "load {path}"),
+        }
+    }
+}
+
+// #region Result buffers
+
+/// Every query's answers for one pass: a `[queries, count]` key matrix, its distances, and how
+/// many hits each row holds.
+pub struct SearchBuffers {
+    keys: nk::Matrix<Key>,
+    distances: nk::Matrix<Distance>,
+    counts: Vec<usize, System>,
+}
+
+impl SearchBuffers {
+    pub fn new(queries: usize, count: usize) -> Result<Self, String> {
+        let error = |error| format!("result matrices for {queries} queries of {count} hits: {error:?}");
+        let mut counts = Vec::with_capacity_in(queries, System);
+        counts.resize(queries, 0);
+        Ok(Self {
+            keys: nk::Matrix::full(&[queries, count], Key::MAX).map_err(error)?,
+            distances: nk::Matrix::full(&[queries, count], Distance::INFINITY).map_err(error)?,
+            counts,
+        })
+    }
+
+    /// The rows of one batch, for a backend to answer into.
+    pub fn hits(&mut self, rows: Range<usize>) -> Hits<'_> {
+        const WHOLE_ROWS: &str = "a batch is a run of whole rows";
+        Hits {
+            keys: self.keys.slice_mut((rows.clone(), ..)).expect(WHOLE_ROWS),
+            distances: self.distances.slice_mut((rows.clone(), ..)).expect(WHOLE_ROWS),
+            counts: &mut self.counts[rows],
+        }
+    }
+
+    /// Each query's keys, distances and hit count, in query order.
+    pub fn rows(&self) -> impl Iterator<Item = (&[Key], &[Distance], usize)> {
+        let count = self.keys.shape()[1];
+        self.keys
+            .as_slice()
+            .chunks_exact(count)
+            .zip(self.distances.as_slice().chunks_exact(count))
+            .zip(&self.counts)
+            .map(|((keys, distances), &found)| (keys, distances, found))
+    }
+
+    /// Each query's found keys, best first.
+    pub fn found(&self) -> impl Iterator<Item = &[Key]> {
+        self.rows().map(|(keys, _, found)| &keys[..found])
+    }
+}
+
+/// One batch's rows of a [`SearchBuffers`].
+pub struct Hits<'a> {
+    keys: MatrixSpan<'a, Key>,
+    distances: MatrixSpan<'a, Distance>,
+    counts: &'a mut [usize],
+}
+
+impl Hits<'_> {
+    /// Hits requested per query.
+    pub fn count(&self) -> usize {
+        self.keys.shape()[1]
+    }
+
+    /// Each query's row, in query order.
+    pub fn rows(&mut self) -> impl Iterator<Item = HitRow<'_>> {
+        const WHOLE_ROWS: &str = "a batch is a run of whole rows";
+        let count = self.count();
+        let keys = self.keys.as_contiguous_slice_mut().expect(WHOLE_ROWS);
+        let distances = self.distances.as_contiguous_slice_mut().expect(WHOLE_ROWS);
+        keys.chunks_exact_mut(count)
+            .zip(distances.chunks_exact_mut(count))
+            .zip(self.counts.iter_mut())
+            .map(|((keys, distances), found)| HitRow { keys, distances, found })
+    }
+}
+
+/// One query's row of a [`Hits`] batch.
+pub struct HitRow<'a> {
+    keys: &'a mut [Key],
+    distances: &'a mut [Distance],
+    found: &'a mut usize,
+}
+
+impl HitRow<'_> {
+    /// Writes the query's hits best first, pads the rest with `Key::MAX` and infinity, and counts
+    /// them. `eval` scores only the counted prefix, so backends drop their engine's misses rather
+    /// than yield sentinels; more hits than slots is an error.
+    pub fn write(self, hits: impl IntoIterator<Item = Result<(Key, Distance), String>>) -> Result<(), String> {
+        let mut found = 0;
+        for hit in hits {
+            let (key, distance) = hit?;
+            if found == self.keys.len() {
+                return Err(format!("more than the {found} hits requested"));
+            }
+            self.keys[found] = key;
+            self.distances[found] = distance;
+            found += 1;
+        }
+        self.keys[found..].fill(Key::MAX);
+        self.distances[found..].fill(Distance::INFINITY);
+        *self.found = found;
+        Ok(())
     }
 }
 
@@ -263,30 +396,30 @@ impl<A: Allocator + Clone> SearchBuffers<A> {
 
 /// Reinterpret a `&[T]` as the raw bytes that back it, without copying.
 ///
-/// Used to splat flat numeric buffers (ground-truth indices, f32 base vectors,
-/// etc.) into the BigANN `.fbin` / `.ibin` file format without re-encoding.
-///
 /// # Safety
 ///
-/// `T` must be "plain old data" in the C/bytemuck sense: no padding, no
-/// destructor, no invalid bit patterns. `u32`, `i32`, `u64`, `f32`, `f64`,
-/// `u8`, `i8` all qualify. Do not use with types containing references,
-/// `bool`, or anything `Drop`.
+/// `T` must be "plain old data": no padding, no destructor, no invalid bit patterns.
 pub unsafe fn pod_slice_as_bytes<T: Copy>(slice: &[T]) -> &[u8] {
     std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice))
 }
 
 /// Format a number with thousand separators: 1234567 → "1,234,567"
-pub fn format_thousands(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (char_index, character) in s.chars().enumerate() {
-        if char_index > 0 && (s.len() - char_index).is_multiple_of(3) {
+pub fn format_thousands(number: u64) -> String {
+    let digits = number.to_string();
+    let mut result = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             result.push(',');
         }
         result.push(character);
     }
     result
+}
+
+/// Splits `range` into runs of `step`, the last one possibly shorter.
+pub fn row_ranges(range: Range<usize>, step: usize) -> impl Iterator<Item = Range<usize>> {
+    let end = range.end;
+    range.step_by(step).map(move |start| start..(start + step).min(end))
 }
 
 // #region Common CLI args
@@ -343,15 +476,6 @@ pub struct CommonArgs {
     /// Queries and ground truth are unaffected; only the add/permutation range shrinks.
     #[arg(long, env = "RETRIEVAL_MAX_BASE_VECTORS", value_parser = parse_count_flag)]
     pub max_base_vectors: Option<usize>,
-
-    /// Persisted-index handle. For embedded backends (USearch, FAISS, cuVS): a
-    /// filesystem path — if it exists the backend loads it and skips the add
-    /// phase, otherwise the backend builds and saves to it. For server-style
-    /// backends: a collection / table / index name (not yet implemented).
-    /// Requires a single-config sweep — multi-valued sweep axes are rejected
-    /// at startup when `--index` is set.
-    #[arg(long, env = "RETRIEVAL_INDEX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    pub index: Option<String>,
 
     /// Replay indexed vectors as their own queries and report the fraction that
     /// retrieve themselves within the top-`--self-search-top-k` ("self-recall").
@@ -417,60 +541,46 @@ impl CommonArgs {
         });
         dimensions
     }
-
-    /// When `--index` is set, the sweep must collapse to a single config —
-    /// otherwise multiple builds would write to (or load from) the same file.
-    /// Pass the cardinality of every sweep axis (`dimensions_sweep.len()`,
-    /// `cli.data_type.len()`, …) and this exits with a clear message if their
-    /// product exceeds one. No-op when `--index` is absent.
-    pub fn ensure_single_config(&self, axis_lengths: &[usize]) {
-        if self.index.is_none() {
-            return;
-        }
-        let cardinality: usize = axis_lengths.iter().product();
-        if cardinality > 1 {
-            bail(&format!(
-                "--index requires a single config; got {cardinality} configs from the sweep"
-            ));
-        }
-    }
 }
 
 // #region BenchState
 
+/// The `--self-search` pass: neighbors per replayed vector, and how many vectors replay.
+#[derive(Clone, Copy)]
+pub struct SelfSearch {
+    pub top_k: usize,
+    pub sample: Option<SelfSearchSample>,
+}
+
+impl SelfSearch {
+    /// Vectors to replay out of the `vectors_indexed` an index holds.
+    fn queries(self, vectors_indexed: usize) -> usize {
+        resolve_self_search_sample(self.sample, vectors_indexed)
+    }
+}
+
 /// Pre-loaded benchmark state. Call `BenchState::load()` once, then `run()` per configuration.
 pub struct BenchState {
-    pub dataset: Dataset,
+    dataset: Dataset,
     /// Effective base-vector count; equals `dataset.rows()` unless `--max-base-vectors` capped it.
-    pub total_vectors: usize,
-    pub keys: Keys,
-    pub query_dataset: Dataset,
-    pub ground_truth: GroundTruth,
-    pub perm: dataset::Permutation,
-    /// Seed of the shuffled insertion order, `None` for the original order.
-    pub seed: Option<Seed>,
+    total_vectors: usize,
+    keys: Keys,
+    query_dataset: Dataset,
+    ground_truth: GroundTruth,
+    permutation: Permutation,
     /// Resolved `--top-k`: the search width and the k every metric uses.
-    pub top_k: usize,
-    pub steps: usize,
-    pub inserts_per_core: usize,
-    pub queries_per_core: usize,
-    /// Rows per `add` and `search` call: the per-core sizes times the running backend's threads.
-    inserts_per_call: usize,
-    queries_per_call: usize,
-    pub self_search: bool,
-    pub self_search_top_k: usize,
-    pub self_search_sample: Option<SelfSearchSample>,
-    pub output_dir: Option<PathBuf>,
-    pub machine_info: MachineInfo,
-    pub dataset_info: DatasetInfo,
+    top_k: usize,
+    steps: usize,
+    inserts_per_core: usize,
+    queries_per_core: usize,
+    self_search: Option<SelfSearch>,
+    output_dir: Option<PathBuf>,
+    dataset_info: DatasetInfo,
     search_buffers: SearchBuffers,
     key_scratch: Vec<Key, System>,
-    /// Shared scratch for `Dataset::gather` (during add) and `Dataset::slice`
-    /// (during search). Add and search are sequential within a step, so a
-    /// single buffer sized at the upper bound is enough. Sized to fit
-    /// `max(inserts_per_call, queries_per_call) * native_vector_bytes` —
-    /// covers any truncation since truncated bytes ≤ native.
-    scratch_buf: Vec<u8, System>,
+    /// Rows copied for a batch that cannot borrow the mapped file: a gather, a truncation or a
+    /// shard boundary.
+    row_scratch: Vec<u8, System>,
 }
 
 impl BenchState {
@@ -483,28 +593,25 @@ impl BenchState {
             }
         };
 
-        // Create output directory if specified
-        if let Some(dir) = &args.output {
-            if dir.extension().is_some_and(|ext| ext == "json" || ext == "jsonl") {
+        if let Some(directory) = &args.output {
+            if directory
+                .extension()
+                .is_some_and(|extension| extension == "json" || extension == "jsonl")
+            {
                 return Err(format!(
                     "--output should be a directory, not a file: {}. \
                      Each config produces its own JSON file inside this directory.",
-                    dir.display()
+                    directory.display()
                 )
                 .into());
             }
-            std::fs::create_dir_all(dir)?;
+            std::fs::create_dir_all(directory)?;
         }
-
-        let machine_info = collect_machine_info();
 
         eprintln!("Loading dataset: {}", args.base_vectors.display());
         let dataset = Dataset::load(&args.base_vectors)?;
         let file_vectors = dataset.rows();
-        let total_vectors = match args.max_base_vectors {
-            Some(cap) => cap.min(file_vectors),
-            None => file_vectors,
-        };
+        let total_vectors = args.max_base_vectors.map_or(file_vectors, |cap| cap.min(file_vectors));
         let dimensions = dataset.dimensions();
         if total_vectors < file_vectors {
             eprintln!(
@@ -531,34 +638,36 @@ impl BenchState {
         let keys = match &args.base_keys {
             Some(path) => {
                 eprintln!("Loading keys: {}", path.display());
-                let k = Keys::load(path)?;
-                eprintln!("  {} keys", format_thousands(k.rows() as u64));
-                // One key per base vector is a hard requirement: the add loop
-                // indexes keys by base row, so a short file reads past the end
-                // of the mapping (a bounds panic at best, a garbage key at
-                // worst, since the check is only a `debug_assert`).
-                if k.rows() < total_vectors {
+                let keys = Keys::load(path)?;
+                eprintln!("  {} keys", format_thousands(keys.rows() as u64));
+                // The add loop reads one key per base row, so a short file would read past its mapping.
+                if keys.rows() < total_vectors {
                     return Err(format!(
                         "--base-keys has {} entries but {} base vectors are in play; \
                          one key per vector is required",
-                        format_thousands(k.rows() as u64),
+                        format_thousands(keys.rows() as u64),
                         format_thousands(total_vectors as u64),
                     )
                     .into());
                 }
-                k
+                keys
             }
-            None => Keys::sequential(total_vectors),
+            None => Keys::Sequential { count: total_vectors },
         };
 
         eprintln!("Loading queries: {}", args.query_vectors.display());
         let query_dataset = Dataset::load(&args.query_vectors)?;
-        let num_queries = query_dataset.rows();
+        let query_count = query_dataset.rows();
         eprintln!(
             "  {} queries, {} dimensions",
-            format_thousands(num_queries as u64),
+            format_thousands(query_count as u64),
             query_dataset.dimensions()
         );
+
+        for &truncated in &args.dims {
+            dataset.check_dimensions(truncated)?;
+            query_dataset.check_dimensions(truncated)?;
+        }
 
         eprintln!("Loading ground truth: {}", args.query_neighbors.display());
         let ground_truth = GroundTruth::load(&args.query_neighbors)?;
@@ -576,6 +685,11 @@ impl BenchState {
             );
         }
 
+        let self_search = args.self_search.then_some(SelfSearch {
+            top_k: args.self_search_top_k,
+            sample: args.self_search_sample,
+        });
+
         eprintln!("- Insertion order: {}", args.insertion_order);
         if let Some(seed) = seed {
             eprintln!("- Seed: {seed}");
@@ -589,23 +703,24 @@ impl BenchState {
             Some(count) => eprintln!("- Max base vectors: {count}"),
             None => eprintln!("- Max base vectors: all"),
         }
-        eprintln!("- Index: {}", args.index.as_deref().unwrap_or("none"));
-        eprintln!("- Self-search: {}", args.self_search);
-        if args.self_search {
-            eprintln!("- Self-search top k: {}", args.self_search_top_k);
-            match args.self_search_sample {
-                Some(sample) => eprintln!("- Self-search sample: {sample}"),
-                None => eprintln!("- Self-search sample: all"),
+        match self_search {
+            Some(SelfSearch { top_k, sample }) => {
+                eprintln!("- Self-search top k: {top_k}");
+                match sample {
+                    Some(sample) => eprintln!("- Self-search sample: {sample}"),
+                    None => eprintln!("- Self-search sample: all"),
+                }
             }
+            None => eprintln!("- Self-search: false"),
         }
         match &args.output {
             Some(path) => eprintln!("- Output: {}", path.display()),
             None => eprintln!("- Output: none"),
         }
 
-        let perm = match seed {
-            None => dataset::Permutation::Identity,
-            Some(seed) => dataset::Permutation::shuffled(total_vectors, seed),
+        let permutation = match seed {
+            None => Permutation::Identity,
+            Some(seed) => Permutation::shuffled(total_vectors, seed),
         };
 
         let dataset_info = DatasetInfo {
@@ -613,34 +728,24 @@ impl BenchState {
             query_vectors_path: args.query_vectors.display().to_string(),
             query_neighbors_path: args.query_neighbors.display().to_string(),
             vectors_count: file_vectors,
-            queries_count: num_queries,
+            queries_count: query_count,
             dimensions,
             neighbors_per_query: ground_truth_width,
         };
 
         Ok(Self {
             total_vectors,
-            perm,
-            seed,
+            permutation,
             top_k,
             steps: args.steps,
             inserts_per_core: args.inserts_per_core,
             queries_per_core: args.queries_per_core,
-            inserts_per_call: 0,
-            queries_per_call: 0,
-            self_search: args.self_search,
-            self_search_top_k: args.self_search_top_k,
-            self_search_sample: args.self_search_sample,
+            self_search,
             output_dir: args.output.clone(),
-            machine_info,
             dataset_info,
-            search_buffers: {
-                let mut buffers = SearchBuffers::new_in(System);
-                buffers.resize(num_queries, top_k);
-                buffers
-            },
+            search_buffers: SearchBuffers::new(query_count, top_k)?,
             key_scratch: Vec::new_in(System),
-            scratch_buf: Vec::new_in(System),
+            row_scratch: Vec::new_in(System),
             dataset,
             keys,
             query_dataset,
@@ -648,29 +753,9 @@ impl BenchState {
         })
     }
 
-    /// Native dimensions of the base dataset. Truncation is per-call: see
-    /// `run` / `run_search_only`'s `dimensions` argument.
+    /// Native dimensions of the base dataset; truncation is per config.
     pub fn dimensions(&self) -> usize {
         self.dataset.dimensions()
-    }
-
-    /// Validate that `dimensions` is a legal exposure for both base and query
-    /// datasets. Used by binaries before kicking off a per-config run.
-    pub fn check_dimensions(&self, dimensions: usize) -> Result<(), DatasetError> {
-        self.dataset.check_dimensions(dimensions)?;
-        self.query_dataset.check_dimensions(dimensions)?;
-        Ok(())
-    }
-
-    /// Size calls and scratch to the backend's reported `threads`, or to one client thread when it reports none.
-    fn size_calls(&mut self, metadata: &HashMap<String, Value>) {
-        let cores = metadata.get("threads").and_then(Value::as_u64).unwrap_or(1) as usize;
-        self.inserts_per_call = self.inserts_per_core * cores;
-        self.queries_per_call = self.queries_per_core * cores;
-        let rows = self.inserts_per_call.max(self.queries_per_call);
-        let row_bytes = self.dataset.vector_bytes().max(self.query_dataset.vector_bytes());
-        self.key_scratch.resize(self.inserts_per_call, 0 as Key);
-        self.scratch_buf.resize(rows * row_bytes, 0u8);
     }
 }
 
@@ -678,19 +763,33 @@ impl BenchState {
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Outcome of one step's add phase.
-struct AddPhaseOutcome {
-    elapsed_secs: f64,
-    throughput_per_sec: u64,
-    counter_sample: Option<perf_counters::CounterSample>,
+/// Items per second, zero before any time has passed.
+fn per_second(count: usize, elapsed: f64) -> u64 {
+    if elapsed > 0.0 {
+        (count as f64 / elapsed) as u64
+    } else {
+        0
+    }
+}
+
+/// A progress bar over `total` items, drawn by `template`.
+fn progress_bar(total: usize, template: &str) -> ProgressBar {
+    let progress = ProgressBar::new(total as u64);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template(template)
+            .expect("a valid progress template")
+            .progress_chars("##-"),
+    );
+    progress
 }
 
 /// Arm perf counters before a phase; on failure disarm the whole capture so
 /// later phases don't try again. Single place for the error-logging wording.
 fn start_counter_capture(perf: &mut Option<perf_counters::PerfCounters>, phase: &str) {
-    if let Some(pc) = perf.as_mut() {
-        if let Err(err) = pc.reset_and_enable() {
-            eprintln!("  perf counters: reset/enable before {phase} failed ({err})");
+    if let Some(counters) = perf.as_mut() {
+        if let Err(error) = counters.reset_and_enable() {
+            eprintln!("  perf counters: reset/enable before {phase} failed ({error})");
             *perf = None;
         }
     }
@@ -701,343 +800,206 @@ fn stop_and_read_counters(
     perf: &mut Option<perf_counters::PerfCounters>,
     phase: &str,
 ) -> Option<perf_counters::CounterSample> {
-    let pc = perf.as_mut()?;
-    match pc.disable_and_read() {
+    let counters = perf.as_mut()?;
+    match counters.disable_and_read() {
         Ok(sample) => Some(sample),
-        Err(err) => {
-            eprintln!("  perf counters: read after {phase} failed ({err})");
+        Err(error) => {
+            eprintln!("  perf counters: read after {phase} failed ({error})");
             *perf = None;
             None
         }
     }
 }
 
-/// The slice of the base one step inserts, at the dimensionality this config
-/// exposes to the backend.
-struct StepSlice {
-    start: usize,
-    count: usize,
-    dimensions: usize,
-}
-
-/// Insert one step's slice in `inserts_per_call` chunks, capturing perf counters
-/// across the phase. Advances `vectors_indexed` to the new cumulative count.
+/// Inserts the base rows `step` in batches of `inserts_per_call`, at `dimensions`.
 fn run_add_phase(
     backend: &mut dyn Backend,
     state: &mut BenchState,
     perf: &mut Option<perf_counters::PerfCounters>,
-    progress_style: &ProgressStyle,
-    slice: StepSlice,
-    vectors_indexed: &mut usize,
-) -> BenchResult<AddPhaseOutcome> {
-    let StepSlice {
-        start: step_start,
-        count: step_count,
-        dimensions,
-    } = slice;
+    step: Range<usize>,
+    dimensions: usize,
+    inserts_per_call: usize,
+) -> BenchResult<StepAddEntry> {
     let total_vectors = state.total_vectors;
-    let inserts_per_call = state.inserts_per_call;
-
-    let progress = ProgressBar::new(total_vectors as u64);
-    progress.set_style(progress_style.clone());
-    progress.set_position(*vectors_indexed as u64);
+    let message = |indexed: usize, throughput: u64| {
+        format!(
+            "{}/{} ({} add/s)",
+            format_thousands(indexed as u64),
+            format_thousands(total_vectors as u64),
+            format_thousands(throughput),
+        )
+    };
+    let progress = progress_bar(total_vectors, "  add    [{elapsed_precise}] {bar:40.cyan/blue} {msg}");
+    progress.set_position(step.start as u64);
 
     start_counter_capture(perf, "add");
-    let add_start = Instant::now();
-    let mut added = 0;
-    while added < step_count {
-        let batch = inserts_per_call.min(step_count - added);
-        let logical_offset = step_start + added;
-        let (batch_keys, vectors) = match &state.perm {
-            dataset::Permutation::Identity => (
-                state.keys.slice(logical_offset, batch, &mut state.key_scratch),
+    let started = Instant::now();
+    for batch in row_ranges(step.clone(), inserts_per_call) {
+        let (keys, vectors) = match &state.permutation {
+            Permutation::Identity => (
+                state.keys.slice(batch.start, batch.len(), &mut state.key_scratch),
                 state
                     .dataset
-                    .slice(logical_offset, batch, dimensions, &mut state.scratch_buf),
+                    .slice(batch.start, batch.len(), dimensions, &mut state.row_scratch),
             ),
-            dataset::Permutation::Shuffled(indices) => {
-                let indices = &indices[logical_offset..][..batch];
-                for (slot, &row_index) in state.key_scratch.iter_mut().zip(indices) {
-                    *slot = state.keys.get(row_index);
+            Permutation::Shuffled { indices, .. } => {
+                let indices = &indices[batch.clone()];
+                for (slot, &row) in state.key_scratch.iter_mut().zip(indices) {
+                    *slot = state.keys.get(row);
                 }
                 (
-                    &state.key_scratch[..batch],
-                    state.dataset.gather(indices, dimensions, &mut state.scratch_buf),
+                    &state.key_scratch[..indices.len()],
+                    state
+                        .dataset
+                        .gather(indices.iter().copied(), dimensions, &mut state.row_scratch),
                 )
             }
         };
-
-        backend.add(batch_keys, vectors)?;
-        added += batch;
-        *vectors_indexed += batch;
-        let elapsed = add_start.elapsed().as_secs_f64();
-        let throughput = if elapsed > 0.0 {
-            (added as f64 / elapsed) as u64
-        } else {
-            0
-        };
-        progress.set_position(*vectors_indexed as u64);
-        progress.set_message(format!(
-            "{}/{} ({} add/s)",
-            format_thousands(*vectors_indexed as u64),
-            format_thousands(total_vectors as u64),
-            format_thousands(throughput),
+        backend.add(keys, vectors)?;
+        progress.set_position(batch.end as u64);
+        progress.set_message(message(
+            batch.end,
+            per_second(batch.end - step.start, started.elapsed().as_secs_f64()),
         ));
     }
-    let elapsed_secs = add_start.elapsed().as_secs_f64();
-    let throughput_per_sec = if elapsed_secs > 0.0 {
-        (step_count as f64 / elapsed_secs) as u64
-    } else {
-        0
-    };
-    let counter_sample = stop_and_read_counters(perf, "add");
-    progress.set_message(format!(
-        "{}/{} ({} add/s)",
-        format_thousands(*vectors_indexed as u64),
-        format_thousands(total_vectors as u64),
-        format_thousands(throughput_per_sec),
-    ));
+    let elapsed = started.elapsed().as_secs_f64();
+    let counters = stop_and_read_counters(perf, "add");
+    let throughput = per_second(step.len(), elapsed);
+    progress.set_message(message(step.end, throughput));
     progress.finish();
-
-    Ok(AddPhaseOutcome {
-        elapsed_secs,
-        throughput_per_sec,
-        counter_sample,
+    Ok(StepAddEntry {
+        elapsed,
+        throughput,
+        counters,
     })
 }
 
-/// Run all queries against the current index and score them. `vectors_indexed`
-/// only affects normalization; `is_final_step` drops the `~` from the progress
-/// line once the index is complete.
+/// Runs all queries against an index holding `vectors_indexed` vectors and scores them;
+/// `final_step` drops the `~` that marks metrics over a partial index.
 fn run_search_phase(
     backend: &mut dyn Backend,
     state: &mut BenchState,
     perf: &mut Option<perf_counters::PerfCounters>,
-    progress_style: &ProgressStyle,
     dimensions: usize,
+    queries_per_call: usize,
     vectors_indexed: usize,
-    is_final_step: bool,
+    final_step: bool,
 ) -> BenchResult<StepSearchEntry> {
-    let num_queries = state.query_dataset.rows();
+    let query_count = state.query_dataset.rows();
     let count = state.top_k;
-
-    let progress = ProgressBar::new(num_queries as u64);
-    progress.set_style(progress_style.clone());
-    progress.set_position(0);
+    let progress = progress_bar(query_count, "  search [{elapsed_precise}] {bar:40.green/blue} {msg}");
 
     start_counter_capture(perf, "search");
-    let search_start = Instant::now();
-    let mut searched = 0usize;
-    while searched < num_queries {
-        let batch_rows = state.queries_per_call.min(num_queries - searched);
-        let batch_queries = state
+    let started = Instant::now();
+    for batch in row_ranges(0..query_count, queries_per_call) {
+        let queries = state
             .query_dataset
-            .slice(searched, batch_rows, dimensions, &mut state.scratch_buf);
-        let key_offset = searched * count;
-        let key_end = key_offset + batch_rows * count;
-
-        backend.search(
-            batch_queries,
-            count,
-            &mut state.search_buffers.keys[key_offset..key_end],
-            &mut state.search_buffers.distances[key_offset..key_end],
-            &mut state.search_buffers.counts[searched..searched + batch_rows],
-        )?;
-
-        searched += batch_rows;
-        let elapsed = search_start.elapsed().as_secs_f64();
-        let throughput = if elapsed > 0.0 {
-            (searched as f64 / elapsed) as u64
-        } else {
-            0
-        };
-        progress.set_position(searched as u64);
+            .slice(batch.start, batch.len(), dimensions, &mut state.row_scratch);
+        backend.search(queries, state.search_buffers.hits(batch.clone()))?;
+        progress.set_position(batch.end as u64);
         progress.set_message(format!(
             "{}/{} ({} search/s)",
-            format_thousands(searched as u64),
-            format_thousands(num_queries as u64),
-            format_thousands(throughput),
+            format_thousands(batch.end as u64),
+            format_thousands(query_count as u64),
+            format_thousands(per_second(batch.end, started.elapsed().as_secs_f64())),
         ));
     }
-    let elapsed_secs = search_start.elapsed().as_secs_f64();
-    let counter_sample = stop_and_read_counters(perf, "search");
+    let elapsed = started.elapsed().as_secs_f64();
+    let counters = stop_and_read_counters(perf, "search");
+    let throughput = per_second(query_count, elapsed);
+    let scores = eval::score(state.search_buffers.found(), &state.ground_truth, count);
 
-    let throughput_per_sec = if elapsed_secs > 0.0 {
-        (num_queries as f64 / elapsed_secs) as u64
-    } else {
-        0
-    };
-    let recall_at_1 = eval::recall_at_k(
-        &state.search_buffers.keys,
-        &state.search_buffers.counts,
-        count,
-        &state.ground_truth,
-        1,
-    );
-    let recall_at_k = eval::recall_at_k(
-        &state.search_buffers.keys,
-        &state.search_buffers.counts,
-        count,
-        &state.ground_truth,
-        count,
-    );
-    let intersection_at_k = eval::intersection_at_k(
-        &state.search_buffers.keys,
-        &state.search_buffers.counts,
-        count,
-        &state.ground_truth,
-        count,
-    );
-    let ndcg_at_k = eval::ndcg_at_k(
-        &state.search_buffers.keys,
-        &state.search_buffers.counts,
-        count,
-        &state.ground_truth,
-        count,
-    );
-
-    // Metrics are raw. A step that holds only part of the base cannot find the
-    // ground truth it does not hold, so the coverage share is printed alongside
-    // rather than divided out — that correction assumes the indexed slice is a
-    // uniform sample, which a leading prefix is not.
+    // Raw metrics, since dividing out coverage would treat the indexed prefix as a uniform sample.
     let coverage = vectors_indexed as f64 / state.dataset.rows().max(1) as f64;
-    let approx = if is_final_step { "" } else { "~" };
+    let approximate = if final_step { "" } else { "~" };
     progress.finish_with_message(format!(
-        "{} search/s, {approx}recall@1={recall_at_1:.4}, \
-         {approx}recall@{count}={recall_at_k:.4}, \
-         {approx}intersection@{count}={intersection_at_k:.4}, \
-         {approx}NDCG@{count}={ndcg_at_k:.4} ({} vectors, {:.0}% coverage)",
-        format_thousands(throughput_per_sec),
+        "{} search/s, {approximate}recall@1={:.4}, \
+         {approximate}recall@{count}={:.4}, \
+         {approximate}intersection@{count}={:.4}, \
+         {approximate}NDCG@{count}={:.4} ({} vectors, {:.0}% coverage)",
+        format_thousands(throughput),
+        scores.recall_at_1,
+        scores.recall_at_k,
+        scores.intersection_at_k,
+        scores.ndcg_at_k,
         format_thousands(vectors_indexed as u64),
         coverage * 100.0,
     ));
 
     Ok(StepSearchEntry {
-        queries: num_queries,
+        queries: query_count,
         top_k: count,
-        elapsed: elapsed_secs,
-        throughput: throughput_per_sec,
-        recall_at_1,
-        recall_at_k,
-        intersection_at_k: Some(intersection_at_k),
-        ndcg_at_k: Some(ndcg_at_k),
-        counters: PhaseCounters::from_sample(counter_sample.as_ref()),
+        elapsed,
+        throughput,
+        recall_at_1: scores.recall_at_1,
+        recall_at_k: scores.recall_at_k,
+        intersection_at_k: Some(scores.intersection_at_k),
+        ndcg_at_k: Some(scores.ndcg_at_k),
+        counters,
     })
 }
 
-/// Replay every indexed vector as its own query: a vector that is in the index
-/// is its own nearest neighbor, so the top-`count` result for row `i` must
-/// contain `keys[i]`. Identity is the ground truth, which is what makes this
-/// runnable on any dataset — including ones that ship without neighbor files.
-///
-/// Results are scored batch by batch and discarded rather than accumulated:
-/// the whole base at 100M vectors and `count = 10` would otherwise need ~9 GB
-/// of host buffers to hold an answer we reduce to a single counter. Requesting
-/// `count` neighbors also yields self-recall@1 for free, so both are reported.
+/// Replays the leading `query_count` indexed vectors as their own queries: a vector in the index
+/// is its own nearest neighbor, so identity is the ground truth, and any dataset can run it.
+/// Batches are scored and dropped as they land, since a 100M-vector answer matrix would only
+/// reduce to two counters.
 fn run_self_search_phase(
     backend: &mut dyn Backend,
     state: &mut BenchState,
     perf: &mut Option<perf_counters::PerfCounters>,
-    progress_style: &ProgressStyle,
     count: usize,
-    num_queries: usize,
+    query_count: usize,
     dimensions: usize,
+    queries_per_call: usize,
 ) -> BenchResult<StepSearchEntry> {
-    let batch_size = state.queries_per_call.min(num_queries).max(1);
-    let mut batch_keys = {
-        let mut values = Vec::new_in(System);
-        values.resize(batch_size * count, 0 as Key);
-        values
-    };
-    let mut batch_distances = {
-        let mut values = Vec::new_in(System);
-        values.resize(batch_size * count, 0.0 as Distance);
-        values
-    };
-    let mut batch_counts = {
-        let mut values = Vec::new_in(System);
-        values.resize(batch_size, 0usize);
-        values
-    };
-    let mut expected_scratch = {
-        let mut values = Vec::new_in(System);
-        values.resize(batch_size, 0 as Key);
-        values
-    };
-
-    let progress = ProgressBar::new(num_queries as u64);
-    progress.set_style(progress_style.clone());
-    progress.set_position(0);
+    let batch_size = queries_per_call.min(query_count);
+    let mut buffers = SearchBuffers::new(batch_size, count)?;
+    let mut expected_scratch = Vec::with_capacity_in(batch_size, System);
+    expected_scratch.resize(batch_size, 0 as Key);
+    let progress = progress_bar(query_count, "  self   [{elapsed_precise}] {bar:40.magenta/blue} {msg}");
 
     start_counter_capture(perf, "self-recall");
-    let self_search_start = Instant::now();
-    let mut searched = 0usize;
-    let mut hits_at_1 = 0usize;
-    let mut hits_at_k = 0usize;
-    while searched < num_queries {
-        let batch_rows = batch_size.min(num_queries - searched);
-        let expected = state.keys.slice(searched, batch_rows, &mut expected_scratch);
-        let batch_queries = state
+    let started = Instant::now();
+    let (mut hits_at_1, mut hits_at_k) = (0, 0);
+    for batch in row_ranges(0..query_count, batch_size) {
+        let expected = state.keys.slice(batch.start, batch.len(), &mut expected_scratch);
+        let queries = state
             .dataset
-            .slice(searched, batch_rows, dimensions, &mut state.scratch_buf);
-        let key_end = batch_rows * count;
-
-        backend.search(
-            batch_queries,
-            count,
-            &mut batch_keys[..key_end],
-            &mut batch_distances[..key_end],
-            &mut batch_counts[..batch_rows],
-        )?;
-
-        let counts = &batch_counts[..batch_rows];
-        hits_at_1 += eval::self_recall_at_k(&batch_keys, counts, count, expected, 1);
-        hits_at_k += eval::self_recall_at_k(&batch_keys, counts, count, expected, count);
-
-        searched += batch_rows;
-        let elapsed = self_search_start.elapsed().as_secs_f64();
-        let throughput = if elapsed > 0.0 {
-            (searched as f64 / elapsed) as u64
-        } else {
-            0
-        };
-        progress.set_position(searched as u64);
+            .slice(batch.start, batch.len(), dimensions, &mut state.row_scratch);
+        backend.search(queries, buffers.hits(0..batch.len()))?;
+        let (at_1, at_k) = eval::self_recall_hits(buffers.found().take(batch.len()), expected, count);
+        hits_at_1 += at_1;
+        hits_at_k += at_k;
+        progress.set_position(batch.end as u64);
         progress.set_message(format!(
             "{}/{} ({} search/s)",
-            format_thousands(searched as u64),
-            format_thousands(num_queries as u64),
-            format_thousands(throughput),
+            format_thousands(batch.end as u64),
+            format_thousands(query_count as u64),
+            format_thousands(per_second(batch.end, started.elapsed().as_secs_f64())),
         ));
     }
-    let elapsed = self_search_start.elapsed().as_secs_f64();
-    let counter_sample = stop_and_read_counters(perf, "self-recall");
-
-    let throughput = if elapsed > 0.0 {
-        (num_queries as f64 / elapsed) as u64
-    } else {
-        0
-    };
-    let recall_at_1 = hits_at_1 as f64 / num_queries as f64;
-    let recall_at_k = hits_at_k as f64 / num_queries as f64;
-
+    let elapsed = started.elapsed().as_secs_f64();
+    let counters = stop_and_read_counters(perf, "self-recall");
+    let throughput = per_second(query_count, elapsed);
+    let recall_at_1 = hits_at_1 as f64 / query_count as f64;
+    let recall_at_k = hits_at_k as f64 / query_count as f64;
     progress.finish_with_message(format!(
         "{} search/s, recall@1={recall_at_1:.4}, recall@{count}={recall_at_k:.4} ({} queries)",
         format_thousands(throughput),
-        format_thousands(num_queries as u64),
+        format_thousands(query_count as u64),
     ));
 
     Ok(StepSearchEntry {
-        queries: num_queries,
+        queries: query_count,
         top_k: count,
         elapsed,
         throughput,
         recall_at_1,
         recall_at_k,
-        // Identity truth is a single key per query, so neither a set overlap
-        // nor a ranked gain says anything beyond `recall_at_1`.
+        // Identity truth holds one key per query, so only `recall_at_1` is meaningful.
         intersection_at_k: None,
         ndcg_at_k: None,
-        counters: PhaseCounters::from_sample(counter_sample.as_ref()),
+        counters,
     })
 }
 
@@ -1085,24 +1047,6 @@ fn resolve_self_search_sample(sample: Option<SelfSearchSample>, vectors_indexed:
     }
 }
 
-/// Resolve how many vectors the self-recall sweep should replay, given how many
-/// are actually in the index. `None` when `--self-search` was not passed.
-fn self_search_query_count(state: &BenchState, vectors_indexed: usize) -> Option<usize> {
-    if !state.self_search {
-        return None;
-    }
-    let resolved = resolve_self_search_sample(state.self_search_sample, vectors_indexed);
-    (resolved > 0).then_some(resolved)
-}
-
-/// Progress-bar style for the self-recall sweep.
-fn self_search_style() -> ProgressStyle {
-    ProgressStyle::default_bar()
-        .template("  self   [{elapsed_precise}] {bar:40.magenta/blue} {msg}")
-        .unwrap()
-        .progress_chars("##-")
-}
-
 /// Assemble a `ConfigReport` and write it to `<output_dir>/<backend>-<hash>.json`.
 /// No-op when the state has no output directory configured.
 fn save_report(
@@ -1111,17 +1055,14 @@ fn save_report(
     dimensions: usize,
     steps: Vec<StepEntry>,
 ) -> BenchResult<()> {
-    let Some(dir) = &state.output_dir else {
+    let Some(directory) = &state.output_dir else {
         return Ok(());
     };
 
-    // Every harness-level flag that changes what was measured belongs in the
-    // hash, centrally: leaving it to each backend is how `--dims` came to
-    // be missing on two of them, silently overwriting result files. Backends
-    // contribute only their engine-specific knobs.
+    // Every harness flag that changes the measurement belongs in the hash; backends add only their own knobs.
     metadata.insert("dimensions".into(), Value::from(dimensions));
     metadata.insert("vectors_count".into(), Value::from(state.total_vectors));
-    metadata.insert("seed".into(), Value::from(state.seed.map(|seed| seed.0)));
+    metadata.insert("seed".into(), Value::from(state.permutation.seed().map(|seed| seed.0)));
     metadata.insert("steps".into(), Value::from(state.steps));
     metadata.insert("inserts_per_core".into(), Value::from(state.inserts_per_core));
     metadata.insert("queries_per_core".into(), Value::from(state.queries_per_core));
@@ -1130,22 +1071,12 @@ fn save_report(
         metadata.insert("self_search_top_k".into(), Value::from(entry.top_k));
         metadata.insert("self_search_sample".into(), Value::from(entry.queries));
     }
-    let backend_name = metadata.get("backend").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let hash = config_hash(&metadata);
-    let filename = format!("{backend_name}-{hash}.json");
-    let path = dir.join(&filename);
+    let backend_name = metadata.get("backend").and_then(Value::as_str).unwrap_or("unknown");
+    let path = directory.join(format!("{backend_name}-{}.json", config_hash(&metadata)));
 
     let report = ConfigReport {
-        machine: collect_machine_info(),
-        dataset: DatasetInfo {
-            base_vectors_path: state.dataset_info.base_vectors_path.clone(),
-            query_vectors_path: state.dataset_info.query_vectors_path.clone(),
-            query_neighbors_path: state.dataset_info.query_neighbors_path.clone(),
-            vectors_count: state.dataset_info.vectors_count,
-            queries_count: state.dataset_info.queries_count,
-            dimensions: state.dataset_info.dimensions,
-            neighbors_per_query: state.dataset_info.neighbors_per_query,
-        },
+        machine: output::collect_machine_info(),
+        dataset: state.dataset_info.clone(),
         config: metadata,
         steps,
     };
@@ -1155,189 +1086,98 @@ fn save_report(
     Ok(())
 }
 
-/// Run one benchmark configuration. Accumulates steps, writes JSON report at
-/// the end. `dimensions` is the per-vector dimensionality this config exposes to
-/// the backend (≤ native dimensions of the underlying datasets).
-pub fn run(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
-    let total_vectors = state.total_vectors;
-
-    let description = backend.description();
+/// Runs one configuration and writes its report. A fresh index fills step by step and is
+/// measured after each; an index loaded holding `loaded` vectors is measured once.
+pub fn run(
+    backend: &mut dyn Backend,
+    state: &mut BenchState,
+    description: &str,
+    dimensions: usize,
+    loaded: Option<usize>,
+) -> BenchResult<()> {
     let metadata = backend.metadata();
-    state.size_calls(&metadata);
+    let cores = metadata.get("threads").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let inserts_per_call = state.inserts_per_core * cores;
+    let queries_per_call = state.queries_per_core * cores;
+    let row_bytes = state.dataset.vector_bytes().max(state.query_dataset.vector_bytes());
+    state.key_scratch.resize(inserts_per_call, 0 as Key);
+    state
+        .row_scratch
+        .resize(inserts_per_call.max(queries_per_call) * row_bytes, 0);
     eprintln!("\n── {description} ──");
 
-    let num_steps = state.steps;
-    let step_size = total_vectors.div_ceil(num_steps);
-    let add_style = ProgressStyle::default_bar()
-        .template("  add    [{elapsed_precise}] {bar:40.cyan/blue} {msg}")
-        .unwrap()
-        .progress_chars("##-");
-    let search_style = ProgressStyle::default_bar()
-        .template("  search [{elapsed_precise}] {bar:40.green/blue} {msg}")
-        .unwrap()
-        .progress_chars("##-");
+    // Without CAP_PERFMON or on another OS, steps run without counters and their fields stay empty.
+    let mut perf = perf_counters::PerfCounters::new()
+        .inspect(|_| eprintln!("  perf counters: system-wide per-CPU capture enabled"))
+        .inspect_err(|error| eprintln!("  perf counters: unavailable ({error}); running without"))
+        .ok();
 
-    let mut vectors_indexed = 0usize;
-    let mut steps: Vec<StepEntry> = Vec::with_capacity(num_steps);
-
-    // Try to attach system-wide per-CPU hardware perf counters. If the caller
-    // doesn't have CAP_PERFMON / the right paranoia setting, or we're on a
-    // non-Linux target, this returns Err and we fall through to running without
-    // counters — the StepEntry fields stay None and are serde-skipped.
-    let mut perf = match perf_counters::PerfCounters::new() {
-        Ok(pc) => {
-            eprintln!("  perf counters: system-wide per-CPU capture enabled");
-            Some(pc)
+    let mut steps = Vec::with_capacity(state.steps);
+    match loaded {
+        Some(indexed) => {
+            if indexed != state.total_vectors {
+                eprintln!(
+                    "  loaded index holds {} vectors, dataset implies {} — using the index's count",
+                    format_thousands(indexed as u64),
+                    format_thousands(state.total_vectors as u64),
+                );
+            }
+            let search = run_search_phase(backend, state, &mut perf, dimensions, queries_per_call, indexed, true)?;
+            steps.push(StepEntry {
+                vectors_indexed: indexed,
+                memory_bytes: backend.memory_bytes() as u64,
+                add: None,
+                ground_truth_search: Some(search),
+                self_search: None,
+            });
         }
-        Err(err) => {
-            eprintln!("  perf counters: unavailable ({err}); running without");
-            None
+        None => {
+            let total_vectors = state.total_vectors;
+            for step in row_ranges(0..total_vectors, total_vectors.div_ceil(state.steps)) {
+                let add = run_add_phase(backend, state, &mut perf, step.clone(), dimensions, inserts_per_call)?;
+                let final_step = step.end == total_vectors;
+                let search = run_search_phase(
+                    backend,
+                    state,
+                    &mut perf,
+                    dimensions,
+                    queries_per_call,
+                    step.end,
+                    final_step,
+                )?;
+                steps.push(StepEntry {
+                    vectors_indexed: step.end,
+                    memory_bytes: backend.memory_bytes() as u64,
+                    add: Some(add),
+                    ground_truth_search: Some(search),
+                    self_search: None,
+                });
+            }
         }
-    };
+    }
 
-    for step in 0..num_steps {
-        let step_start = step * step_size;
-        let step_count = step_size.min(total_vectors - step_start);
-        let is_final_step = step == num_steps - 1;
-
-        let add = run_add_phase(
-            backend,
-            state,
-            &mut perf,
-            &add_style,
-            StepSlice {
-                start: step_start,
-                count: step_count,
+    // Runs once against the finished index, so it lands on the last step.
+    let vectors_indexed = steps.last().map_or(0, |step| step.vectors_indexed);
+    if let Some(self_search) = state.self_search {
+        let queries = self_search.queries(vectors_indexed);
+        if queries > 0 {
+            let entry = run_self_search_phase(
+                backend,
+                state,
+                &mut perf,
+                self_search.top_k,
+                queries,
                 dimensions,
-            },
-            &mut vectors_indexed,
-        )?;
-
-        let search = run_search_phase(
-            backend,
-            state,
-            &mut perf,
-            &search_style,
-            dimensions,
-            vectors_indexed,
-            is_final_step,
-        )?;
-
-        steps.push(StepEntry {
-            vectors_indexed,
-            memory_bytes: backend.memory_bytes() as u64,
-            add: Some(StepAddEntry {
-                elapsed: add.elapsed_secs,
-                throughput: add.throughput_per_sec,
-                counters: PhaseCounters::from_sample(add.counter_sample.as_ref()),
-            }),
-            ground_truth_search: Some(search),
-            self_search: None,
-        });
-    }
-
-    // Once, against the finished index — a per-step sweep would cost the sum of
-    // every prefix, and on batch-built backends would force a rebuild each time.
-    // It lands on the last step because that is the index state it ran against.
-    if let Some(queries) = self_search_query_count(state, vectors_indexed) {
-        let entry = run_self_search_phase(
-            backend,
-            state,
-            &mut perf,
-            &self_search_style(),
-            state.self_search_top_k,
-            queries,
-            dimensions,
-        )?;
-        if let Some(last) = steps.last_mut() {
-            last.self_search = Some(entry);
+                queries_per_call,
+            )?;
+            if let Some(last) = steps.last_mut() {
+                last.self_search = Some(entry);
+            }
         }
     }
 
-    let peak_memory = steps.iter().map(|s| s.memory_bytes).max().unwrap_or(0);
+    let peak_memory = steps.iter().map(|step| step.memory_bytes).max().unwrap_or(0);
     save_report(state, metadata, dimensions, steps)?;
-
-    eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / (1u64 << 30) as f64);
-    eprintln!();
-    Ok(())
-}
-
-/// Run one benchmark configuration against a pre-built / loaded index — no
-/// add phase. Emits a single `StepEntry` whose `add_*` fields are zero /
-/// `None`. `dimensions` is the per-vector dimensionality the loaded index expects
-/// (queries are sliced at this dimensions before being handed to `search`).
-pub fn run_search_only(backend: &mut dyn Backend, state: &mut BenchState, dimensions: usize) -> BenchResult<()> {
-    // A loaded index need not cover the same slice of the base as this run's
-    // `--max-base-vectors` implies — it was built by an earlier invocation with
-    // its own flags. Prefer the backend's own count; self-recall in particular
-    // reports nonsense if it queries rows the index never saw.
-    let total_vectors = match backend.indexed_count() {
-        Some(indexed) if indexed != state.total_vectors => {
-            eprintln!(
-                "  loaded index holds {} vectors, dataset implies {} — using the index's count",
-                format_thousands(indexed as u64),
-                format_thousands(state.total_vectors as u64),
-            );
-            indexed
-        }
-        Some(indexed) => indexed,
-        None => state.total_vectors,
-    };
-
-    let description = backend.description();
-    let metadata = backend.metadata();
-    state.size_calls(&metadata);
-    eprintln!("\n── {description} (search-only) ──");
-
-    let search_style = ProgressStyle::default_bar()
-        .template("  search [{elapsed_precise}] {bar:40.green/blue} {msg}")
-        .unwrap()
-        .progress_chars("##-");
-
-    let mut perf = match perf_counters::PerfCounters::new() {
-        Ok(pc) => {
-            eprintln!("  perf counters: system-wide per-CPU capture enabled");
-            Some(pc)
-        }
-        Err(err) => {
-            eprintln!("  perf counters: unavailable ({err}); running without");
-            None
-        }
-    };
-
-    let search = run_search_phase(
-        backend,
-        state,
-        &mut perf,
-        &search_style,
-        dimensions,
-        total_vectors,
-        true,
-    )?;
-
-    let mut step = StepEntry {
-        vectors_indexed: total_vectors,
-        memory_bytes: backend.memory_bytes() as u64,
-        add: None,
-        ground_truth_search: Some(search),
-        self_search: None,
-    };
-
-    if let Some(queries) = self_search_query_count(state, total_vectors) {
-        step.self_search = Some(run_self_search_phase(
-            backend,
-            state,
-            &mut perf,
-            &self_search_style(),
-            state.self_search_top_k,
-            queries,
-            dimensions,
-        )?);
-    }
-
-    let peak_memory = step.memory_bytes;
-    save_report(state, metadata, dimensions, vec![step])?;
-
     eprintln!("  peak memory: {:.2} GB", peak_memory as f64 / (1u64 << 30) as f64);
     eprintln!();
     Ok(())
@@ -1348,116 +1188,60 @@ pub fn run_search_only(backend: &mut dyn Backend, state: &mut BenchState, dimens
 /// How one config in a sweep ended up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigOutcome {
-    /// Backend constructed and `run()` returned `Ok(())`.
+    /// Backend constructed and the benchmark ran to the end.
     Ran,
     /// Backend construction failed — config is invalid for this engine (e.g. non-default ef on
     /// FAISS binary HNSW).
     Skipped,
-    /// Backend ran but the benchmark loop errored mid-flight.
+    /// Backend ran but the benchmark loop or the save errored mid-flight.
     Failed,
 }
 
-/// Run an already-constructed backend, routing a construction or run failure to
-/// `Skipped` / `Failed` rather than aborting the sweep. For backends that build
-/// their engine handle eagerly (the server-backed ones) and have no `--index`
-/// branch to take.
-pub fn try_run_config<Index, ConstructError>(
-    description: &str,
-    backend: Result<Index, ConstructError>,
-    state: &mut BenchState,
-    dimensions: usize,
-) -> ConfigOutcome
-where
-    Index: Backend,
-    ConstructError: std::fmt::Display,
-{
-    match backend {
-        Ok(mut backend) => match run(&mut backend, state, dimensions) {
-            Ok(()) => ConfigOutcome::Ran,
-            Err(err) => {
-                eprintln!("\n── {description} — failed ──\n  {err}");
-                ConfigOutcome::Failed
-            }
-        },
-        Err(err) => {
-            eprintln!("\n── {description} — skipped ──\n  {err}");
-            ConfigOutcome::Skipped
-        }
+impl ConfigOutcome {
+    fn skipped(description: &str, error: impl fmt::Display) -> Self {
+        eprintln!("\n── {description} — skipped ──\n  {error}");
+        Self::Skipped
+    }
+
+    fn failed(description: &str, error: impl fmt::Display) -> Self {
+        eprintln!("\n── {description} — failed ──\n  {error}");
+        Self::Failed
     }
 }
 
-/// Run one config, routing failures to `Skipped` / `Failed` instead of
-/// aborting the sweep, and handling the `--index` load-vs-build branch.
-///
-/// - `handle = None` → build and run.
-/// - `handle = Some(h)` and the path **exists** → calls `load(h)` and runs
-///   `run_search_only`. No add phase.
-/// - `handle = Some(h)` and the path **does not exist** → calls `build()`,
-///   runs the full `run`, then `idx.save(h)` once it returns.
-///
-/// Build / load / run / save errors are routed to `Skipped` / `Failed` and
-/// do not abort the surrounding sweep — the caller records the outcome
-/// against a `SweepSummary`.
-pub fn run_config<Index, BuildFn, LoadFn>(
+/// Runs one opened config, measuring a loaded index once and saving a fresh one when
+/// `index_file` asks; failures land in the outcome rather than ending the sweep.
+pub fn run_config(
     description: &str,
-    handle: Option<&str>,
-    build: BuildFn,
-    load: LoadFn,
+    index_file: IndexFile<'_>,
+    backend: Result<impl Backend, impl fmt::Display>,
     state: &mut BenchState,
     dimensions: usize,
-) -> ConfigOutcome
-where
-    Index: Backend,
-    BuildFn: FnOnce() -> Result<Index, String>,
-    LoadFn: FnOnce(&str) -> Result<Index, String>,
-{
-    let load_existing = handle.is_some_and(|h| std::path::Path::new(h).exists());
-
-    if load_existing {
-        let h = handle.unwrap();
-        match load(h) {
-            Ok(mut idx) => match run_search_only(&mut idx, state, dimensions) {
-                Ok(()) => ConfigOutcome::Ran,
-                Err(err) => {
-                    eprintln!("\n── {description} (loaded) — failed ──\n  {err}");
-                    ConfigOutcome::Failed
-                }
-            },
-            Err(err) => {
-                eprintln!("\n── {description} (load[{h}]) — skipped ──\n  {err}");
-                ConfigOutcome::Skipped
-            }
+) -> ConfigOutcome {
+    let mut backend = match backend {
+        Ok(backend) => backend,
+        Err(error) => return ConfigOutcome::skipped(description, error),
+    };
+    let loaded = match index_file {
+        IndexFile::Load(_) => Some(backend.indexed_count().unwrap_or(state.total_vectors)),
+        IndexFile::None | IndexFile::Save(_) => None,
+    };
+    if let Err(error) = run(&mut backend, state, description, dimensions, loaded) {
+        return ConfigOutcome::failed(description, error);
+    }
+    let IndexFile::Save(path) = index_file else {
+        return ConfigOutcome::Ran;
+    };
+    match backend.save(path) {
+        Ok(()) => {
+            eprintln!("  saved index → {path}");
+            ConfigOutcome::Ran
         }
-    } else {
-        match build() {
-            Ok(mut idx) => match run(&mut idx, state, dimensions) {
-                Ok(()) => match handle {
-                    Some(h) => match idx.save(h) {
-                        Ok(()) => {
-                            eprintln!("  saved index → {h}");
-                            ConfigOutcome::Ran
-                        }
-                        Err(err) => {
-                            eprintln!("\n── {description} (save[{h}]) — failed ──\n  {err}");
-                            ConfigOutcome::Failed
-                        }
-                    },
-                    None => ConfigOutcome::Ran,
-                },
-                Err(err) => {
-                    eprintln!("\n── {description} — failed ──\n  {err}");
-                    ConfigOutcome::Failed
-                }
-            },
-            Err(err) => {
-                eprintln!("\n── {description} — skipped ──\n  {err}");
-                ConfigOutcome::Skipped
-            }
-        }
+        Err(error) => ConfigOutcome::failed(description, error),
     }
 }
 
-/// Aggregate outcome counter for a sweep — record per config, print once at the end.
+/// Aggregate outcome counter for a sweep — record per config, report once at the end.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SweepSummary {
     pub ran: usize,
@@ -1474,11 +1258,16 @@ impl SweepSummary {
         }
     }
 
-    pub fn print(&self) {
+    /// Prints the tally and exits with status 1 when a config failed or none ran; servers must
+    /// stop their containers first, since the exit skips destructors.
+    pub fn finish(self) {
         eprintln!(
             "Benchmark complete: {} config(s) ran, {} skipped, {} failed.",
             self.ran, self.skipped, self.failed
         );
+        if self.failed != 0 || self.ran == 0 {
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1588,6 +1377,17 @@ pub struct Threads(pub NonZeroUsize);
 
 impl Threads {
     pub const ONE: Threads = Threads(NonZeroUsize::MIN);
+
+    /// Every logical core the machine's topology reports, at least one.
+    pub fn all_cores() -> Self {
+        let cores = Topology::new().and_then(|topology| topology.logical_cores_count());
+        Self(cores.ok().and_then(NonZeroUsize::new).unwrap_or(NonZeroUsize::MIN))
+    }
+}
+
+/// A ForkUnion pool of `threads` workers over the machine's topology.
+pub fn spawn_pool(threads: Threads) -> fu::Result<ThreadPool> {
+    Topology::new().and_then(|topology| ThreadPool::spawn(&topology, threads.0.get()))
 }
 
 impl fmt::Display for Threads {
@@ -1621,15 +1421,14 @@ pub struct SplitMix64 {
 
 impl SplitMix64 {
     /// The next 64 random bits.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> u64 {
+    pub fn draw(&mut self) -> u64 {
         self.state = self.state.wrapping_add(SPLITMIX64_GAMMA);
         mix(self.state)
     }
 
     /// A draw below `bound`: the high half of a draw times `bound`, with a bias of at most `bound` over 2^64.
     pub fn below(&mut self, bound: u64) -> u64 {
-        ((u128::from(self.next()) * u128::from(bound)) >> 64) as u64
+        ((u128::from(self.draw()) * u128::from(bound)) >> 64) as u64
     }
 }
 
@@ -1656,8 +1455,7 @@ pub fn parse_count_flag(text: &str) -> Result<usize, String> {
 
 /// `parse_threads` for clap, with `0` resolved to every available core.
 pub fn parse_threads_flag(text: &str) -> Result<Threads, String> {
-    let all_cores = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
-    parse_threads(text, all_cores).ok_or_else(|| "expected a count, 0 for all cores".into())
+    parse_threads(text, Threads::all_cores().0).ok_or_else(|| "expected a count, 0 for all cores".into())
 }
 
 /// `parse_seed` for clap.
@@ -1720,47 +1518,55 @@ mod tests {
     use std::alloc::System;
 
     use super::{
-        parse_self_search_sample, resolve_self_search_sample, CastScratch, SearchBuffers, SelfSearchSample, SplitMix64,
-        VectorSlice,
+        parse_self_search_sample, resolve_self_search_sample, CastScratch, Distance, Key, SearchBuffers,
+        SelfSearchSample, SplitMix64, VectorSlice, Vectors,
     };
 
     #[test]
-    fn owned_search_and_conversion_buffers_reuse_allocations() {
-        let mut buffers = SearchBuffers::new_in(System);
-        buffers.resize(8, 4);
-        let pointers = (
-            buffers.keys.as_ptr(),
-            buffers.distances.as_ptr(),
-            buffers.counts.as_ptr(),
-        );
-        buffers.resize(3, 4);
-        assert_eq!(
-            pointers,
-            (
-                buffers.keys.as_ptr(),
-                buffers.distances.as_ptr(),
-                buffers.counts.as_ptr()
-            )
-        );
+    fn hit_rows_pad_count_and_refuse_overflow() {
+        let mut buffers = SearchBuffers::new(2, 3).unwrap();
+        {
+            let mut hits = buffers.hits(0..2);
+            let mut rows = hits.rows();
+            rows.next().unwrap().write([Ok((7, 0.5)), Ok((9, 1.5))]).unwrap();
+            let overflow = rows.next().unwrap().write((0..4).map(|key| Ok((key, 0.0))));
+            assert!(overflow.is_err());
+        }
+        let (keys, distances, found) = buffers.rows().next().unwrap();
+        assert_eq!(keys, [7, 9, Key::MAX]);
+        assert_eq!(distances, [0.5, 1.5, Distance::INFINITY]);
+        assert_eq!(found, 2);
+        assert_eq!(buffers.found().next().unwrap(), [7, 9]);
+    }
+
+    #[test]
+    fn conversions_reuse_allocations_and_pass_matching_types_through() {
         let mut scratch = Vec::new_in(System);
-        assert_eq!(VectorSlice::I8(&[-2, 3]).to_f32_in(&mut scratch).unwrap(), [-2.0, 3.0]);
+        let signed = Vectors::new(VectorSlice::I8(&[-2, 3]), 2);
+        assert_eq!(signed.to_f32_in(&mut scratch).unwrap(), [-2.0, 3.0]);
         let pointer = scratch.as_ptr();
-        assert_eq!(VectorSlice::U8(&[7]).to_f32_in(&mut scratch).unwrap(), [7.0]);
+        let unsigned = Vectors::new(VectorSlice::U8(&[7]), 1);
+        assert_eq!(unsigned.to_f32_in(&mut scratch).unwrap(), [7.0]);
         assert_eq!(pointer, scratch.as_ptr());
         let source = [2.0, 4.0];
-        assert_eq!(
-            VectorSlice::F32(&source).to_f32_in(&mut scratch).unwrap().as_ptr(),
-            source.as_ptr()
-        );
+        let floats = Vectors::new(VectorSlice::F32(&source), 2);
+        assert_eq!(floats.to_f32_in(&mut scratch).unwrap().as_ptr(), source.as_ptr());
         let mut wire = CastScratch::F32(Vec::new_in(System));
-        let pointer = wire.encode(&VectorSlice::I8(&[1, -2, 3])).unwrap().as_ptr();
-        assert_eq!(wire.encode(&VectorSlice::I8(&[4, 5])).unwrap().as_ptr(), pointer);
+        let pointer = wire
+            .encode(&Vectors::new(VectorSlice::I8(&[1, -2, 3]), 3))
+            .unwrap()
+            .as_ptr();
+        assert_eq!(
+            wire.encode(&Vectors::new(VectorSlice::I8(&[4, 5]), 2))
+                .unwrap()
+                .as_ptr(),
+            pointer
+        );
         let bytes = [9u8, 8];
         let mut bytes_wire = CastScratch::U8(Vec::new_in(System));
-        assert_eq!(
-            bytes_wire.encode(&VectorSlice::U8(&bytes)).unwrap().as_ptr(),
-            bytes.as_ptr()
-        );
+        let unsigned = Vectors::new(VectorSlice::U8(&bytes), 2);
+        let passed = bytes_wire.encode(&unsigned).unwrap();
+        assert_eq!(passed.as_ptr(), bytes.as_ptr());
     }
 
     #[test]
@@ -1804,6 +1610,6 @@ mod tests {
 
     #[test]
     fn splitmix64_matches_the_shared_test_vector() {
-        assert_eq!(SplitMix64 { state: 42 }.next(), 0xbdd7_3226_2feb_6e95);
+        assert_eq!(SplitMix64 { state: 42 }.draw(), 0xbdd7_3226_2feb_6e95);
     }
 }
