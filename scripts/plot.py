@@ -1,38 +1,39 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
-# dependencies = ["plotly>=6.1", "kaleido>=1"]
+# requires-python = ">=3.11"
+# dependencies = ["matplotlib>=3.9"]
 # ///
 """
-Generate benchmark plots from JSON result files.
+Generate benchmark charts from JSON result files, as SVG in the diagrams' red palette.
 
 Usage:
-    uv run scripts/plot.py results/ --output-dir plots/
+    uv run scripts/plot.py results/ --output plots/
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import plotly.graph_objects as go
+import matplotlib
 
-COLORS = [
-    "#1f77b4",
-    "#ff7f0e",
-    "#2ca02c",
-    "#d62728",
-    "#9467bd",
-    "#8c564b",
-    "#e377c2",
-    "#7f7f7f",
-    "#bcbd22",
-    "#17becf",
-]
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+THEME = {
+    "field": "#C44536",
+    "ink": "#FFE6A7",
+    "frame": "#E5E5E5",
+    "font": ["Poppins", "Helvetica", "Arial", "sans-serif"],
+}
+# USearch draws at full strength and every other engine at half, as on the USearch page.
+MARKERS = ["o", "s", "D", "^", "v", "P", "X", "*"]
 
 
 def load_reports(input_path: str) -> list[dict[str, Any]]:
@@ -104,43 +105,48 @@ def make_plot(
     filename: str,
     output_dir: Path,
     machine_info: dict[str, Any],
+    logarithmic: bool = False,
 ) -> None:
-    """Generate a single Plotly chart."""
-    fig = go.Figure()
-    for i, report in enumerate(reports):
+    """Draw one chart of `y_fn` against the vectors indexed, one line per report."""
+    figure, axis = plt.subplots(figsize=(16, 9.2))
+    for index, report in enumerate(reports):
         # Points are paired before filtering: dropping only the y-values would
         # shift every remaining point onto the wrong x.
         points = []
         for step in report.get("steps", []):
             value = y_fn(step, report)
-            if value is None:
-                continue
-            points.append((int(step["vectors_indexed"]), value))
+            if value is not None:
+                points.append((int(step["vectors_indexed"]), value))
         # A load run has no add phase, so it contributes nothing to some charts.
-        # Skip it rather than drawing an empty legend entry.
         if not points:
             continue
-        fig.add_trace(
-            go.Scatter(
-                x=[x for x, _ in points],
-                y=[y for _, y in points],
-                mode="lines+markers",
-                name=series_key(report),
-                line={"color": COLORS[i % len(COLORS)]},
-            )
+        leading = (report.get("config") or {}).get("backend") == "usearch"
+        axis.plot(
+            [x for x, _ in points],
+            [y for _, y in points],
+            marker=MARKERS[index % len(MARKERS)],
+            color=THEME["ink"],
+            alpha=1.0 if leading else 0.5,
+            linewidth=3 if leading else 2,
+            label=series_key(report),
         )
-
-    subtitle = (
-        f"<br><sub>{machine_info.get('cpu_model', '')}</sub>" if machine_info else ""
-    )
-    fig.update_layout(
-        title=f"{title}{subtitle}",
-        xaxis_title=x_label,
-        yaxis_title=y_label,
-        template="plotly_white",
-        legend={"x": 0.01, "y": 0.99},
-    )
-    fig.write_image(str(output_dir / filename), width=1200, height=600, scale=2)
+    if logarithmic:
+        axis.set_yscale("log")
+        low, high = axis.get_ylim()
+        axis.set_ylim(
+            10 ** math.floor(math.log10(low)), 10 ** math.ceil(math.log10(high))
+        )
+    else:
+        axis.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.4g}"))
+    axis.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
+    subtitle = machine_info.get("cpu_model", "") if machine_info else ""
+    axis.set_title(f"{title}\n{subtitle}".strip(), loc="left")
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.grid(alpha=0.2)
+    axis.legend(loc="best", frameon=False)
+    figure.savefig(output_dir / filename, format="svg", bbox_inches="tight")
+    plt.close(figure)
 
 
 def main() -> None:
@@ -151,7 +157,7 @@ def main() -> None:
         "input", help="Directory containing JSON result files, or a single file"
     )
     parser.add_argument(
-        "--output-dir", default="plots", help="Output directory for PNGs"
+        "--output", type=Path, help="Output directory, <input>/plots by default"
     )
     args = parser.parse_args()
 
@@ -160,8 +166,28 @@ def main() -> None:
         print("No reports found.", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = Path(args.output_dir)
+    input_path = Path(args.input)
+    output_dir = (
+        args.output
+        or (input_path if input_path.is_dir() else input_path.parent) / "plots"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update(
+        {
+            "figure.facecolor": THEME["field"],
+            "axes.facecolor": THEME["field"],
+            "axes.edgecolor": THEME["frame"],
+            "axes.labelcolor": THEME["ink"],
+            "axes.titlecolor": THEME["ink"],
+            "text.color": THEME["ink"],
+            "xtick.color": THEME["ink"],
+            "ytick.color": THEME["ink"],
+            "grid.color": THEME["ink"],
+            "font.family": THEME["font"],
+            "font.size": 14,
+            "svg.fonttype": "none",
+        }
+    )
 
     machine_info: dict[str, Any] = reports[0].get("machine", {})
     series_names = [series_key(r) for r in reports]
@@ -181,9 +207,10 @@ def main() -> None:
         add_field("throughput"),
         "Vectors Indexed",
         "Vectors / Second",
-        "construction-speed.png",
+        "construction-speed.svg",
         output_dir,
         machine_info,
+        logarithmic=True,
     )
 
     make_plot(
@@ -192,7 +219,7 @@ def main() -> None:
         lambda s, _r: s["memory_bytes"] / 2**30,
         "Vectors Indexed",
         "Memory (GB)",
-        "construction-memory.png",
+        "construction-memory.svg",
         output_dir,
         machine_info,
     )
@@ -203,9 +230,10 @@ def main() -> None:
         ground_truth_field("throughput"),
         "Vectors Indexed",
         "Queries / Second",
-        "search-speed.png",
+        "search-speed.svg",
         output_dir,
         machine_info,
+        logarithmic=True,
     )
 
     make_plot(
@@ -214,7 +242,7 @@ def main() -> None:
         ground_truth_field("recall_at_1"),
         "Vectors Indexed",
         "Recall@1",
-        "recall-at-1.png",
+        "recall-at-1.svg",
         output_dir,
         machine_info,
     )
@@ -225,7 +253,7 @@ def main() -> None:
         ground_truth_field("recall_at_k"),
         "Vectors Indexed",
         f"Recall@{k_label}",
-        "recall-at-k.png",
+        "recall-at-k.svg",
         output_dir,
         machine_info,
     )
@@ -236,7 +264,7 @@ def main() -> None:
         ground_truth_field("intersection_at_k"),
         "Vectors Indexed",
         f"Intersection@{k_label}",
-        "intersection-at-k.png",
+        "intersection-at-k.svg",
         output_dir,
         machine_info,
     )
@@ -247,7 +275,7 @@ def main() -> None:
         ground_truth_field("ndcg_at_k"),
         "Vectors Indexed",
         f"NDCG@{k_label}",
-        "ndcg-at-k.png",
+        "ndcg-at-k.svg",
         output_dir,
         machine_info,
     )
@@ -258,7 +286,7 @@ def main() -> None:
         coverage,
         "Vectors Indexed",
         "Indexed / Base File",
-        "coverage.png",
+        "coverage.svg",
         output_dir,
         machine_info,
     )

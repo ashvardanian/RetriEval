@@ -1,3 +1,5 @@
+# RetriEval
+
 ![RetriEval benchmarks thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/RetriEval.jpg?raw=true)
 
 __RetriEval__ is a benchmarking suite designed for Billion-scale Vector Search workloads.
@@ -25,7 +27,7 @@ retri-eval-usearch \
     --base-vectors data/wiki-1m/base.1M.fbin \
     --query-vectors data/wiki-1m/query.public.100K.fbin \
     --query-neighbors data/wiki-1m/groundtruth.public.100K.ibin \
-    --data-type f32,f16,i8 \
+    --data-type bf16,f16,i8 \
     --metric ip \
     --output results/
 ```
@@ -33,7 +35,7 @@ retri-eval-usearch \
 Generate plots from the results:
 
 ```sh
-uv run scripts/plot.py results/ --output-dir plots/
+uv run scripts/plot.py results/ --output plots/
 ```
 
 ## Backends
@@ -47,6 +49,7 @@ uv run scripts/plot.py results/ --output-dir plots/
 | __cuVS__    | CUDA        | f32, f16, i8, u8                              | l2, ip, cos                   |
 
 - __USearch__: The input is stored in the `--data-type` quantization, converted on the fly.
+  `e3m2` and `e2m3` occupy byte slots; `b1` is packed.
 - __FAISS__: Input is always f32.
   `--data-type` selects the internal scalar quantizer (SQfp16, SQbf16, SQ8_direct, etc.).
 - __cuVS__: Input is converted on the host to the `--data-type`, one of f32, f16, i8 or u8, before CAGRA builds on it.
@@ -189,11 +192,15 @@ Every row follows the same methodology:
 - Never let a row build faster than it searches: when `Add/s` exceeds `Search/s`, raise the construction expansion and lower the search expansion until search is at least as fast at that recall.
 - Confirm the behavior on a 1M–10M subset, then validate the scaling curves at 100M–1B.
 
+Compare the fastest measured configuration meeting the same recall target, with the same recall definition, queries, K, and ground truth.
+Report build time and memory alongside query throughput, and keep query concurrency, batch size, and cache state comparable.
+
 Each search reports both recall conventions, because they answer different questions and one of them saturates:
 
 - `recall_at_k` is 1-recall@K, FAISS's `OneRecallAtRCriterion` and the measure USearch reports.
 - `intersection_at_k` is K-recall@K, `|top-K ∩ ground-truth-K| / K`, order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
-- 1-recall@K ≥ K-recall@K for the same run, so the two are never interchangeable.
+- `ndcg_at_k` weights true hits by `1 / log2(rank + 1)`, normalized by ideal gain.
+- Neither 1-recall@K nor K-recall@K generally bounds the other, so the two are never interchangeable.
 - K is `--top-k`, which defaults to the ground-truth file's width, 10 on the Wiki sets and 100 on the BigANN ones.
 - 1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
   `intersection_at_k` stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix.
@@ -288,12 +295,14 @@ The flag on the command line overrides the variable, and switches like `--self-s
 retri-eval-*
   --base-vectors <PATH|GLOB>            required
       Base vectors to index: .fbin, .u8bin, .i8bin or .b1bin.
-  --base-keys <PATH>                    sequential
-      Keys for the base vectors, .i32bin, one per vector.
-  --query-vectors <PATH>                required
+  --base-keys <PATH|GLOB>               generated
+      Keys for the base vectors, one per vector: .i32bin, .u64bin or .uuidbin.
+  --key-type <TYPE>                     u32
+      Keys generated without --base-keys: u32, u64, uuid-v4 or uuid-v7.
+  --query-vectors <PATH|GLOB>           required
       Query vectors to search with.
-  --query-neighbors <PATH>              required
-      Ground-truth neighbors for those queries, .ibin.
+  --query-neighbors <PATH|GLOB>         required
+      Ground-truth neighbor rows for those queries: .ibin, or .u64bin past 2^32 base rows.
   --top-k <K>                           ground-truth width
       Neighbors per query, the K every metric is taken at; at most the ground-truth width.
   --insertion-order <ORDER>             shuffled
@@ -540,6 +549,23 @@ On a base whose row order carries structure, only the default full sweep is unbi
 Note also that a self-search's `recall_at_k` is very nearly redundant with its `recall_at_1`: a vector's own distance to itself is zero, which is minimal, so if the index retrieves it at all it lands at rank 1.
 Raising `--self-search-top-k` therefore changes how much search work each query does — which is the point when you are measuring throughput — but not the recall value.
 
+### Keys & Order
+
+Keys stay as wide as their input: a keys file is memory-mapped at its own width, and generated keys are computed from the row on demand, so neither costs memory per row.
+`uuid-v7` keys hold the row in their timestamp and counter, so they sort as rows do, while `uuid-v4` keys scatter over the whole key space.
+Each engine stores keys natively where it can:
+
+- __USearch__ takes every key as its 16-byte `Key`.
+- __Qdrant__ keeps keys that fit 64 bits as numeric point ids and the rest as UUID point ids.
+- __Weaviate and SurrealDB__ use each key as the object or record UUID, integers zero-padded.
+- __Redis__ spells keys as UUIDs in the hash names.
+- __LanceDB__ sizes its `id` column to `UInt32`, `UInt64` or `FixedSizeBinary(16)`.
+- __FAISS, cuVS and Turso__ store base rows as their ids and name hits by the rows' keys, so keys of any width cost them nothing; cuVS saves those rows to a `.rows` file beside its index.
+
+Duplicate keys suit USearch and the engines that store rows, FAISS, cuVS and Turso, since the others overwrite a repeated id.
+
+`--insertion-order shuffled` is a seeded Feistel permutation computed per position, so a shuffle of any size stores nothing per row.
+
 ## Observability
 
 Building with `--features perf-counters` adds per-phase hardware counters on Linux, and an external `perf stat` sidecar works on any build.
@@ -587,6 +613,6 @@ Its metrics drop the `self_` prefix because the container already says it, and i
 ## Development
 
 The repository pins Rust 1.100, as `beta-2026-10-18` until its stable release.
-CI runs `cargo fmt --check`, then `cargo clippy` and `cargo test` per feature set; pass the same `--features` locally for optional native engines.
+CI runs `cargo fmt --check`, Ruff on the plotting script, then `cargo clippy` and `cargo test` per feature set; pass the same `--features` locally for optional native engines.
 `src/` holds the shared library in `bench.rs`, one binary per backend and `retri-generate`, `scripts/` the dataset downloaders and plotting, `.githooks/` the Git hooks, and `docker/` the compose files for the server backends.
 Arm the hooks once per clone with `git config core.hooksPath .githooks`.

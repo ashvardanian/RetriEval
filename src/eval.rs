@@ -52,8 +52,8 @@ pub struct Scores {
     pub recall_at_1: f64,
     /// Rank-1 truth found anywhere in the top `k`: the "1-recall@K" / hit-rate convention of
     /// FAISS's `OneRecallAtRCriterion` and USearch's `mean_recall`. It is *not* the set-overlap
-    /// "K-recall@K" that ann-benchmarks and cuVS report, and since 1-recall@K ≥ K-recall@K for the
-    /// same run, the two must not be compared; they coincide at K=1.
+    /// "K-recall@K" that ann-benchmarks and cuVS report. Neither generally bounds the other;
+    /// the two must not be compared as equivalent metrics, and they coincide at K=1.
     pub recall_at_k: f64,
     /// The mean share of each query's top-`k` truth that came back, `|top-K ∩ truth-K| / K`:
     /// FAISS's `IntersectionCriterion`, and what ann-benchmarks and cuVS publish as recall. It

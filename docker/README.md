@@ -1,7 +1,7 @@
 # Docker
 
 Qdrant, Redis, Weaviate and SurrealDB run as Docker containers that each `retri-eval-*` binary spawns and tears down itself.
-The compose files here mirror the port bindings and environment variables hard-coded in those binaries, for starting a server by hand.
+The compose files here mirror the port bindings and environment variables hard-coded in the Qdrant, Redis and Weaviate binaries, for starting a server by hand; SurrealDB's settings live only in `src/surrealdb.rs`.
 
 ## Lifecycle
 

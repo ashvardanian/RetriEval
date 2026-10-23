@@ -3,6 +3,8 @@
 Datasets go here and stay out of version control; only this README and `.gitkeep` are tracked.
 Every file starts with an 8-byte header, a little-endian `u32` row count and a `u32` width, followed by row-major data.
 Vectors use `.fbin`, `.u8bin`, `.i8bin` or `.b1bin`, ground-truth neighbors use `.ibin`, and optional vector keys use `.i32bin`.
+Bases past 2³² rows take ground truth as `.u64bin` rows instead, and keys may also be `.u64bin` integers or `.uuidbin` UUIDs, 16 bytes each, most significant byte first.
+Ground truth always names base rows, and scoring compares the keys of those rows, so several rows may share one key.
 `retri-generate` and the `retri-download-*` binaries write files in this format.
 
 ## Downloads
@@ -29,7 +31,7 @@ retri-eval-usearch \
     --base-vectors data/wiki-1m/base.1M.fbin \
     --query-vectors data/wiki-1m/query.public.100K.fbin \
     --query-neighbors data/wiki-1m/groundtruth.public.100K.ibin \
-    --data-type f32,f16,i8 --metric ip \
+    --data-type bf16,f16,i8 --metric ip \
     --output results/wiki-1m
 ```
 
@@ -50,7 +52,7 @@ retri-eval-usearch \
     --base-vectors data/arxiv-2m/abstract.e5-base-v2.fbin \
     --query-vectors data/arxiv-2m/query.fbin \
     --query-neighbors data/arxiv-2m/groundtruth.ibin \
-    --data-type f32,bf16,f16,i8 --metric ip \
+    --data-type bf16,f16,i8 --metric ip \
     --output results/arxiv-2m
 ```
 
@@ -72,7 +74,7 @@ retri-eval-usearch \
     --base-vectors data/sift-10m/base.10M.u8bin \
     --query-vectors data/sift-10m/query.public.10K.u8bin \
     --query-neighbors data/sift-10m/groundtruth.public.10K.ibin \
-    --data-type f32,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric l2 \
     --output results/sift-10m
 ```
 
@@ -87,7 +89,7 @@ retri-eval-usearch \
     --base-vectors data/sift-100m/base.100M.u8bin \
     --query-vectors data/sift-100m/query.public.10K.u8bin \
     --query-neighbors data/sift-100m/groundtruth.public.10K.ibin \
-    --data-type f32,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric l2 \
     --steps 20 --output results/sift-100m
 ```
 
@@ -117,7 +119,7 @@ retri-eval-usearch \
     --base-vectors data/turing-1m/base.1M.fbin \
     --query-vectors data/turing-1m/query.public.100K.fbin \
     --query-neighbors data/turing-1m/groundtruth.public.100K.ibin \
-    --data-type f32,bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric l2 \
     --output results/turing-1m
 ```
 
@@ -132,7 +134,7 @@ retri-eval-usearch \
     --base-vectors data/turing-10m/base.10M.fbin \
     --query-vectors data/turing-10m/query.public.100K.fbin \
     --query-neighbors data/turing-10m/groundtruth.public.100K.ibin \
-    --data-type f32,bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric l2 \
     --output results/turing-10m
 ```
 
@@ -147,7 +149,7 @@ retri-eval-usearch \
     --base-vectors data/turing-100m/base.100M.fbin \
     --query-vectors data/turing-100m/query.public.100K.fbin \
     --query-neighbors data/turing-100m/groundtruth.public.100K.ibin \
-    --data-type f32,bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric l2 \
     --steps 20 --output results/turing-100m
 ```
 
@@ -167,7 +169,7 @@ retri-eval-usearch \
     --base-vectors data/spacev-100m/base.100M.i8bin \
     --query-vectors data/spacev-100m/query.30K.i8bin \
     --query-neighbors data/spacev-100m/groundtruth.30K.i32bin \
-    --data-type f32,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric l2 \
     --steps 20 --output results/spacev-100m
 ```
 
@@ -201,7 +203,7 @@ retri-eval-usearch \
     --base-vectors data/t2i-1m/base.1M.fbin \
     --query-vectors data/t2i-1m/query.public.100K.fbin \
     --query-neighbors data/t2i-1m/groundtruth.public.100K.ibin \
-    --data-type f32,bf16,f16,i8 --metric cos \
+    --data-type bf16,f16,i8 --metric cos \
     --output results/t2i-1m
 ```
 

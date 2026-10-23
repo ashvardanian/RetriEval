@@ -23,6 +23,10 @@ jobs:
         run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
       - name: Check Formatting
         run: cargo fmt --all -- --check
+      - name: Set Up uv
+        uses: astral-sh/setup-uv@v6
+      - name: Check Python Plotting
+        run: uvx ruff check --target-version py311 --extend-select I scripts/plot.py && uvx ruff format --check scripts/plot.py
       - name: Lint ${{ matrix.name }}
         run: cargo clippy --locked --no-default-features --features '${{ matrix.features }}' --all-targets -- -D warnings
       - name: Test ${{ matrix.name }}
