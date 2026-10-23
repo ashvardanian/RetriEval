@@ -404,9 +404,11 @@ impl Dataset {
     }
 }
 
-/// A shuffled permutation of `[0..n]` for randomizing insertion order.
-pub struct Permutation {
-    indices: Vec<usize, System>,
+/// The order rows are inserted in: the file's own, which needs no indices and reads rows in place,
+/// or a shuffled permutation of `[0..n]`.
+pub enum Permutation {
+    Identity,
+    Shuffled(Vec<usize, System>),
 }
 
 impl Permutation {
@@ -430,7 +432,7 @@ impl Permutation {
         };
         if n < PERMUTATION_SERIAL_THRESHOLD {
             fisher_yates_shuffle(&mut indices, seed, 0);
-            return Self { indices };
+            return Self::Shuffled(indices);
         }
 
         let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get());
@@ -465,23 +467,7 @@ impl Permutation {
             }
         }
 
-        Self { indices }
-    }
-
-    /// Identity permutation (no shuffle).
-    pub fn identity(n: usize) -> Self {
-        Self {
-            indices: {
-                let mut values = Vec::with_capacity_in(n, System);
-                values.extend(0..n);
-                values
-            },
-        }
-    }
-
-    /// Get the permuted indices for a contiguous range `[start..start+count]`.
-    pub fn range(&self, start: usize, count: usize) -> &[usize] {
-        &self.indices[start..start + count]
+        Self::Shuffled(indices)
     }
 }
 

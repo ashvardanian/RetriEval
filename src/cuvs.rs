@@ -74,8 +74,8 @@ use numkong as nk;
 use serde_json::json;
 
 use retrieval::{
-    run_config, spell_list, Backend, BenchState, CommonArgs, Distance, IndexConfig, Key, SweepSummary, UnwrapOrBail,
-    Vectors,
+    run_config, spell_list, Backend, BenchState, CastScratch, CommonArgs, Distance, IndexConfig, Key, SweepSummary,
+    UnwrapOrBail, Vectors,
 };
 
 // #region CudaAllocator
@@ -188,34 +188,6 @@ impl CuvsDataType {
             Self::F32 => 4,
             Self::F16 => 2,
             Self::I8 | Self::U8 => 1,
-        }
-    }
-
-    /// Convert f32 values to the target data_type, appending raw bytes to `output`.
-    fn convert_from_f32(self, source: &[f32], output: &mut Vec<u8, std::alloc::System>) {
-        match self {
-            Self::F32 => {
-                let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * 4) };
-                output.extend_from_slice(bytes);
-            }
-            Self::F16 => {
-                output.reserve(source.len() * 2);
-                for &value in source {
-                    output.extend_from_slice(&nk::f16::from_f32(value).0.to_ne_bytes());
-                }
-            }
-            Self::I8 => {
-                output.reserve(source.len());
-                for &value in source {
-                    output.push(value.clamp(-128.0, 127.0) as i8 as u8);
-                }
-            }
-            Self::U8 => {
-                output.reserve(source.len());
-                for &value in source {
-                    output.push(value.clamp(0.0, 255.0) as u8);
-                }
-            }
         }
     }
 }
@@ -449,9 +421,6 @@ struct SearchBuffers {
     neighbors_host: Vec<Key, std::alloc::System>,
     distances_host: Vec<Distance, std::alloc::System>,
 
-    /// Reusable host-side buffer for data_type conversion before H2D copy.
-    query_staging: Vec<u8, std::alloc::System>,
-
     /// Search params, cached for as long as `neighbor_count` holds — the itopk
     /// floor is derived from it, so a different neighbor count needs new params.
     search_params: cuvs::cagra::SearchParams,
@@ -493,7 +462,6 @@ impl SearchBuffers {
                 v.resize(capacity_queries * neighbor_count, Distance::default());
                 v
             },
-            query_staging: Vec::new_in(std::alloc::System),
             search_params,
         })
     }
@@ -592,6 +560,17 @@ fn spell_count_or_auto<T: fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "auto".into(), |count| count.to_string())
 }
 
+impl From<CuvsDataType> for CastScratch {
+    fn from(data_type: CuvsDataType) -> Self {
+        match data_type {
+            CuvsDataType::F32 => Self::F32(Vec::new_in(std::alloc::System)),
+            CuvsDataType::F16 => Self::F16(Vec::new_in(std::alloc::System)),
+            CuvsDataType::I8 => Self::I8(Vec::new_in(std::alloc::System)),
+            CuvsDataType::U8 => Self::U8(Vec::new_in(std::alloc::System)),
+        }
+    }
+}
+
 // #region Metric
 
 /// CAGRA metrics, as `--metric` spells them.
@@ -651,7 +630,8 @@ impl fmt::Display for BuildAlgo {
 // #region Backend
 
 pub struct CuvsBackend {
-    scratch: Vec<f32, std::alloc::System>,
+    /// Input cast to `data_type` on the host, before it is appended or copied to the device.
+    cast: CastScratch,
     // GPU resources that depend on `res` are declared BEFORE `res`
     // so they drop first (Rust drops fields in declaration order).
     search_buffers: Option<SearchBuffers>,
@@ -736,7 +716,7 @@ impl CuvsBackend {
         metadata.insert("num_random_samplings".into(), json!(num_random_samplings.unwrap_or(0)));
 
         Ok(Self {
-            scratch: Vec::new_in(std::alloc::System),
+            cast: data_type.into(),
             search_buffers: None,
             index: None,
             res,
@@ -812,7 +792,7 @@ impl CuvsBackend {
         metadata.insert("num_random_samplings".into(), serde_json::Value::Null);
 
         Ok(Self {
-            scratch: Vec::new_in(std::alloc::System),
+            cast: data_type.into(),
             search_buffers: None,
             index: Some(index),
             res,
@@ -939,8 +919,8 @@ impl Backend for CuvsBackend {
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        let f32_data = vectors.data.to_f32_in(&mut self.scratch)?;
-        self.data_type.convert_from_f32(f32_data, &mut self.host_vectors);
+        let bytes = self.cast.encode(&vectors.data)?;
+        self.host_vectors.extend_from_slice(bytes);
         self.host_keys.extend_from_slice(keys);
         self.dirty = true;
         Ok(())
@@ -982,19 +962,9 @@ impl Backend for CuvsBackend {
         let buffers = self.search_buffers.as_mut().unwrap();
         buffers.set_batch_rows(num_queries);
 
-        // Upload queries to GPU. For f32 data_type, copy directly from the source
-        // data without an intermediate staging buffer.
-        let query_f32 = queries.data.to_f32_in(&mut self.scratch)?;
-        if matches!(self.data_type, CuvsDataType::F32) {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(query_f32.as_ptr() as *const u8, std::mem::size_of_val(query_f32))
-            };
-            unsafe { Self::host_to_device(&self.res, bytes, buffers.queries.as_mut_ptr())? };
-        } else {
-            buffers.query_staging.clear();
-            self.data_type.convert_from_f32(query_f32, &mut buffers.query_staging);
-            unsafe { Self::host_to_device(&self.res, &buffers.query_staging, buffers.queries.as_mut_ptr())? };
-        }
+        // Queries already in `data_type` upload straight from the source rows.
+        let bytes = self.cast.encode(&queries.data)?;
+        unsafe { Self::host_to_device(&self.res, bytes, buffers.queries.as_mut_ptr())? };
 
         // Non-owning DLPack views over the pre-allocated GpuTensor memory.
         // We pass raw `*mut DLManagedTensor` pointers into cuvs-sys directly,
@@ -1105,8 +1075,10 @@ fn main() {
     eprintln!("- Connectivity: {}", spell_list(&cli.connectivity));
     eprintln!("- Expansion add: {}", spell_list(&cli.expansion_add));
     eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
-    let search_widths: Vec<String> = cli.search_width.iter().copied().map(spell_count_or_auto).collect();
-    eprintln!("- Search width: {}", search_widths.join(","));
+    eprintln!(
+        "- Search width: {}",
+        spell_list(cli.search_width.iter().copied().map(spell_count_or_auto))
+    );
     eprintln!("- Min iterations: {}", spell_count_or_auto(cli.min_iterations));
     eprintln!("- Max iterations: {}", spell_count_or_auto(cli.max_iterations));
     eprintln!("- Random samplings: {}", spell_count_or_auto(cli.num_random_samplings));

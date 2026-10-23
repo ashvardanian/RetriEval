@@ -21,7 +21,7 @@ jobs:
         uses: astral-sh/setup-uv@v6
       - name: Install BLAS, LAPACK, OpenMP and Protobuf
         run: sudo apt-get update && sudo apt-get install -y libblas-dev liblapack-dev libomp-dev protobuf-compiler
-      - name: Install Nightly Rust with Rustfmt and Clippy
-        run: rustup toolchain install nightly-2026-09-24 --profile minimal --component rustfmt,clippy
+      - name: Install Rust 1.100 with Rustfmt and Clippy
+        run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
       - name: Format, Lint and Test ${{ matrix.name }}
         run: scripts/check.sh '${{ matrix.features }}'

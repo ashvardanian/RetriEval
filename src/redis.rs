@@ -21,15 +21,14 @@
 //!     --output results/
 //! ```
 
-use std::{fmt, time::Duration};
+use std::{fmt, fmt::Write, time::Duration};
 
 use clap::Parser;
 use itertools::iproduct;
-use numkong as nk;
 use serde_json::json;
 
 use retrieval::{
-    bail, docker::ContainerHandle, pod_slice_as_bytes, spell_duration, spell_list, try_run_config, Backend, BenchState,
+    bail, docker::ContainerHandle, spell_duration, spell_list, try_run_config, Backend, BenchState, CastScratch,
     CommonArgs, Distance, Key, Port, SweepSummary, UnwrapOrBail, VectorSlice, Vectors,
 };
 
@@ -73,6 +72,19 @@ enum DataType {
     I8,
 }
 
+impl From<DataType> for CastScratch {
+    fn from(data_type: DataType) -> Self {
+        match data_type {
+            DataType::F64 => Self::F64(Vec::new_in(std::alloc::System)),
+            DataType::F32 => Self::F32(Vec::new_in(std::alloc::System)),
+            DataType::Bf16 => Self::BF16(Vec::new_in(std::alloc::System)),
+            DataType::F16 => Self::F16(Vec::new_in(std::alloc::System)),
+            DataType::I8 => Self::I8(Vec::new_in(std::alloc::System)),
+            DataType::U8 => Self::U8(Vec::new_in(std::alloc::System)),
+        }
+    }
+}
+
 impl fmt::Display for DataType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         retrieval::spell_value(self, formatter)
@@ -104,60 +116,6 @@ impl From<DataType> for RedisDataType {
             bytes_per_element,
         }
     }
-}
-
-enum WireScratch {
-    F32(Vec<f32, std::alloc::System>),
-    F64(Vec<f64, std::alloc::System>),
-    F16(Vec<nk::f16, std::alloc::System>),
-    BF16(Vec<nk::bf16, std::alloc::System>),
-    U8(Vec<u8, std::alloc::System>),
-    I8(Vec<i8, std::alloc::System>),
-}
-impl WireScratch {
-    fn new(data_type: RedisDataType) -> Self {
-        match data_type.token {
-            "FLOAT32" => Self::F32(Vec::new_in(std::alloc::System)),
-            "FLOAT64" => Self::F64(Vec::new_in(std::alloc::System)),
-            "FLOAT16" => Self::F16(Vec::new_in(std::alloc::System)),
-            "BFLOAT16" => Self::BF16(Vec::new_in(std::alloc::System)),
-            "UINT8" => Self::U8(Vec::new_in(std::alloc::System)),
-            "INT8" => Self::I8(Vec::new_in(std::alloc::System)),
-            _ => unreachable!(),
-        }
-    }
-    fn encode<'a>(&'a mut self, source: &'a VectorSlice<'_>, start: usize, end: usize) -> &'a [u8] {
-        match (&mut *self, source) {
-            (Self::F32(_), VectorSlice::F32(data)) => return unsafe { pod_slice_as_bytes(&data[start..end]) },
-            (Self::I8(_), VectorSlice::I8(data)) => return unsafe { pod_slice_as_bytes(&data[start..end]) },
-            (Self::U8(_), VectorSlice::U8(data)) => return &data[start..end],
-            _ => {}
-        }
-        match self {
-            Self::F32(v) => cast_into(source, start, end, v),
-            Self::F64(v) => cast_into(source, start, end, v),
-            Self::F16(v) => cast_into(source, start, end, v),
-            Self::BF16(v) => cast_into(source, start, end, v),
-            Self::U8(v) => cast_into(source, start, end, v),
-            Self::I8(v) => cast_into(source, start, end, v),
-        }
-    }
-}
-fn cast_into<'a, T: nk::CastDType + Copy + Default>(
-    source: &VectorSlice<'_>,
-    start: usize,
-    end: usize,
-    target: &'a mut Vec<T, std::alloc::System>,
-) -> &'a [u8] {
-    target.resize(end - start, T::default());
-    let result = match source {
-        VectorSlice::F32(v) => nk::cast(&v[start..end], target),
-        VectorSlice::I8(v) => nk::cast(&v[start..end], target),
-        VectorSlice::U8(v) => nk::cast(&v[start..end], target),
-        VectorSlice::B1x8(_) => unreachable!(),
-    };
-    result.expect("matching conversion lengths");
-    unsafe { pod_slice_as_bytes(target) }
 }
 
 // #region CLI
@@ -220,7 +178,9 @@ struct Cli {
 
 struct RedisBackend {
     connection: redis::Connection,
-    wire: WireScratch,
+    wire: CastScratch,
+    /// One key at a time, spelled into the same buffer before the pipeline copies it.
+    key: String,
     pipeline: redis::Pipeline,
     container: Option<ContainerHandle>,
     runtime: tokio::runtime::Handle,
@@ -243,30 +203,25 @@ impl Backend for RedisBackend {
     }
 
     fn add(&mut self, keys: &[Key], vectors: Vectors) -> Result<(), String> {
-        if matches!(vectors.data, retrieval::VectorSlice::B1x8(_)) {
+        if matches!(vectors.data, VectorSlice::B1x8(_)) {
             return Err("This backend does not support packed binary input".into());
         }
         let dimensions = vectors.dimensions;
         let num_vectors = vectors.len();
         let bytes_per_row = dimensions * self.data_type.bytes_per_element;
+        let encoded = self.wire.encode(&vectors.data)?;
 
         for batch_start in (0..num_vectors).step_by(self.batch_size) {
             let batch_end = (batch_start + self.batch_size).min(num_vectors);
-            let batch_rows = batch_end - batch_start;
-            let encoded = self
-                .wire
-                .encode(&vectors.data, batch_start * dimensions, batch_end * dimensions);
-
             self.pipeline.clear();
             let pipe = &mut self.pipeline;
-            for row_within_batch in 0..batch_rows {
-                let global_index = batch_start + row_within_batch;
-                let key = format!("{PREFIX}{}", keys[global_index]);
-                pipe.cmd("HSET")
-                    .arg(&key)
-                    .arg("vector")
-                    .arg(&encoded[row_within_batch * bytes_per_row..(row_within_batch + 1) * bytes_per_row])
-                    .ignore();
+            for (&key, row) in keys[batch_start..batch_end]
+                .iter()
+                .zip(encoded[batch_start * bytes_per_row..].chunks_exact(bytes_per_row))
+            {
+                self.key.clear();
+                write!(self.key, "{PREFIX}{key}").expect("a String takes any write");
+                pipe.cmd("HSET").arg(&self.key).arg("vector").arg(row).ignore();
             }
             let _: () = pipe
                 .query(&mut self.connection)
@@ -283,7 +238,7 @@ impl Backend for RedisBackend {
         out_distances: &mut [Distance],
         out_counts: &mut [usize],
     ) -> Result<(), String> {
-        if matches!(queries.data, retrieval::VectorSlice::B1x8(_)) {
+        if matches!(queries.data, VectorSlice::B1x8(_)) {
             return Err("This backend does not support packed binary input".into());
         }
         let dimensions = queries.dimensions;
@@ -293,7 +248,7 @@ impl Backend for RedisBackend {
         let ef_runtime = self.expansion_search.max(count);
         let query_str = format!("*=>[KNN {count} @vector $BLOB EF_RUNTIME {ef_runtime}]");
 
-        let encoded = self.wire.encode(&queries.data, 0, num_vectors * dimensions);
+        let encoded = self.wire.encode(&queries.data)?;
         self.pipeline.clear();
 
         for query_index in 0..num_vectors {
@@ -529,7 +484,8 @@ fn main() {
         );
         let backend = RedisBackend {
             connection: conn,
-            wire: WireScratch::new(data_type),
+            wire: data_type_name.into(),
+            key: String::new(),
             pipeline: redis::pipe(),
             container: container_for_this_run,
             runtime: runtime.handle().clone(),
@@ -583,12 +539,5 @@ mod tests {
             redis::Value::Array(vec![]),
         ]);
         assert!(decode_ft_search(&malformed, &mut keys, &mut distances).is_err());
-    }
-    #[test]
-    fn conversion_reuses_typed_wire_allocation() {
-        let mut wire = WireScratch::F32(Vec::new_in(std::alloc::System));
-        let source = VectorSlice::I8(&[1, -2, 3]);
-        let pointer = wire.encode(&source, 0, 3).as_ptr();
-        assert_eq!(wire.encode(&source, 0, 2).as_ptr(), pointer);
     }
 }

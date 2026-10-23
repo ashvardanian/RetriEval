@@ -160,7 +160,7 @@ pub fn write_report(path: &Path, report: &ConfigReport) -> std::io::Result<()> {
 /// Generate a short hash from config metadata for file naming.
 pub fn config_hash(config: &HashMap<String, Value>) -> String {
     let mut hasher = DefaultHasher::new();
-    let mut sorted = std::collections::BTreeMap::new_in(std::alloc::System);
+    let mut sorted = std::collections::BTreeMap::new();
     sorted.extend(config.iter());
     format!("{sorted:?}").hash(&mut hasher);
     format!("{:06x}", hasher.finish() & CONFIG_HASH_MASK)

@@ -573,6 +573,6 @@ Its metrics drop the `self_` prefix because the container already says it, and i
 
 ## Development
 
-The repository pins `nightly-2026-09-24`.
+The repository pins Rust 1.100, as `beta-2026-10-18` until its stable release.
 Run `scripts/check.sh` for formatting, Clippy, and CPU tests; pass an explicit feature list for optional native engines.
 `src/` holds the shared library in `bench.rs`, one binary per backend and `retri-generate`, `scripts/` the dataset downloaders, plotting and Git hooks, and `docker/` the compose files for the server backends.

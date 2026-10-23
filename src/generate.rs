@@ -89,8 +89,10 @@ fn compute_top_k_tiled<Metric: PackedDistance>(
     let mut pool = spawn_pool(threads)?;
     // One packed tile, one distance tile and one ranking for the whole call, reused tile after tile.
     let mut packed_tile = nk::DotsPackedMatrix::<Metric>::empty_in(nk::Global);
-    let mut distances = vec![Metric::Distance::default(); query_count * tile_rows];
-    let mut best = vec![(Metric::WORST_KEY, u32::MAX); query_count * top_k];
+    let mut distances = Vec::with_capacity_in(query_count * tile_rows, std::alloc::System);
+    distances.resize(query_count * tile_rows, Metric::Distance::default());
+    let mut best = Vec::with_capacity_in(query_count * top_k, std::alloc::System);
+    best.resize(query_count * top_k, (Metric::WORST_KEY, u32::MAX));
     let progress = ground_truth_progress(base_count, Metric::metric_name());
 
     let mut tile_start = 0;
@@ -191,12 +193,15 @@ fn compute_shape_top_k_tiled(
     );
 
     let mut pool = spawn_pool(threads)?;
-    let query_clouds: Vec<&[[nk::f16; 3]]> = queries.each().collect();
+    let mut query_clouds = Vec::with_capacity_in(query_count, std::alloc::System);
+    query_clouds.extend(queries.each());
     let packed_queries = nk::ShapesPackedMatrix::new_parallel_in(&query_clouds, nk::Global, &mut pool)?;
     // One tile of cloud borrows, one score tile and one ranking for the whole call.
-    let mut tile_clouds: Vec<&[[nk::f16; 3]]> = Vec::with_capacity(tile_rows);
-    let mut scores = vec![0.0f32; query_count * tile_rows];
-    let mut best = vec![(u32::MAX, u32::MAX); query_count * top_k];
+    let mut tile_clouds = Vec::with_capacity_in(tile_rows, std::alloc::System);
+    let mut scores = Vec::with_capacity_in(query_count * tile_rows, std::alloc::System);
+    scores.resize(query_count * tile_rows, 0.0f32);
+    let mut best = Vec::with_capacity_in(query_count * top_k, std::alloc::System);
+    best.resize(query_count * top_k, (u32::MAX, u32::MAX));
     let progress = ground_truth_progress(base_count, "shapes");
 
     let mut tile_start = 0;

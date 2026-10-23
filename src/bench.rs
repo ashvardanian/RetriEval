@@ -3,8 +3,6 @@
 //! This is the library root. Backend binaries (`usearch.rs`, `faiss.rs`, etc.)
 //! import from here and provide their own `main()`.
 
-#![feature(btreemap_alloc)]
-
 // The generator is also compiled as a standalone binary.
 extern crate self as retrieval;
 
@@ -31,6 +29,7 @@ use std::{
 };
 
 use indicatif::{ProgressBar, ProgressStyle};
+use numkong as nk;
 use serde_json::Value;
 
 #[cfg(feature = "download")]
@@ -73,14 +72,64 @@ impl VectorSlice<'_> {
         if let Self::F32(values) = self {
             return Ok(values);
         }
-        scratch.clear();
-        match self {
-            Self::I8(values) => scratch.extend(values.iter().map(|&v| v as f32)),
-            Self::U8(values) => scratch.extend(values.iter().map(|&v| v as f32)),
-            Self::B1x8(_) => return Err("Packed binary input cannot be converted to dense F32 without a bit metric"),
-            Self::F32(_) => unreachable!(),
+        cast_in(self, scratch)
+    }
+}
+
+/// Casts every value of `source` into `target`, resized to fit, with NumKong's conversions.
+fn cast_in<'a, T: nk::CastDType + Copy + Default, A: Allocator>(
+    source: &VectorSlice<'_>,
+    target: &'a mut Vec<T, A>,
+) -> Result<&'a [T], &'static str> {
+    let cast = match source {
+        VectorSlice::F32(values) => cast_values(values, target),
+        VectorSlice::I8(values) => cast_values(values, target),
+        VectorSlice::U8(values) => cast_values(values, target),
+        VectorSlice::B1x8(_) => return Err("Packed binary input cannot be cast to a dense type without a bit metric"),
+    };
+    cast.expect("matching conversion lengths");
+    Ok(target)
+}
+
+fn cast_values<Source: nk::CastDType, T: nk::CastDType + Copy + Default, A: Allocator>(
+    values: &[Source],
+    target: &mut Vec<T, A>,
+) -> Result<(), nk::Error> {
+    target.clear();
+    target.resize(values.len(), T::default());
+    nk::cast(values, target)
+}
+
+/// A backend's wire buffer in its stored scalar type: input already in that type passes through as
+/// bytes, and any other input is cast into the buffer.
+pub enum CastScratch {
+    F64(Vec<f64, System>),
+    F32(Vec<f32, System>),
+    BF16(Vec<nk::bf16, System>),
+    F16(Vec<nk::f16, System>),
+    I8(Vec<i8, System>),
+    U8(Vec<u8, System>),
+}
+
+impl CastScratch {
+    /// The bytes of `source` in this buffer's scalar type.
+    pub fn encode<'a>(&'a mut self, source: &'a VectorSlice<'_>) -> Result<&'a [u8], &'static str> {
+        match (&mut *self, source) {
+            // SAFETY: `f32` and `i8` are POD.
+            (Self::F32(_), VectorSlice::F32(values)) => return Ok(unsafe { pod_slice_as_bytes(values) }),
+            (Self::I8(_), VectorSlice::I8(values)) => return Ok(unsafe { pod_slice_as_bytes(values) }),
+            (Self::U8(_), VectorSlice::U8(values)) => return Ok(values),
+            _ => {}
         }
-        Ok(scratch)
+        // SAFETY: every scalar type here is POD.
+        Ok(match self {
+            Self::F64(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
+            Self::F32(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
+            Self::BF16(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
+            Self::F16(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
+            Self::I8(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
+            Self::U8(target) => unsafe { pod_slice_as_bytes(cast_in(source, target)?) },
+        })
     }
 }
 
@@ -532,7 +581,7 @@ impl BenchState {
             eprintln!("- Seed: {seed}");
         }
         eprintln!("- Top k: {top_k}");
-        eprintln!("- Dims: {}", spell_list(&args.dimensions_sweep(dimensions)));
+        eprintln!("- Dims: {}", spell_list(args.dimensions_sweep(dimensions)));
         eprintln!("- Steps: {}", args.steps);
         eprintln!("- Inserts per core: {}", args.inserts_per_core);
         eprintln!("- Queries per core: {}", args.queries_per_core);
@@ -555,7 +604,7 @@ impl BenchState {
         }
 
         let perm = match seed {
-            None => dataset::Permutation::identity(total_vectors),
+            None => dataset::Permutation::Identity,
             Some(seed) => dataset::Permutation::shuffled(total_vectors, seed),
         };
 
@@ -699,13 +748,24 @@ fn run_add_phase(
     while added < step_count {
         let batch = inserts_per_call.min(step_count - added);
         let logical_offset = step_start + added;
-        let indices = state.perm.range(logical_offset, batch);
-
-        for (slot, &row_index) in indices.iter().enumerate() {
-            state.key_scratch[slot] = state.keys.get(row_index);
-        }
-        let batch_keys = &state.key_scratch[..batch];
-        let vectors = state.dataset.gather(indices, dimensions, &mut state.scratch_buf);
+        let (batch_keys, vectors) = match &state.perm {
+            dataset::Permutation::Identity => (
+                state.keys.slice(logical_offset, batch, &mut state.key_scratch),
+                state
+                    .dataset
+                    .slice(logical_offset, batch, dimensions, &mut state.scratch_buf),
+            ),
+            dataset::Permutation::Shuffled(indices) => {
+                let indices = &indices[logical_offset..][..batch];
+                for (slot, &row_index) in state.key_scratch.iter_mut().zip(indices) {
+                    *slot = state.keys.get(row_index);
+                }
+                (
+                    &state.key_scratch[..batch],
+                    state.dataset.gather(indices, dimensions, &mut state.scratch_buf),
+                )
+            }
+        };
 
         backend.add(batch_keys, vectors)?;
         added += batch;
@@ -1626,8 +1686,13 @@ pub fn spell_value<T: clap::ValueEnum>(value: &T, formatter: &mut fmt::Formatter
 }
 
 /// Spells a list the way a comma-separated sweep flag reads it: `16,32`.
-pub fn spell_list<T: fmt::Display>(values: &[T]) -> String {
-    values.iter().map(T::to_string).collect::<Vec<_>>().join(",")
+pub fn spell_list<T: fmt::Display>(values: impl IntoIterator<Item = T>) -> String {
+    let mut spelled = String::new();
+    for (index, value) in values.into_iter().enumerate() {
+        let separator = if index == 0 { "" } else { "," };
+        fmt::Write::write_fmt(&mut spelled, format_args!("{separator}{value}")).expect("a String takes any write");
+    }
+    spelled
 }
 
 /// Sugar for the recurring `result.unwrap_or_else(|e| bail(&format!("{prefix}: {e}")))`
@@ -1655,7 +1720,8 @@ mod tests {
     use std::alloc::System;
 
     use super::{
-        parse_self_search_sample, resolve_self_search_sample, SearchBuffers, SelfSearchSample, SplitMix64, VectorSlice,
+        parse_self_search_sample, resolve_self_search_sample, CastScratch, SearchBuffers, SelfSearchSample, SplitMix64,
+        VectorSlice,
     };
 
     #[test]
@@ -1685,6 +1751,15 @@ mod tests {
         assert_eq!(
             VectorSlice::F32(&source).to_f32_in(&mut scratch).unwrap().as_ptr(),
             source.as_ptr()
+        );
+        let mut wire = CastScratch::F32(Vec::new_in(System));
+        let pointer = wire.encode(&VectorSlice::I8(&[1, -2, 3])).unwrap().as_ptr();
+        assert_eq!(wire.encode(&VectorSlice::I8(&[4, 5])).unwrap().as_ptr(), pointer);
+        let bytes = [9u8, 8];
+        let mut bytes_wire = CastScratch::U8(Vec::new_in(System));
+        assert_eq!(
+            bytes_wire.encode(&VectorSlice::U8(&bytes)).unwrap().as_ptr(),
+            bytes.as_ptr()
         );
     }
 
