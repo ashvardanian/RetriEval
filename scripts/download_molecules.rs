@@ -1,6 +1,7 @@
 //! Download a subset of the USearchMolecules dataset, extract one binary
 //! fingerprint column into `.b1bin` base parts, and precompute
-//! Hamming top-K ground truth with NumKong + ForkUnion.
+//! Hamming top-K ground truth with NumKong + ForkUnion; or extract the
+//! first conformer of every embedded molecule into point-cloud parts.
 //!
 //! ## Build & Install
 //!
@@ -31,6 +32,16 @@
 //!     --top-k 100 \
 //!     --output datasets/gdb13_100M_ecfp4/
 //! ```
+//!
+//! Every embedded PubChem molecule's first conformer, hydrogens included, in 8 parts
+//! of `f16` xyz points beside their per-cloud counts:
+//! ```sh
+//! retri-download-molecules \
+//!     --source pubchem \
+//!     --conformers \
+//!     --part-rows 15000000 \
+//!     --output datasets/pubchem-conformers-113m/
+//! ```
 
 use std::{
     fmt,
@@ -40,7 +51,11 @@ use std::{
     time::Duration,
 };
 
-use arrow_array::{Array, FixedSizeBinaryArray};
+use arrow_array::{
+    cast::AsArray,
+    types::{Float16Type, UInt8Type},
+    Array, FixedSizeBinaryArray,
+};
 use bytes::Bytes;
 use clap::Parser;
 use futures::stream::{self, StreamExt};
@@ -81,8 +96,13 @@ struct Cli {
 
     /// Fingerprint column: `maccs` (166 bits), `pubchem` (881 bits),
     /// `ecfp4` (2048 bits), or `fcfp4` (2048 bits).
-    #[arg(long, value_enum)]
-    fingerprint: Fingerprint,
+    #[arg(long, value_enum, required_unless_present = "conformers")]
+    fingerprint: Option<Fingerprint>,
+
+    /// Extract each embedded molecule's first conformer from the `.3D.parquet` shards instead of a
+    /// fingerprint: `base.part_N.f16bin` xyz points and `counts.part_N.ibin` points per cloud.
+    #[arg(long, conflicts_with_all = ["fingerprint", "top_k"])]
+    conformers: bool,
 
     /// Maximum molecules to extract (default: all available shards).
     #[arg(long, value_parser = retrieval::parse_count_flag)]
@@ -207,13 +227,13 @@ impl fmt::Display for Source {
     }
 }
 
-fn shard_url(url_prefix: &str, source: &str, shard_index: usize) -> String {
+fn shard_url(url_prefix: &str, source: &str, shard_index: usize, suffix: &str) -> String {
     // Shard filenames encode the [start, end) row range with 10-digit padding
     // under a `parquet/` subdirectory, e.g. `parquet/0000000000-0001000000.parquet`
-    // for molecules [0, 1_000_000).
+    // for molecules [0, 1_000_000), and `.3D.parquet` for their conformers.
     let start = shard_index * SHARD_ROWS;
     let end = start + SHARD_ROWS;
-    format!("{url_prefix}/{source}/parquet/{start:010}-{end:010}.parquet")
+    format!("{url_prefix}/{source}/parquet/{start:010}-{end:010}{suffix}")
 }
 
 fn write_bin_header(file: &mut File, rows: u32, dimensions_bits: u32) -> std::io::Result<()> {
@@ -228,6 +248,15 @@ fn write_bin_header_buf<W: Write>(writer: &mut W, rows: u32, dimensions_bits: u3
 
 fn part_path(output: &Path, part_index: usize) -> PathBuf {
     output.join(format!("base.part_{part_index:03}.b1bin"))
+}
+
+fn points_part_path(output: &Path, part_index: usize) -> PathBuf {
+    output.join(format!("base.part_{part_index:03}.f16bin"))
+}
+
+/// A conformer part's point counts, written last, so a nonzero header marks the pair finished.
+fn counts_part_path(output: &Path, part_index: usize) -> PathBuf {
+    output.join(format!("counts.part_{part_index:03}.ibin"))
 }
 
 /// Rows a part's header counts: zero while the part is being written, `None` when it is missing.
@@ -251,6 +280,15 @@ fn finish_part(writer: BufWriter<File>, rows: usize, dimensions_bits: usize) -> 
     write_bin_header(&mut file, rows as u32, dimensions_bits as u32)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Shard download progress, with a length only when `--limit` bounds the shards.
+fn shard_progress(shards: Option<usize>) -> ProgressBar {
+    let progress = shards.map_or_else(ProgressBar::no_length, |shards| ProgressBar::new(shards as u64));
+    progress.set_style(
+        ProgressStyle::with_template("  {spinner} downloading shards: {pos}/{len} [{elapsed_precise}] {msg}").unwrap(),
+    );
+    progress
 }
 
 /// Fetches one shard, retrying failures with doubling delays.
@@ -342,11 +380,167 @@ fn extract_and_append<W: Write>(
     Ok(appended)
 }
 
+/// Root column positions of `names` in a shard's schema, for a projection.
+fn root_columns<const COUNT: usize>(
+    builder: &ParquetRecordBatchReaderBuilder<Bytes>,
+    names: [&str; COUNT],
+) -> Result<[usize; COUNT], Box<dyn std::error::Error>> {
+    let fields = builder.parquet_schema().root_schema().get_fields();
+    let mut positions = [0; COUNT];
+    for (position, name) in positions.iter_mut().zip(names) {
+        *position = fields
+            .iter()
+            .position(|field| field.name() == name)
+            .ok_or_else(|| format!("Parquet schema has no column `{name}` — is this the right source?"))?;
+    }
+    Ok(positions)
+}
+
+/// Appends the first conformer of every embedded molecule in one `.3D.parquet` shard: its xyz
+/// points to `points` and its point count to `counts`. Returns the clouds and points appended.
+fn extract_conformers<W: Write>(
+    shard_bytes: Bytes,
+    points: &mut W,
+    counts: &mut W,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(shard_bytes)?;
+    let columns = root_columns(&builder, ["conformer_index", "conformer_coords"])?;
+    let mask = ProjectionMask::roots(builder.parquet_schema(), columns);
+    let (mut clouds, mut points_appended) = (0, 0);
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let indices = batch.column(0).as_primitive::<UInt8Type>();
+        let coordinates = batch.column(1).as_list::<i32>();
+        let scalars = coordinates.values().as_primitive::<Float16Type>().values();
+        let offsets = coordinates.value_offsets();
+        for row in 0..batch.num_rows() {
+            // Molecules that failed to embed keep their rows with null coordinates.
+            if indices.value(row) != 0 || coordinates.is_null(row) {
+                continue;
+            }
+            let cloud = &scalars[offsets[row] as usize..offsets[row + 1] as usize];
+            if !cloud.len().is_multiple_of(3) {
+                return Err(format!("a conformer holds {} scalars, not xyz triples", cloud.len()).into());
+            }
+            // SAFETY: `f16` is POD.
+            points.write_all(unsafe { retrieval::pod_slice_as_bytes(cloud) })?;
+            counts.write_all(&((cloud.len() / 3) as u32).to_le_bytes())?;
+            clouds += 1;
+            points_appended += cloud.len() / 3;
+        }
+    }
+    Ok((clouds, points_appended))
+}
+
+/// Writes every shard's first conformers into part pairs of `shards_per_part` input shards each,
+/// resuming after the pairs an earlier run finished.
+async fn download_conformers(
+    cli: &Cli,
+    client: &reqwest::Client,
+    shards_per_part: usize,
+    max_shards: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = cli.source.directory();
+    let mut part_index = 0;
+    while part_rows_of(&counts_part_path(&cli.output, part_index))?.is_some_and(|clouds| clouds != 0) {
+        part_index += 1;
+    }
+    let first_shard = part_index * shards_per_part;
+    if part_index > 0 {
+        eprintln!("Keeping {part_index} finished parts, resuming at shard {first_shard}");
+    }
+    let progress = shard_progress(cli.limit.map(|_| max_shards));
+    progress.set_position(first_shard as u64);
+
+    let urls = (first_shard..max_shards).map(|shard_index| {
+        (
+            shard_index,
+            shard_url(&cli.url_prefix, source, shard_index, ".3D.parquet"),
+        )
+    });
+    let mut stream = stream::iter(urls)
+        .map(|(shard_index, url)| {
+            let client = client.clone();
+            async move {
+                let bytes = download_shard(&client, &url).await;
+                (shard_index, url, bytes)
+            }
+        })
+        .buffered(cli.download_concurrency);
+
+    // Both files of a part open with zero rows; the points header lands first and the counts
+    // header last, so an interrupted pair never passes for a finished one.
+    let (mut total_clouds, mut total_points) = (0usize, 0usize);
+    let mut part: Option<(BufWriter<File>, BufWriter<File>, usize, usize)> = None;
+    let finish_pair = |(points, counts, clouds, points_count): (BufWriter<File>, BufWriter<File>, usize, usize)| {
+        finish_part(points, points_count, 3)?;
+        finish_part(counts, clouds, 1)
+    };
+    while let Some((shard_index, url, result)) = stream.next().await {
+        let bytes = match result {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                eprintln!("\n  shard {shard_index} missing (stopping): {url}");
+                break;
+            }
+            Err(error) => return Err(format!("download failed for {url}: {error}").into()),
+        };
+        let (points, counts, clouds, points_count) = match &mut part {
+            Some(part) => part,
+            None => {
+                let mut points = BufWriter::with_capacity(
+                    OUTPUT_BUFFER_BYTES,
+                    File::create(points_part_path(&cli.output, part_index))?,
+                );
+                let mut counts = BufWriter::with_capacity(
+                    OUTPUT_BUFFER_BYTES,
+                    File::create(counts_part_path(&cli.output, part_index))?,
+                );
+                write_bin_header_buf(&mut points, 0, 3)?;
+                write_bin_header_buf(&mut counts, 0, 1)?;
+                part.insert((points, counts, 0, 0))
+            }
+        };
+        let (clouds_appended, points_appended) = extract_conformers(bytes, points, counts)?;
+        *clouds += clouds_appended;
+        *points_count += points_appended;
+        if *points_count > u32::MAX as usize {
+            return Err(
+                format!("part {part_index} passed 2³² points at shard {shard_index}; lower --part-rows").into(),
+            );
+        }
+        total_clouds += clouds_appended;
+        total_points += points_appended;
+        if (shard_index + 1).is_multiple_of(shards_per_part) {
+            finish_pair(part.take().unwrap())?;
+            part_index += 1;
+        }
+        progress.set_position((shard_index + 1) as u64);
+        progress.set_message(format!(
+            "{total_clouds} clouds, {total_points} points ({:.1} GiB)",
+            (total_points * std::mem::size_of::<[numkong::f16; 3]>()) as f64 / (1u64 << 30) as f64
+        ));
+    }
+    progress.finish_and_clear();
+    if let Some(pair) = part.take() {
+        finish_pair(pair)?;
+        part_index += 1;
+    }
+    if total_clouds == 0 {
+        return Err("no conformers downloaded — check --source / --url-prefix".into());
+    }
+    eprintln!("Downloaded {total_clouds} conformers of {total_points} points in {part_index} parts, this run");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli: Cli = retrieval::parse_cli();
     eprintln!("- Source: {}", cli.source);
-    eprintln!("- Fingerprint: {}", cli.fingerprint);
+    match cli.fingerprint {
+        Some(fingerprint) => eprintln!("- Fingerprint: {fingerprint}"),
+        None => eprintln!("- Conformers: first per embedded molecule"),
+    }
     match cli.limit {
         Some(limit) => eprintln!("- Limit: {limit}"),
         None => eprintln!("- Limit: all"),
@@ -364,7 +558,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("- URL prefix: {}", cli.url_prefix);
     eprintln!("- Output: {}", cli.output.display());
     let source = cli.source.directory();
-    let info = cli.fingerprint.info();
 
     std::fs::create_dir_all(&cli.output)?;
     let parquet_dir = cli.output.join("parquet");
@@ -379,17 +572,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let shards_per_part = cli.part_rows / SHARD_ROWS;
 
-    // Shard planning: request enough shards to cover `--limit`; if omitted,
-    // walk shards until we hit a 403/404. We still need an upper bound to
-    // build the shard-index stream — 16K > any USearchMolecules source (enamine
-    // has 6040 shards), so missing-shard detection always terminates first.
-    const SHARD_CEILING: usize = 16_384;
+    // Request enough shards to cover `--limit`; without one the lazily pulled stream
+    // runs until the bucket answers 403 or 404 past its last shard.
     let limit = cli.limit.unwrap_or(usize::MAX);
-    let max_shards = if cli.limit.is_some() {
-        limit.div_ceil(SHARD_ROWS).min(SHARD_CEILING)
-    } else {
-        SHARD_CEILING
+    let max_shards = limit.div_ceil(SHARD_ROWS);
+    let Some(fingerprint) = cli.fingerprint else {
+        return download_conformers(&cli, &client, shards_per_part, max_shards).await;
     };
+    let info = fingerprint.info();
 
     // Parts an earlier run finished are kept, so a rerun fetches only the shards after them.
     let mut part_index = 0;
@@ -403,16 +593,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Keeping {part_index} finished parts, resuming at shard {first_shard}");
     }
 
-    let progress = ProgressBar::new(max_shards as u64);
-    progress.set_style(
-        ProgressStyle::with_template("  {spinner} downloading shards: {pos}/{len} [{elapsed_precise}] {msg}").unwrap(),
-    );
+    let progress = shard_progress(cli.limit.map(|_| max_shards));
     progress.set_position(first_shard as u64);
 
     // Concurrent download with ordered processing: we need rows in shard order
     // for deterministic output. `buffered(n)` preserves request order.
-    let urls =
-        (first_shard..max_shards).map(|shard_index| (shard_index, shard_url(&cli.url_prefix, source, shard_index)));
+    let urls = (first_shard..max_shards)
+        .map(|shard_index| (shard_index, shard_url(&cli.url_prefix, source, shard_index, ".parquet")));
 
     // Each part is written with a zero row count, patched in once the part fills,
     // so an interrupted part never passes for a finished one.

@@ -224,7 +224,11 @@ The vectors are genuinely binary rather than quantised floats, a natural fit for
 
 `retri-download-molecules` fetches the requested fingerprint column, `--source` picks the subset and `--limit N` takes a prefix of it.
 `--fingerprint ecfp4` multiplies the base-file size by roughly 12× at each scale.
-Ground-truth time dominates at billion scale; set `--ground-truth-batch` explicitly to trade more RAM for larger query batches.
+Ground-truth time dominates at billion scale, while its memory stays fixed: the base is scanned in tiles, so only one tile and its distances are resident at a time.
+The base lands in parts of `--part-rows` rows, 512M by default, as `base.part_000.b1bin` onward, which the `'base.part_*.b1bin'` glob reads as one set.
+A rerun into the same folder keeps the finished parts and fetches only the shards after them.
+Queries and ground truth are written only with `--top-k`; without it, the parts alone serve self-recall runs, `--self-search`.
+Ground truth names neighbors by `u32` ids, so it covers at most 2³² base rows.
 
 <details>
 <summary>PubChem 115M MACCS — b1, 168 bits, Hamming, ~2.4 GB</summary>
@@ -236,7 +240,7 @@ retri-download-molecules \
     --query-count 10000 --top-k 10 \
     --output data/pubchem-maccs/
 retri-eval-usearch \
-    --base-vectors data/pubchem-maccs/base.115627267.b1bin \
+    --base-vectors 'data/pubchem-maccs/base.part_*.b1bin' \
     --query-vectors data/pubchem-maccs/query.10000.b1bin \
     --query-neighbors data/pubchem-maccs/groundtruth.10000.ibin \
     --data-type b1 --metric hamming,jaccard \
@@ -254,7 +258,7 @@ retri-download-molecules \
     --query-count 10000 --top-k 10 \
     --output data/pubchem-ecfp4/
 retri-eval-usearch \
-    --base-vectors data/pubchem-ecfp4/base.115627267.b1bin \
+    --base-vectors 'data/pubchem-ecfp4/base.part_*.b1bin' \
     --query-vectors data/pubchem-ecfp4/query.10000.b1bin \
     --query-neighbors data/pubchem-ecfp4/groundtruth.10000.ibin \
     --data-type b1 --metric hamming \

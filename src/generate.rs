@@ -124,6 +124,114 @@ fn compute_top_k_tiled<Metric: PackedDistance>(
     Ok(())
 }
 
+/// The shape metrics exact ground truth ranks by, both between centered clouds over the 8 sign flips of
+/// their principal axes, so a ranking matches what a USearch shapes index walks by.
+#[derive(Clone, Copy, Debug)]
+pub enum ShapeMetric {
+    Chamfer,
+    Hausdorff,
+}
+
+/// Point clouds as a shapes dataset stores them: every cloud's points end to end, and each cloud's
+/// point count.
+#[derive(Clone, Copy)]
+pub struct Clouds<'a> {
+    pub points: &'a [[nk::f16; 3]],
+    pub counts: &'a [u32],
+}
+
+impl<'a> Clouds<'a> {
+    /// Each cloud's points in order, borrowed from the tape.
+    fn each(self) -> impl Iterator<Item = &'a [[nk::f16; 3]]> {
+        self.counts.iter().scan(0usize, move |first, &count| {
+            let cloud = &self.points[*first..*first + count as usize];
+            *first += count as usize;
+            Some(cloud)
+        })
+    }
+}
+
+/// Exact shape top-K: every query cloud packed once, the base packed a tile at a time and scored
+/// against all of them, rankings carried across tiles. Ties break toward the lower base index.
+pub fn compute_shape_top_k(
+    base: &[Clouds<'_>],
+    queries: Clouds<'_>,
+    metric: ShapeMetric,
+    ground_truth: MatrixSpan<'_, u32>,
+    threads: Threads,
+) -> Result<(), GroundTruthError> {
+    let query_count = queries.counts.len();
+    compute_shape_top_k_tiled(
+        base,
+        queries,
+        metric,
+        ground_truth,
+        DISTANCE_TILE_BYTES / (query_count.max(1) * std::mem::size_of::<f32>()),
+        threads,
+    )
+}
+
+/// [`compute_shape_top_k`] with an explicit base tile, which tests shrink to cross tile boundaries.
+fn compute_shape_top_k_tiled(
+    base: &[Clouds<'_>],
+    queries: Clouds<'_>,
+    metric: ShapeMetric,
+    mut ground_truth: MatrixSpan<'_, u32>,
+    tile_rows: usize,
+    threads: Threads,
+) -> Result<(), GroundTruthError> {
+    let base_count: usize = base.iter().map(|part| part.counts.len()).sum();
+    let query_count = queries.counts.len();
+    let top_k = checked_top_k(base_count, query_count, &ground_truth)?;
+    let threads = threads.0.get();
+    let tile_rows = tile_rows.clamp(top_k, base_count);
+    eprintln!(
+        "  ground truth ({metric:?}): base_count={base_count}, query_count={query_count}, top_k={top_k}, \
+         tile_rows={tile_rows}, threads={threads}"
+    );
+
+    let mut pool = spawn_pool(threads)?;
+    let query_clouds: Vec<&[[nk::f16; 3]]> = queries.each().collect();
+    let packed_queries = nk::ShapesPackedMatrix::new_parallel_in(&query_clouds, nk::Global, &mut pool)?;
+    // One tile of cloud borrows, one score tile and one ranking for the whole call.
+    let mut tile_clouds: Vec<&[[nk::f16; 3]]> = Vec::with_capacity(tile_rows);
+    let mut scores = vec![0.0f32; query_count * tile_rows];
+    let mut best = vec![(u32::MAX, u32::MAX); query_count * top_k];
+    let progress = ground_truth_progress(base_count, "shapes");
+
+    let mut tile_start = 0;
+    for part in base {
+        let mut clouds = part.each().peekable();
+        while clouds.peek().is_some() {
+            tile_clouds.clear();
+            tile_clouds.extend(clouds.by_ref().take(tile_rows));
+            let tile_count = tile_clouds.len();
+            let packed_tile = nk::ShapesPackedMatrix::new_parallel_in(&tile_clouds, nk::Global, &mut pool)?;
+            let tile_scores = &mut scores[..query_count * tile_count];
+            match metric {
+                ShapeMetric::Chamfer => packed_queries.chamfers_parallel(&packed_tile, tile_scores, None, &mut pool)?,
+                ShapeMetric::Hausdorff => {
+                    packed_queries.hausdorffs_parallel(&packed_tile, tile_scores, None, &mut pool)?
+                }
+            }
+            fold_tile(
+                tile_scores,
+                tile_count,
+                tile_start,
+                &mut best,
+                top_k,
+                f32::to_bits,
+                &mut pool,
+            );
+            tile_start += tile_count;
+            progress.set_position(tile_start as u64);
+        }
+    }
+    progress.finish_and_clear();
+    land_ranking(&best, top_k, &mut ground_truth);
+    Ok(())
+}
+
 /// Rows `[first, first + count)` of `rows` as a view of the same memory; unlike `slice`, it serves
 /// sub-byte scalars too, since it never cuts a row.
 fn leading_rows<'a, Metric: nk::StorageElement>(
@@ -664,7 +772,10 @@ mod tests {
 
     use rand::{rngs::StdRng, RngExt, SeedableRng};
 
-    use super::{binary_view, compute_top_k_tiled, generate_gaussian_f32, matrix_span, matrix_view, nk};
+    use super::{
+        binary_view, compute_shape_top_k_tiled, compute_top_k_tiled, generate_gaussian_f32, matrix_span, matrix_view,
+        nk, Clouds, ShapeMetric,
+    };
     use retrieval::Threads;
 
     const BASE_COUNT: usize = 300;
@@ -747,6 +858,62 @@ mod tests {
                     .collect();
                 let found: Vec<usize> = found.iter().map(|&id| id as usize).collect();
                 assert_eq!(found, naive_top_k(&distances), "bits {bits}");
+            }
+        }
+    }
+
+    #[test]
+    fn shape_top_k_matches_unpacked_tiles() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let counts: Vec<u32> = (0..BASE_COUNT + QUERY_COUNT).map(|_| rng.random_range(3..40)).collect();
+        let points: Vec<[nk::f16; 3]> = (0..counts.iter().sum::<u32>())
+            .map(|_| std::array::from_fn(|_| nk::f16::from_f32(rng.random_range(-4.0f32..4.0))))
+            .collect();
+        let base_points = counts[..BASE_COUNT].iter().sum::<u32>() as usize;
+        let base = Clouds {
+            points: &points[..base_points],
+            counts: &counts[..BASE_COUNT],
+        };
+        let queries = Clouds {
+            points: &points[base_points..],
+            counts: &counts[BASE_COUNT..],
+        };
+        let base_clouds: Vec<&[[nk::f16; 3]]> = base.each().collect();
+        let query_clouds: Vec<&[[nk::f16; 3]]> = queries.each().collect();
+        let packed_base = nk::ShapesPackedMatrix::new(&base_clouds).unwrap();
+        let packed_queries = nk::ShapesPackedMatrix::new(&query_clouds).unwrap();
+        for metric in [ShapeMetric::Chamfer, ShapeMetric::Hausdorff] {
+            let mut distances = vec![0.0f32; QUERY_COUNT * BASE_COUNT];
+            match metric {
+                ShapeMetric::Chamfer => packed_queries.chamfers(&packed_base, &mut distances, None).unwrap(),
+                ShapeMetric::Hausdorff => packed_queries.hausdorffs(&packed_base, &mut distances, None).unwrap(),
+            }
+            let parts = [
+                Clouds {
+                    points: &base.points[..counts[..PART_ROWS].iter().sum::<u32>() as usize],
+                    counts: &counts[..PART_ROWS],
+                },
+                Clouds {
+                    points: &base.points[counts[..PART_ROWS].iter().sum::<u32>() as usize..],
+                    counts: &counts[PART_ROWS..BASE_COUNT],
+                },
+            ];
+            let mut ground_truth = vec![0u32; QUERY_COUNT * TOP_K];
+            let span = matrix_span(&mut ground_truth, QUERY_COUNT, TOP_K);
+            compute_shape_top_k_tiled(
+                &parts,
+                queries,
+                metric,
+                span,
+                64,
+                Threads(NonZeroUsize::new(2).unwrap()),
+            )
+            .unwrap();
+            let (rows, _) = distances.as_chunks::<BASE_COUNT>();
+            let (founds, _) = ground_truth.as_chunks::<TOP_K>();
+            for (row, found) in rows.iter().zip(founds) {
+                let found: Vec<usize> = found.iter().map(|&id| id as usize).collect();
+                assert_eq!(found, naive_top_k(row), "{metric:?}");
             }
         }
     }
