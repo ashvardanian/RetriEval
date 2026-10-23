@@ -7,9 +7,9 @@ jobs:
     steps:
       - name: Check Out Repository
         uses: actions/checkout@v4
-      - name: Set Up uv
-        uses: astral-sh/setup-uv@v6
       - name: Install Rust 1.100 with Rustfmt and Clippy
         run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
-      - name: Format, Lint and Test cuVS Backend
-        run: scripts/check.sh cuvs-backend
+      - name: Lint cuVS Backend
+        run: cargo clippy --locked --no-default-features --features cuvs-backend --all-targets -- -D warnings
+      - name: Test cuVS Backend
+        run: cargo test --locked --no-default-features --features cuvs-backend --all-targets

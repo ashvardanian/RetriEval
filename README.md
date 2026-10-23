@@ -167,25 +167,37 @@ The tables below group the datasets by scale, and each name links to its downloa
 
 ## Results
 
-Each table holds one row per backend, device and data type, so a new run is a new row and nothing else moves.
-`1-r@10` is 1-recall@10, the share of queries whose true nearest neighbor lands in the top 10, and `10-r@10` is K-recall@10, the share of the true top 10 found.
-`Connectivity` is the graph degree, and `Expansions` the construction and search expansion, split by `/`.
-`Add/s` and `Search/s` count vectors per second, `Memory` is the backend's own peak figure, and `Build` is the wall time to index the whole base.
-`Device` is `CPU` for a dual-socket server and `GPU` for a single accelerator, and every backend took its native input type, with no rescaling.
+These numbers were measured for reference on DGX-B300 and DGX-H100 class nodes, the main drivers of AI neoclouds, and mostly guide the design of USearch.
+They shift with the data, the software versions and the hardware, so treat them as reference points for your own runs, not as fixed rankings.
 
-The recommended methodology is to sweep each backend's settings until they reach 99% recall@10 or more on a given dataset.
-A row never builds faster than it searches: when `Add/s` exceeds `Search/s`, raise the construction breadth and lower the search breadth until search is at least as fast at that recall.
-Once the behavior is confirmed on a 1M–10M subset, 100M–1B runs validate the scaling curves.
+Each table holds one row per backend, device and data type, so a new run is a new row and nothing else moves:
 
-Each search reports both recall conventions, because they answer different questions and one of them saturates.
-`recall_at_k` is 1-recall@K, FAISS's `OneRecallAtRCriterion` and the measure USearch reports.
-`intersection_at_k` is K-recall@K, `|top-K ∩ ground-truth-K| / K`, order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
-1-recall@K ≥ K-recall@K for the same run, so the two are never interchangeable.
+- `Device`: the cores a run used and what they are, like `148× NVIDIA SM103` for the streaming multiprocessors of one B300 or `128× Intel Xeon6` for the physical cores of a dual-socket host.
+  CPU rows count physical cores, not SMT threads: with two threads per core, the `96×` and `128×` hosts ran 192 and 256 threads.
+- `Type`: the stored type; every backend took its native input type, with no rescaling.
+- `Connectivity`: the graph degree.
+- `Expansions`: the construction and search expansion, split by `/`.
+- `1-r@10`: 1-recall@10, the share of queries whose true nearest neighbor lands in the top 10.
+- `10-r@10`: K-recall@10, the share of the true top 10 found.
+- `Add/s` and `Search/s`: vectors indexed and queries answered per second.
+- `Memory`: the backend's own peak figure.
+- `Build`: the wall time to index the whole base.
 
-K is `--top-k`, which defaults to the ground-truth file's width, 10 on the Wiki sets and 100 on the BigANN ones.
-1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
-`intersection_at_k` stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix, so both are stricter at wide K than the same-named numbers at K=10.
-Pass `--top-k 10` for figures comparable across datasets of differing ground-truth width.
+Every row follows the same methodology:
+
+- Sweep each backend's settings until it reaches 99% recall@10 or more on the dataset.
+- Never let a row build faster than it searches: when `Add/s` exceeds `Search/s`, raise the construction expansion and lower the search expansion until search is at least as fast at that recall.
+- Confirm the behavior on a 1M–10M subset, then validate the scaling curves at 100M–1B.
+
+Each search reports both recall conventions, because they answer different questions and one of them saturates:
+
+- `recall_at_k` is 1-recall@K, FAISS's `OneRecallAtRCriterion` and the measure USearch reports.
+- `intersection_at_k` is K-recall@K, `|top-K ∩ ground-truth-K| / K`, order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
+- 1-recall@K ≥ K-recall@K for the same run, so the two are never interchangeable.
+- K is `--top-k`, which defaults to the ground-truth file's width, 10 on the Wiki sets and 100 on the BigANN ones.
+- 1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
+  `intersection_at_k` stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix.
+- Pass `--top-k 10` for figures comparable across datasets of differing ground-truth width.
 
 ### PubChem MACCS
 
@@ -193,18 +205,18 @@ Pass `--top-k 10` for figures comparable across datasets of differing ground-tru
 
 #### PubChem MACCS 10M
 
-| Backend      | Device | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s | Memory | Build |
-| :----------- | :----- | :--- | -----------: | ---------: | -----: | ------: | -----: | -------: | -----: | ----: |
-| USearch 2.25 | CPU    | `b1` |           32 |     128/64 | 0.9696 |       … | 36,347 |   35,767 | 4.7 GB |  5.0m |
-| FAISS 1.12   | CPU    | `b1` |           64 |      40/16 | 0.9661 |       … | 95,230 |  293,795 | 7.6 GB |  1.5m |
+| Backend      | Device          | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s | Memory | Build |
+| :----------- | :-------------- | :--- | -----------: | ---------: | -----: | ------: | -----: | -------: | -----: | ----: |
+| USearch 2.25 | 96× Intel Xeon6 | `b1` |           32 |   128 / 64 | 0.9696 |       … | 36,347 |   35,767 | 4.7 GB |  5.0m |
+| FAISS 1.12   | 96× Intel Xeon6 | `b1` |           64 |    40 / 16 | 0.9661 |       … | 95,230 |  293,795 | 7.6 GB |  1.5m |
 
 #### PubChem MACCS 100M
 
-| Backend      | Device | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory |        Build |
-| :----------- | :----- | :--- | -----------: | ---------: | -----: | ------: | ------: | --------: | ------: | -----------: |
-| USearch 2.25 | CPU    | `b1` |           32 |     128/64 | 0.8438 |       … |  35,080 |    38,432 | 40.8 GB |        54.6m |
-| FAISS 1.12   | CPU    | `b1` |           64 |      40/16 |      … |       … |       … |         … | ≥ 63 GB | killed at 9h |
-| USearch 3.0  | GPU    | `b1` |           32 |     256/64 | 0.9907 |  0.9906 | 559,140 | 1,460,000 | 18.3 GB |         3.4m |
+| Backend      | Device            | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory |        Build |
+| :----------- | :---------------- | :--- | -----------: | ---------: | -----: | ------: | ------: | --------: | ------: | -----------: |
+| USearch 2.25 | 96× Intel Xeon6   | `b1` |           32 |   128 / 64 | 0.8438 |       … |  35,080 |    38,432 | 40.8 GB |        54.6m |
+| FAISS 1.12   | 96× Intel Xeon6   | `b1` |           64 |    40 / 16 |      … |       … |       … |         … | ≥ 63 GB | killed at 9h |
+| USearch 3.0  | 148× NVIDIA SM103 | `b1` |           32 |   256 / 64 | 0.9907 |  0.9906 | 559,140 | 1,460,000 | 18.3 GB |         3.4m |
 
 ### SIFT
 
@@ -212,23 +224,23 @@ Meta's 128-dimensional `u8` descriptors under L2, compared at the setting that f
 
 #### SIFT 10M
 
-| Backend      | Device | Type  | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory | Build |
-| :----------- | :----- | :---- | -----------: | ---------: | -----: | ------: | ------: | --------: | ------: | ----: |
-| USearch 2.25 | CPU    | `u8`  |           16 |    128/256 | 0.9938 |       … |  35,405 |    80,729 |  4.4 GB |  4.8m |
-| FAISS 1.12   | CPU    | `u8`  |           16 |    128/256 | 0.9952 |       … |  26,374 |    38,278 |  5.9 GB |  5.6m |
-| cuVS 26.10   | GPU    | `u8`  |           64 |    128/128 |      … |  0.9966 | 204,838 | 1,204,000 |       … |  0.8m |
-| USearch 3.0  | GPU    | `u8`  |           32 |    256/128 | 0.9911 |  0.9780 | 558,510 | 1,040,000 |  2.6 GB |  0.3m |
-| FAISS 1.15.1 | CPU    | `u8`  |           32 |     128/96 | 0.9900 |  0.9765 | 115,643 |   133,919 |  8.6 GB |  1.4m |
-| FAISS 1.15.1 | CPU    | `f32` |           32 |     128/96 | 0.9900 |  0.9765 |  59,688 |    61,027 | 14.4 GB |  2.8m |
+| Backend      | Device            | Type  | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory | Build |
+| :----------- | :---------------- | :---- | -----------: | ---------: | -----: | ------: | ------: | --------: | ------: | ----: |
+| USearch 2.25 | 96× Intel Xeon6   | `u8`  |           16 |  128 / 256 | 0.9938 |       … |  35,405 |    80,729 |  4.4 GB |  4.8m |
+| FAISS 1.12   | 96× Intel Xeon6   | `u8`  |           16 |  128 / 256 | 0.9952 |       … |  26,374 |    38,278 |  5.9 GB |  5.6m |
+| cuVS 26.10   | 148× NVIDIA SM103 | `u8`  |           64 |  128 / 128 |      … |  0.9966 | 204,838 | 1,204,000 |       … |  0.8m |
+| USearch 3.0  | 148× NVIDIA SM103 | `u8`  |           32 |  256 / 128 | 0.9911 |  0.9780 | 558,510 | 1,040,000 |  2.6 GB |  0.3m |
+| FAISS 1.15.1 | 128× Intel Xeon6  | `u8`  |           32 |   128 / 96 | 0.9900 |  0.9765 | 115,643 |   133,919 |  8.6 GB |  1.4m |
+| FAISS 1.15.1 | 128× Intel Xeon6  | `f32` |           32 |   128 / 96 | 0.9900 |  0.9765 |  59,688 |    61,027 | 14.4 GB |  2.8m |
 
 #### SIFT 100M
 
-| Backend      | Device | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory |        Build |
-| :----------- | :----- | :--- | -----------: | ---------: | -----: | ------: | ------: | -------: | ------: | -----------: |
-| USearch 2.25 | CPU    | `u8` |           16 |    128/256 | 0.9833 |       … |  39,831 |   75,808 | 53.7 GB |        48.7m |
-| FAISS 1.12   | CPU    | `u8` |           16 |    128/256 |      … |       … |       … |        … | ≥ 46 GB | killed at 9h |
-| cuVS 26.10   | GPU    | `u8` |           64 |    128/256 |      … |  0.9963 | 154,799 |  582,000 |       … |        10.8m |
-| USearch 3.0  | GPU    | `u8` |           32 |    256/256 | 0.9913 |  0.9810 | 431,520 |  604,490 | 24.8 GB |         3.9m |
+| Backend      | Device            | Type | Connectivity | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory |        Build |
+| :----------- | :---------------- | :--- | -----------: | ---------: | -----: | ------: | ------: | -------: | ------: | -----------: |
+| USearch 2.25 | 96× Intel Xeon6   | `u8` |           16 |  128 / 256 | 0.9833 |       … |  39,831 |   75,808 | 53.7 GB |        48.7m |
+| FAISS 1.12   | 96× Intel Xeon6   | `u8` |           16 |  128 / 256 |      … |       … |       … |        … | ≥ 46 GB | killed at 9h |
+| cuVS 26.10   | 148× NVIDIA SM103 | `u8` |           64 |  128 / 256 |      … |  0.9963 | 154,799 |  582,000 |       … |        10.8m |
+| USearch 3.0  | 148× NVIDIA SM103 | `u8` |           32 |  256 / 256 | 0.9913 |  0.9810 | 431,520 |  604,490 | 24.8 GB |         3.9m |
 
 ### Turing-ANNS
 
@@ -236,29 +248,29 @@ Microsoft's 100-dimensional `f32` web-search embeddings under L2, compared at th
 
 #### Turing-ANNS 10M
 
-| Backend      | Device | Type   | Connectivity | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory | Build |
-| :----------- | :----- | :----- | -----------: | ---------: | -----: | ------: | -----: | -------: | ------: | ----: |
-| USearch 2.25 | CPU    | `f32`  |           48 |    768/384 | 0.9929 |       … |  8,532 |   12,331 | 13.0 GB | 18.3m |
-| USearch 2.25 | CPU    | `bf16` |           48 |    768/384 | 0.9929 |       … | 10,496 |   16,940 | 10.9 GB | 14.1m |
-| USearch 2.25 | CPU    | `f16`  |           48 |    768/384 | 0.9929 |       … | 10,969 |   20,246 | 10.9 GB | 13.5m |
-| USearch 2.25 | CPU    | `e5m2` |           48 |    768/384 | 0.9919 |       … | 10,526 |   20,534 |  9.8 GB | 13.5m |
-| USearch 2.25 | CPU    | `e4m3` |           48 |    768/384 | 0.9930 |       … |  7,353 |   12,106 |  9.8 GB | 19.4m |
-| USearch 2.25 | CPU    | `e3m2` |           48 |    768/384 | 0.9728 |       … | 10,398 |   18,022 |  9.8 GB | 13.3m |
-| USearch 2.25 | CPU    | `e2m3` |           48 |    768/384 | 0.7941 |       … | 10,935 |   21,313 |  9.8 GB | 13.2m |
-| FAISS 1.12   | CPU    | `f32`  |           48 |    768/384 | 0.9944 |       … |  7,491 |   16,486 | 14.1 GB | 20.6m |
-| FAISS 1.12   | CPU    | `bf16` |           48 |    768/384 | 0.9944 |       … |  3,800 |   10,391 | 12.1 GB | 39.4m |
-| FAISS 1.12   | CPU    | `f16`  |           48 |    768/384 | 0.9944 |       … |  2,545 |   10,032 | 12.1 GB | 1h 1m |
-| USearch 3.0  | GPU    | `bf16` |           32 |  1024/1024 | 0.9908 |  0.9831 | 95,870 |  155,810 |  3.4 GB |  1.7m |
+| Backend      | Device            | Type   | Connectivity |  Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory | Build |
+| :----------- | :---------------- | :----- | -----------: | ----------: | -----: | ------: | -----: | -------: | ------: | ----: |
+| USearch 2.25 | 96× Intel Xeon6   | `f32`  |           48 |   768 / 384 | 0.9929 |       … |  8,532 |   12,331 | 13.0 GB | 18.3m |
+| USearch 2.25 | 96× Intel Xeon6   | `bf16` |           48 |   768 / 384 | 0.9929 |       … | 10,496 |   16,940 | 10.9 GB | 14.1m |
+| USearch 2.25 | 96× Intel Xeon6   | `f16`  |           48 |   768 / 384 | 0.9929 |       … | 10,969 |   20,246 | 10.9 GB | 13.5m |
+| USearch 2.25 | 96× Intel Xeon6   | `e5m2` |           48 |   768 / 384 | 0.9919 |       … | 10,526 |   20,534 |  9.8 GB | 13.5m |
+| USearch 2.25 | 96× Intel Xeon6   | `e4m3` |           48 |   768 / 384 | 0.9930 |       … |  7,353 |   12,106 |  9.8 GB | 19.4m |
+| USearch 2.25 | 96× Intel Xeon6   | `e3m2` |           48 |   768 / 384 | 0.9728 |       … | 10,398 |   18,022 |  9.8 GB | 13.3m |
+| USearch 2.25 | 96× Intel Xeon6   | `e2m3` |           48 |   768 / 384 | 0.7941 |       … | 10,935 |   21,313 |  9.8 GB | 13.2m |
+| FAISS 1.12   | 96× Intel Xeon6   | `f32`  |           48 |   768 / 384 | 0.9944 |       … |  7,491 |   16,486 | 14.1 GB | 20.6m |
+| FAISS 1.12   | 96× Intel Xeon6   | `bf16` |           48 |   768 / 384 | 0.9944 |       … |  3,800 |   10,391 | 12.1 GB | 39.4m |
+| FAISS 1.12   | 96× Intel Xeon6   | `f16`  |           48 |   768 / 384 | 0.9944 |       … |  2,545 |   10,032 | 12.1 GB | 1h 1m |
+| USearch 3.0  | 148× NVIDIA SM103 | `bf16` |           32 | 1024 / 1024 | 0.9908 |  0.9831 | 95,870 |  155,810 |  3.4 GB |  1.7m |
 
 #### Turing-ANNS 100M
 
-| Backend      | Device | Type   | Connectivity | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |   Memory |  Build |
-| :----------- | :----- | :----- | -----------: | ---------: | -----: | ------: | -----: | -------: | -------: | -----: |
-| USearch 2.25 | CPU    | `f32`  |           48 |    768/384 | 0.9929 |       … |  6,646 |   10,398 | 139.6 GB |  4h 1m |
-| USearch 2.25 | CPU    | `bf16` |           48 |    768/384 | 0.9931 |       … |  8,564 |   14,772 | 105.2 GB |  3h 1m |
-| USearch 2.25 | CPU    | `f16`  |           48 |    768/384 | 0.9930 |       … |  8,807 |   15,412 | 105.2 GB | 2h 54m |
-| USearch 2.25 | CPU    | `e5m2` |           48 |    768/384 | 0.9924 |       … |  7,368 |   13,227 |  88.0 GB | 3h 15m |
-| USearch 3.0  | GPU    | `bf16` |           32 |  1024/1024 | 0.9933 |  0.9868 | 88,660 |  156,790 |  32.1 GB |  18.8m |
+| Backend      | Device            | Type   | Connectivity |  Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |   Memory |  Build |
+| :----------- | :---------------- | :----- | -----------: | ----------: | -----: | ------: | -----: | -------: | -------: | -----: |
+| USearch 2.25 | 96× Intel Xeon6   | `f32`  |           48 |   768 / 384 | 0.9929 |       … |  6,646 |   10,398 | 139.6 GB |  4h 1m |
+| USearch 2.25 | 96× Intel Xeon6   | `bf16` |           48 |   768 / 384 | 0.9931 |       … |  8,564 |   14,772 | 105.2 GB |  3h 1m |
+| USearch 2.25 | 96× Intel Xeon6   | `f16`  |           48 |   768 / 384 | 0.9930 |       … |  8,807 |   15,412 | 105.2 GB | 2h 54m |
+| USearch 2.25 | 96× Intel Xeon6   | `e5m2` |           48 |   768 / 384 | 0.9924 |       … |  7,368 |   13,227 |  88.0 GB | 3h 15m |
+| USearch 3.0  | 148× NVIDIA SM103 | `bf16` |           32 | 1024 / 1024 | 0.9933 |  0.9868 | 88,660 |  156,790 |  32.1 GB |  18.8m |
 
 ## CLI Reference
 
@@ -574,5 +586,6 @@ Its metrics drop the `self_` prefix because the container already says it, and i
 ## Development
 
 The repository pins Rust 1.100, as `beta-2026-10-18` until its stable release.
-Run `scripts/check.sh` for formatting, Clippy, and CPU tests; pass an explicit feature list for optional native engines.
-`src/` holds the shared library in `bench.rs`, one binary per backend and `retri-generate`, `scripts/` the dataset downloaders, plotting and Git hooks, and `docker/` the compose files for the server backends.
+CI runs `cargo fmt --check`, then `cargo clippy` and `cargo test` per feature set; pass the same `--features` locally for optional native engines.
+`src/` holds the shared library in `bench.rs`, one binary per backend and `retri-generate`, `scripts/` the dataset downloaders and plotting, `.githooks/` the Git hooks, and `docker/` the compose files for the server backends.
+Arm the hooks once per clone with `git config core.hooksPath .githooks`.
