@@ -25,6 +25,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Set Up uv
         uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.4"
       - name: Check Python Plotting
         run: uvx ruff check --target-version py311 --extend-select I scripts/plot.py && uvx ruff format --check scripts/plot.py
       - name: Lint ${{ matrix.name }}
