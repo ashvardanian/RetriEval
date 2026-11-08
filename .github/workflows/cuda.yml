@@ -6,7 +6,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, cuda]
     steps:
       - name: Check Out Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install Rust 1.100 with Rustfmt and Clippy
         run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
       - name: Lint cuVS Backend

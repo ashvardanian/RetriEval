@@ -3,7 +3,7 @@ on: [push, pull_request]
 jobs:
   check:
     name: Check ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -16,7 +16,7 @@ jobs:
             features: lancedb-backend,download
     steps:
       - name: Check Out Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install BLAS, LAPACK, OpenMP and Protobuf
         run: sudo apt-get update && sudo apt-get install -y libblas-dev liblapack-dev libomp-dev protobuf-compiler
       - name: Install Rust 1.100 with Rustfmt and Clippy

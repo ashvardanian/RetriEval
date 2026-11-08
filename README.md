@@ -6,7 +6,7 @@ __RetriEval__ is a benchmarking suite designed for Billion-scale Vector Search w
 It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/NVIDIA/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
 It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, and machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
 
-## Quick Start
+## Quickstart
 
 Install the default `retri-eval-usearch` binary:
 
@@ -56,11 +56,15 @@ uv run scripts/plot.py results/ --output plots/
   It reuses the shared `--connectivity`, `--expansion-add` and `--expansion-search` names and JSON keys, so its runs plot on the same axes as the HNSW backends.
   The mapping is an analogy, not an identity: `--expansion-add` is CAGRA's pre-prune candidate width rather than `ef_construction`, and `--expansion-search` its internal top-i list rather than `ef_search`.
 
+![A query walking a proximity graph from an entry point along a thick path, beside a table naming the connectivity, construction and search expansion flags in USearch, FAISS, Qdrant, Weaviate, Redis, SurrealDB and cuVS](assets/graph-search.svg)
+
 ```sh
 retri-eval-usearch --data-type bf16 --metric l2 ...
 retri-eval-faiss --data-type f16 --metric l2 ...
 retri-eval-cuvs --metric l2 ...
 ```
+
+![Bit layouts of every --data-type from f32 down to b1, split into sign, exponent, mantissa and integer bits, with each type's largest value, overflow and NaN behavior, and the share of its codes inside the range from minus one to one](assets/scalar-types.svg)
 
 ### Vector Databases
 
@@ -195,6 +199,8 @@ Every row follows the same methodology:
 Compare the fastest measured configuration meeting the same recall target, with the same recall definition, queries, K, and ground truth.
 Report build time and memory alongside query throughput, and keep query concurrency, batch size, and cache state comparable.
 
+![Two schematic throughput-recall curves, where engine A looks faster at its default setting but engine B answers more queries once both are swept to the same 0.99 recall](assets/matched-recall.svg)
+
 Each search reports both recall conventions, because they answer different questions and one of them saturates:
 
 - `recall_at_k` is 1-recall@K, FAISS's `OneRecallAtRCriterion` and the measure USearch reports.
@@ -205,6 +211,8 @@ Each search reports both recall conventions, because they answer different quest
 - 1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
   `intersection_at_k` stays informative there, and `ndcg_at_k` likewise normalizes over the full truth prefix.
 - Pass `--top-k 10` for figures comparable across datasets of differing ground-truth width.
+
+![One list of ten returned answers scored four ways against the true neighbors: 0 for 1-recall@1, 1 for 1-recall@10, 0.7 for 10-recall@10 and 0.74 for NDCG@10](assets/recall-metrics.svg)
 
 ### PubChem MACCS
 

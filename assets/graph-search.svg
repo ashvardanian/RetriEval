@@ -1,0 +1,211 @@
+<svg width="1600" height="920" viewBox="0 0 1600 920" fill="none" xmlns="http://www.w3.org/2000/svg">
+<title>Search walks a graph of neighbors.</title>
+<defs>
+<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+  <path d="M0 0V6" stroke="#FFE6A7" stroke-width="2"/>
+</pattern>
+<pattern id="dots" width="6" height="6" patternUnits="userSpaceOnUse">
+  <circle cx="3" cy="3" r="1.3" fill="#FFE6A7"/>
+</pattern>
+<pattern id="rows" width="6" height="6" patternUnits="userSpaceOnUse">
+  <path d="M0 3H6" stroke="#FFE6A7" stroke-width="1.6"/>
+</pattern>
+</defs>
+<rect width="1600" height="920" fill="#C44536"/>
+<g id="graph-search" font-family="Poppins, Helvetica, Arial, sans-serif" stroke-linecap="round" stroke-linejoin="round">
+<text x="70" y="58" font-size="20" fill="#FFE6A7">RetriEval / search notes</text>
+<text x="70" y="140" font-size="54" fill="#FFE6A7">Search walks a graph of neighbors.</text>
+<text x="70" y="200" font-size="23" fill="#FFE6A7">Graph engines link each vector to a few near ones and answer a query by walking toward it.</text>
+<path d="M229.7 774.6L111.8 754.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M654.5 651.0L732.3 722.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M448.7 320.4L493.7 439.7" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M401.8 431.9L345.3 521.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.9 663.3L229.7 774.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M654.5 651.0L586.5 648.9" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M515.7 694.4L390.8 719.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M166.2 794.5L229.7 774.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M588.0 769.6L586.5 648.9" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M203.9 297.7L308.1 407.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M515.7 694.4L588.0 769.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M398.6 575.5L442.6 616.5" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M613.8 427.6L493.7 439.7" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M239.1 491.1L345.3 521.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M159.8 702.9L111.8 754.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M345.3 521.1L332.2 639.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M654.5 651.0L588.0 769.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M732.3 722.1L588.0 769.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M442.6 616.5L469.1 518.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.9 663.3L300.7 741.3" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M710.0 527.5L705.5 394.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M515.7 694.4L531.6 603.9" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M557.7 311.4L493.7 439.7" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M203.9 297.7L100.4 397.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M159.8 702.9L229.7 774.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M710.0 527.5L605.8 494.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M605.8 494.2L493.7 439.7" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M398.6 575.5L345.3 521.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.9 663.3L166.2 794.5" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M398.6 575.5L332.2 639.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M119.9 526.6L148.2 611.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M159.8 702.9L225.9 663.3" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M448.7 320.4L401.8 431.9" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M390.8 719.6L442.6 616.5" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M748.2 782.0L654.5 651.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M448.7 320.4L378.2 343.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M162.1 444.7L225.5 413.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M148.2 611.0L225.9 663.3" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M221.9 551.1L148.2 611.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M531.6 603.9L586.5 648.9" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M401.8 431.9L493.7 439.7" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M515.7 694.4L442.6 616.5" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M119.9 526.6L176.9 504.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M613.8 427.6L705.5 394.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M710.0 527.5L654.5 651.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.5 413.4L290.8 325.8" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M390.8 719.6L332.2 639.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M308.1 407.1L290.8 325.8" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M531.6 603.9L469.1 518.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M221.9 551.1L176.9 504.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M119.9 526.6L100.4 397.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M557.7 311.4L705.5 394.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M166.2 794.5L111.8 754.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M162.1 444.7L176.9 504.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M300.7 741.3L332.2 639.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M605.8 494.2L705.5 394.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M221.9 551.1L239.1 491.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M557.7 311.4L448.7 320.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M469.1 518.2L493.7 439.7" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M100.4 397.0L176.9 504.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M748.2 782.0L747.1 625.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M162.1 444.7L239.1 491.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M531.6 603.9L605.8 494.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M203.9 297.7L290.8 325.8" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M300.7 741.3L229.7 774.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M221.9 551.1L119.9 526.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M159.8 702.9L166.2 794.5" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M398.6 575.5L469.1 518.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M390.8 719.6L300.7 741.3" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M748.2 782.0L732.3 722.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M401.8 431.9L378.2 343.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M162.1 444.7L119.9 526.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M162.1 444.7L100.4 397.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M203.9 297.7L225.5 413.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M159.8 702.9L148.2 611.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.5 413.4L308.1 407.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M308.1 407.1L378.2 343.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.5 413.4L176.9 504.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M401.8 431.9L308.1 407.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M557.7 311.4L613.8 427.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M710.0 527.5L747.1 625.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.9 663.3L111.8 754.2" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M748.2 782.0L588.0 769.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M531.6 603.9L442.6 616.5" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M605.8 494.2L613.8 427.6" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.5 413.4L239.1 491.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M176.9 504.6L239.1 491.1" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.9 663.3L332.2 639.4" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M654.5 651.0L747.1 625.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M290.8 325.8L378.2 343.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M732.3 722.1L747.1 625.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M531.6 603.9L654.5 651.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M515.7 694.4L586.5 648.9" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M225.5 413.4L100.4 397.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.5"/>
+<path d="M111.8 754.2L225.9 663.3L332.2 639.4L398.6 575.5L469.1 518.2L493.7 439.7L613.8 427.6L705.5 394.0" stroke="#FFE6A7" stroke-width="4.5" opacity="1.0"/>
+<circle cx="398.6" cy="575.5" r="8" fill="#FFE6A7" opacity="1.0"/>
+<circle cx="710.0" cy="527.5" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="221.9" cy="551.1" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="515.7" cy="694.4" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="162.1" cy="444.7" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="159.8" cy="702.9" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="557.7" cy="311.4" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="748.2" cy="782.0" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="531.6" cy="603.9" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="203.9" cy="297.7" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="448.7" cy="320.4" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="225.5" cy="413.4" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="119.9" cy="526.6" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="390.8" cy="719.6" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="442.6" cy="616.5" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="401.8" cy="431.9" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="654.5" cy="651.0" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="308.1" cy="407.1" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="290.8" cy="325.8" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="605.8" cy="494.2" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="732.3" cy="722.1" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="100.4" cy="397.0" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="148.2" cy="611.0" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="613.8" cy="427.6" r="8" fill="#FFE6A7" opacity="1.0"/>
+<circle cx="469.1" cy="518.2" r="8" fill="#FFE6A7" opacity="1.0"/>
+<circle cx="225.9" cy="663.3" r="8" fill="#FFE6A7" opacity="1.0"/>
+<circle cx="176.9" cy="504.6" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="300.7" cy="741.3" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="239.1" cy="491.1" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="166.2" cy="794.5" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="345.3" cy="521.1" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="588.0" cy="769.6" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="229.7" cy="774.6" r="8" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0"/>
+<circle cx="378.2" cy="343.0" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="493.7" cy="439.7" r="8" fill="#FFE6A7" opacity="1.0"/>
+<circle cx="705.5" cy="394.0" r="8" fill="#FFE6A7" opacity="1.0"/>
+<circle cx="747.1" cy="625.0" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="111.8" cy="754.2" r="8" fill="#FFE6A7" opacity="1.0"/>
+<circle cx="586.5" cy="648.9" r="4.5" fill="#FFE6A7" opacity="0.7"/>
+<circle cx="332.2" cy="639.4" r="8" fill="#FFE6A7" opacity="1.0"/>
+<path d="M688.0 318.0L712.0 342.0" stroke="#FFE6A7" stroke-width="3.5" opacity="1.0"/>
+<path d="M688.0 342.0L712.0 318.0" stroke="#FFE6A7" stroke-width="3.5" opacity="1.0"/>
+<text x="720.0" y="316.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">query</text>
+<text x="129.8" y="760.2" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">entry</text>
+<path d="M250.0 310.0L290.8 325.8" stroke="#FFE6A7" stroke-width="2" opacity="1.0" stroke-dasharray="4 6"/>
+<path d="M250.0 310.0L203.9 297.7" stroke="#FFE6A7" stroke-width="2" opacity="1.0" stroke-dasharray="4 6"/>
+<path d="M250.0 310.0L225.5 413.4" stroke="#FFE6A7" stroke-width="2" opacity="1.0" stroke-dasharray="4 6"/>
+<path d="M250.0 310.0L308.1 407.1" stroke="#FFE6A7" stroke-width="2" opacity="1.0" stroke-dasharray="4 6"/>
+<circle cx="250.0" cy="310.0" r="9" fill="none" stroke="#FFE6A7" stroke-width="2.5" opacity="1.0" stroke-dasharray="3 4"/>
+<text x="268.0" y="296.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">inserting</text>
+<text x="860.0" y="280.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">THE SAME THREE FLAGS, IN EACH ENGINE'S WORDS</text>
+<text x="860.0" y="322.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400"></text>
+<text x="980.0" y="322.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">connectivity</text>
+<text x="1130.0" y="322.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">expansion-add</text>
+<text x="1370.0" y="322.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">expansion-search</text>
+<path d="M860.0 336.0L1530.0 336.0" stroke="#FFE6A7" stroke-width="1.5" opacity="0.6"/>
+<text x="860.0" y="372.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">USearch</text>
+<text x="980.0" y="372.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">connectivity</text>
+<text x="1130.0" y="372.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">expansion_add</text>
+<text x="1370.0" y="372.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">expansion_search</text>
+<path d="M860.0 388.0L1530.0 388.0" stroke="#FFE6A7" stroke-width="1" opacity="0.25"/>
+<text x="860.0" y="418.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">FAISS</text>
+<text x="980.0" y="418.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">M</text>
+<text x="1130.0" y="418.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">efConstruction</text>
+<text x="1370.0" y="418.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">efSearch</text>
+<path d="M860.0 434.0L1530.0 434.0" stroke="#FFE6A7" stroke-width="1" opacity="0.25"/>
+<text x="860.0" y="464.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">Qdrant</text>
+<text x="980.0" y="464.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">m</text>
+<text x="1130.0" y="464.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">ef_construct</text>
+<text x="1370.0" y="464.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">hnsw_ef</text>
+<path d="M860.0 480.0L1530.0 480.0" stroke="#FFE6A7" stroke-width="1" opacity="0.25"/>
+<text x="860.0" y="510.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">Weaviate</text>
+<text x="980.0" y="510.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">maxConnections</text>
+<text x="1130.0" y="510.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">efConstruction</text>
+<text x="1370.0" y="510.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">ef</text>
+<path d="M860.0 526.0L1530.0 526.0" stroke="#FFE6A7" stroke-width="1" opacity="0.25"/>
+<text x="860.0" y="556.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">Redis</text>
+<text x="980.0" y="556.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">M</text>
+<text x="1130.0" y="556.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">EF_CONSTRUCTION</text>
+<text x="1370.0" y="556.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">EF_RUNTIME</text>
+<path d="M860.0 572.0L1530.0 572.0" stroke="#FFE6A7" stroke-width="1" opacity="0.25"/>
+<text x="860.0" y="602.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">SurrealDB</text>
+<text x="980.0" y="602.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">M</text>
+<text x="1130.0" y="602.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">EFC</text>
+<text x="1370.0" y="602.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">EF in &lt;|K,EF|&gt;</text>
+<path d="M860.0 618.0L1530.0 618.0" stroke="#FFE6A7" stroke-width="1" opacity="0.25"/>
+<text x="860.0" y="648.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">cuVS</text>
+<text x="980.0" y="648.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">graph_degree</text>
+<text x="1130.0" y="648.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">intermediate_graph_degree</text>
+<text x="1370.0" y="648.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">itopk_size</text>
+<path d="M860.0 664.0L1530.0 664.0" stroke="#FFE6A7" stroke-width="1" opacity="0.25"/>
+<text x="860.0" y="720.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">HNSW engines grow a layered graph one insert at a time;</text>
+<text x="860.0" y="748.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">CAGRA prunes a k-NN graph to a fixed degree on the GPU,</text>
+<text x="860.0" y="776.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">so its names match the flags by role, not by algorithm.</text>
+<path d="M70 838H1530" stroke="#FFE6A7" stroke-width="1.5" opacity="0.6"/>
+<text x="70" y="880" font-size="18" fill="#FFE6A7">Thick path: the walk from the entry point. Rings: neighbors scored on the way. Dashed: a vector being linked in.</text>
+</g>
+</svg>

@@ -1,0 +1,177 @@
+<svg width="1600" height="920" viewBox="0 0 1600 920" fill="none" xmlns="http://www.w3.org/2000/svg">
+<title>Recall counts what came back.</title>
+<defs>
+<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+  <path d="M0 0V6" stroke="#FFE6A7" stroke-width="2"/>
+</pattern>
+<pattern id="dots" width="6" height="6" patternUnits="userSpaceOnUse">
+  <circle cx="3" cy="3" r="1.3" fill="#FFE6A7"/>
+</pattern>
+<pattern id="rows" width="6" height="6" patternUnits="userSpaceOnUse">
+  <path d="M0 3H6" stroke="#FFE6A7" stroke-width="1.6"/>
+</pattern>
+</defs>
+<rect width="1600" height="920" fill="#C44536"/>
+<g id="recall-metrics" font-family="Poppins, Helvetica, Arial, sans-serif" stroke-linecap="round" stroke-linejoin="round">
+<text x="70" y="58" font-size="20" fill="#FFE6A7">RetriEval / search notes</text>
+<text x="70" y="140" font-size="54" fill="#FFE6A7">Recall counts what came back.</text>
+<text x="70" y="200" font-size="23" fill="#FFE6A7">One list of ten answers, scored four ways, by which true neighbors count and how many answers are searched.</text>
+<text x="70.0" y="290.0" font-size="19" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">true, nearest first</text>
+<text x="70.0" y="370.0" font-size="19" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">returned, best first</text>
+<text x="317.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">1</text>
+<rect x="300.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="317.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">A</text>
+<rect x="300.0" y="344.0" width="34.0" height="34.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="317.0" y="368.0" font-size="18" text-anchor="middle" fill="#C44536" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">B</text>
+<text x="357.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">2</text>
+<rect x="340.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="357.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">B</text>
+<rect x="340.0" y="344.0" width="34.0" height="34.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="357.0" y="368.0" font-size="18" text-anchor="middle" fill="#C44536" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">A</text>
+<text x="397.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">3</text>
+<rect x="380.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="397.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">C</text>
+<rect x="380.0" y="344.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="397.0" y="368.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">K</text>
+<text x="437.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">4</text>
+<rect x="420.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="437.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">D</text>
+<rect x="420.0" y="344.0" width="34.0" height="34.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="437.0" y="368.0" font-size="18" text-anchor="middle" fill="#C44536" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">C</text>
+<text x="477.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">5</text>
+<rect x="460.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="477.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">E</text>
+<rect x="460.0" y="344.0" width="34.0" height="34.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="477.0" y="368.0" font-size="18" text-anchor="middle" fill="#C44536" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">E</text>
+<text x="517.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">6</text>
+<rect x="500.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="517.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">F</text>
+<rect x="500.0" y="344.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="517.0" y="368.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">L</text>
+<text x="557.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">7</text>
+<rect x="540.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="557.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">G</text>
+<rect x="540.0" y="344.0" width="34.0" height="34.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="557.0" y="368.0" font-size="18" text-anchor="middle" fill="#C44536" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">D</text>
+<text x="597.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">8</text>
+<rect x="580.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="597.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">H</text>
+<rect x="580.0" y="344.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="597.0" y="368.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">M</text>
+<text x="637.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">9</text>
+<rect x="620.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="637.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">I</text>
+<rect x="620.0" y="344.0" width="34.0" height="34.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="637.0" y="368.0" font-size="18" text-anchor="middle" fill="#C44536" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">F</text>
+<text x="677.0" y="252.0" font-size="15" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">10</text>
+<rect x="660.0" y="264.0" width="34.0" height="34.0" fill="none" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="677.0" y="288.0" font-size="18" text-anchor="middle" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">J</text>
+<rect x="660.0" y="344.0" width="34.0" height="34.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="2" opacity="1.0"/>
+<text x="677.0" y="368.0" font-size="18" text-anchor="middle" fill="#C44536" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">G</text>
+<path d="M357.0 298C357.0 322 317.0 320 317.0 344" stroke="#FFE6A7" stroke-width="1.5" opacity="0.8"/>
+<path d="M317.0 298C317.0 322 357.0 320 357.0 344" stroke="#FFE6A7" stroke-width="1.5" opacity="0.8"/>
+<path d="M397.0 298C397.0 322 437.0 320 437.0 344" stroke="#FFE6A7" stroke-width="1.5" opacity="0.8"/>
+<path d="M477.0 298C477.0 322 477.0 320 477.0 344" stroke="#FFE6A7" stroke-width="1.5" opacity="0.8"/>
+<path d="M437.0 298C437.0 322 557.0 320 557.0 344" stroke="#FFE6A7" stroke-width="1.5" opacity="0.8"/>
+<path d="M517.0 298C517.0 322 637.0 320 637.0 344" stroke="#FFE6A7" stroke-width="1.5" opacity="0.8"/>
+<path d="M557.0 298C557.0 322 677.0 320 677.0 344" stroke="#FFE6A7" stroke-width="1.5" opacity="0.8"/>
+<text x="760.0" y="288.0" font-size="19" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">X-recall@Y: the share of the true X nearest</text>
+<text x="760.0" y="318.0" font-size="19" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">found among the Y answers returned.</text>
+<text x="760.0" y="358.0" font-size="19" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">Neither bounds the other,</text>
+<text x="760.0" y="388.0" font-size="19" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">so the two are never compared.</text>
+<text x="70.0" y="470.0" font-size="28" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">1-recall@1</text>
+<text x="70.0" y="498.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">recall_at_1</text>
+<rect x="70.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="70.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="96.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="96.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="122.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="122.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="148.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="148.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="174.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="174.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="200.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="200.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="226.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="226.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="252.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="252.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="278.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="278.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="304.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="304.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<path d="M70.0 520.0L92.0 520.0" stroke="#FFE6A7" stroke-width="3" opacity="1.0"/>
+<path d="M70.0 622.0L92.0 622.0" stroke="#FFE6A7" stroke-width="3" opacity="1.0"/>
+<text x="70.0" y="670.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">0 of the true 1 returned</text>
+<text x="70.0" y="750.0" font-size="56" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">0</text>
+<text x="445.0" y="470.0" font-size="28" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">1-recall@10</text>
+<text x="445.0" y="498.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">recall_at_k</text>
+<rect x="445.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="445.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="471.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="471.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="497.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="497.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="523.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="523.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="549.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="549.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="575.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="575.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="601.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="601.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="627.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="627.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="653.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="653.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="679.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.3"/>
+<rect x="679.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<path d="M445.0 520.0L467.0 520.0" stroke="#FFE6A7" stroke-width="3" opacity="1.0"/>
+<path d="M445.0 622.0L701.0 622.0" stroke="#FFE6A7" stroke-width="3" opacity="1.0"/>
+<text x="445.0" y="670.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">1 of the true 1 returned</text>
+<text x="445.0" y="750.0" font-size="56" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">1</text>
+<text x="820.0" y="470.0" font-size="28" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">10-recall@10</text>
+<text x="820.0" y="498.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">intersection_at_k</text>
+<rect x="820.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="820.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="846.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="846.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="872.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="872.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="898.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="898.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="924.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="924.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="950.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="950.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="976.0" y="530.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="976.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1002.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1002.0" y="590.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1028.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1028.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1054.0" y="530.0" width="22.0" height="22.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1054.0" y="590.0" width="22.0" height="22.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<path d="M820.0 520.0L1076.0 520.0" stroke="#FFE6A7" stroke-width="3" opacity="1.0"/>
+<path d="M820.0 622.0L1076.0 622.0" stroke="#FFE6A7" stroke-width="3" opacity="1.0"/>
+<text x="820.0" y="670.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">7 of the true 10 returned</text>
+<text x="820.0" y="750.0" font-size="56" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">0.7</text>
+<text x="1195.0" y="470.0" font-size="28" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">NDCG@10</text>
+<text x="1195.0" y="498.0" font-size="15" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">ndcg_at_k</text>
+<rect x="1195.0" y="530.0" width="22.0" height="92.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1221.0" y="564.0" width="22.0" height="58.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1247.0" y="576.0" width="22.0" height="46.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.4"/>
+<rect x="1273.0" y="582.4" width="22.0" height="39.6" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1299.0" y="586.4" width="22.0" height="35.6" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1325.0" y="589.2" width="22.0" height="32.8" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.4"/>
+<rect x="1351.0" y="591.3" width="22.0" height="30.7" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1377.0" y="593.0" width="22.0" height="29.0" fill="none" stroke="#FFE6A7" stroke-width="1.5" opacity="0.4"/>
+<rect x="1403.0" y="594.3" width="22.0" height="27.7" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="1429.0" y="595.4" width="22.0" height="26.6" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="1195.0" y="670.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">hits weighted by 1 / log2(rank + 1)</text>
+<text x="1195.0" y="750.0" font-size="56" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">0.74</text>
+<path d="M70 838H1530" stroke="#FFE6A7" stroke-width="1.5" opacity="0.6"/>
+<text x="70" y="880" font-size="18" fill="#FFE6A7">Upper rows: the true neighbors that count. Lower rows: the answers searched. Filled cells match; bars mark each window.</text>
+</g>
+</svg>

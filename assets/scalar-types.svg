@@ -1,0 +1,206 @@
+<svg width="1600" height="920" viewBox="0 0 1600 920" fill="none" xmlns="http://www.w3.org/2000/svg">
+<title>Fewer bits, sharper tradeoffs.</title>
+<defs>
+<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+  <path d="M0 0V6" stroke="#FFE6A7" stroke-width="2"/>
+</pattern>
+<pattern id="dots" width="6" height="6" patternUnits="userSpaceOnUse">
+  <circle cx="3" cy="3" r="1.3" fill="#FFE6A7"/>
+</pattern>
+<pattern id="rows" width="6" height="6" patternUnits="userSpaceOnUse">
+  <path d="M0 3H6" stroke="#FFE6A7" stroke-width="1.6"/>
+</pattern>
+</defs>
+<rect width="1600" height="920" fill="#C44536"/>
+<g id="scalar-types" font-family="Poppins, Helvetica, Arial, sans-serif" stroke-linecap="round" stroke-linejoin="round">
+<text x="70" y="58" font-size="20" fill="#FFE6A7">RetriEval / search notes</text>
+<text x="70" y="140" font-size="54" fill="#FFE6A7">Fewer bits, sharper tradeoffs.</text>
+<text x="70" y="200" font-size="23" fill="#FFE6A7">--data-type picks how each dimension is stored: exponent bits buy range, mantissa bits buy precision.</text>
+<text x="180.0" y="242.0" font-size="17" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">bits per dimension</text>
+<text x="1040.0" y="242.0" font-size="17" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400">largest</text>
+<text x="1180.0" y="242.0" font-size="17" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400">overflow</text>
+<text x="1340.0" y="242.0" font-size="17" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400">NaN</text>
+<text x="1530.0" y="242.0" font-size="17" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400">in [-1, 1]</text>
+<text x="70.0" y="288.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">f32</text>
+<rect x="180.0" y="268.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="300.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="320.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="340.0" y="268.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="360.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="380.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="400.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="420.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="440.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="460.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="480.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="500.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="520.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="540.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="560.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="580.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="600.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="620.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="640.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="660.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="680.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="700.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="720.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="740.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="760.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="780.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="800.0" y="268.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="828.0" y="288.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">32</text>
+<text x="1040.0" y="288.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">3.4e38</text>
+<text x="1180.0" y="288.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">to inf</text>
+<text x="1340.0" y="288.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">yes</text>
+<text x="1530.0" y="288.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<text x="70.0" y="340.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">bf16</text>
+<rect x="180.0" y="320.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="300.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="320.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="340.0" y="320.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="360.0" y="320.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="380.0" y="320.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="400.0" y="320.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="420.0" y="320.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="440.0" y="320.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="460.0" y="320.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="480.0" y="320.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="508.0" y="340.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">16</text>
+<text x="1040.0" y="340.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">3.4e38</text>
+<text x="1180.0" y="340.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">to inf</text>
+<text x="1340.0" y="340.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">yes</text>
+<text x="1530.0" y="340.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<text x="70.0" y="392.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">f16</text>
+<rect x="180.0" y="372.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="372.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="372.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="372.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="372.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="372.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="300.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="320.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="340.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="360.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="380.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="400.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="420.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="440.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="460.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="480.0" y="372.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="508.0" y="392.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">16</text>
+<text x="1040.0" y="392.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">65,504</text>
+<text x="1180.0" y="392.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">to inf</text>
+<text x="1340.0" y="392.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">yes</text>
+<text x="1530.0" y="392.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<text x="70.0" y="444.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">e5m2</text>
+<rect x="180.0" y="424.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="424.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="424.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="424.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="424.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="424.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="300.0" y="424.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="320.0" y="424.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="348.0" y="444.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">8</text>
+<text x="1040.0" y="444.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">57,344</text>
+<text x="1180.0" y="444.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">to inf</text>
+<text x="1340.0" y="444.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">6 codes</text>
+<text x="1530.0" y="444.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">49%</text>
+<text x="70.0" y="496.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">e4m3</text>
+<rect x="180.0" y="476.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="476.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="476.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="476.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="476.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="476.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="300.0" y="476.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="320.0" y="476.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="348.0" y="496.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">8</text>
+<text x="1040.0" y="496.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">448</text>
+<text x="1180.0" y="496.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">saturates</text>
+<text x="1340.0" y="496.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">2 codes</text>
+<text x="1530.0" y="496.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">45%</text>
+<text x="70.0" y="548.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">e3m2</text>
+<rect x="180.0" y="528.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="528.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="528.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="528.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="528.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="528.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="308.0" y="548.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">6</text>
+<text x="1040.0" y="548.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">28</text>
+<text x="1180.0" y="548.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">saturates</text>
+<text x="1340.0" y="548.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">none</text>
+<text x="1530.0" y="548.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">41%</text>
+<text x="70.0" y="600.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">e2m3</text>
+<rect x="180.0" y="580.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="580.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="580.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="580.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="580.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="580.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="308.0" y="600.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">6</text>
+<text x="1040.0" y="600.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">7.5</text>
+<text x="1180.0" y="600.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">saturates</text>
+<text x="1340.0" y="600.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">none</text>
+<text x="1530.0" y="600.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">28%</text>
+<text x="70.0" y="652.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">i8</text>
+<rect x="180.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="300.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="320.0" y="632.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="348.0" y="652.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">8</text>
+<text x="1040.0" y="652.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">127</text>
+<text x="1180.0" y="652.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">saturates</text>
+<text x="1340.0" y="652.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">to 0</text>
+<text x="1530.0" y="652.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<text x="70.0" y="704.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">u8</text>
+<rect x="180.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="200.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="220.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="240.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="260.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="280.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="300.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<rect x="320.0" y="684.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="348.0" y="704.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">8</text>
+<text x="1040.0" y="704.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">255</text>
+<text x="1180.0" y="704.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">saturates</text>
+<text x="1340.0" y="704.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">to 0</text>
+<text x="1530.0" y="704.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<text x="70.0" y="756.0" font-size="24" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">b1</text>
+<rect x="180.0" y="736.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="208.0" y="756.0" font-size="16" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">1</text>
+<text x="1040.0" y="756.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">1</text>
+<text x="1180.0" y="756.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<text x="1340.0" y="756.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<text x="1530.0" y="756.0" font-size="18" text-anchor="end" fill="#FFE6A7" opacity="1.0" font-weight="400" font-family="Red Hat Mono, ui-monospace, monospace">…</text>
+<rect x="70.0" y="790.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="98.0" y="810.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">sign</text>
+<rect x="180.0" y="790.0" width="16.0" height="26.0" fill="url(#hatch)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="208.0" y="810.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">exponent, for range</text>
+<rect x="440.0" y="790.0" width="16.0" height="26.0" fill="url(#dots)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="468.0" y="810.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">mantissa, for precision</text>
+<rect x="740.0" y="790.0" width="16.0" height="26.0" fill="url(#rows)" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="768.0" y="810.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">integer</text>
+<rect x="880.0" y="790.0" width="16.0" height="26.0" fill="#FFE6A7" stroke="#FFE6A7" stroke-width="1.5" opacity="1.0"/>
+<text x="908.0" y="810.0" font-size="18" text-anchor="start" fill="#FFE6A7" opacity="1.0" font-weight="400">one bit</text>
+<path d="M70 838H1530" stroke="#FFE6A7" stroke-width="1.5" opacity="0.6"/>
+<text x="70" y="880" font-size="18" fill="#FFE6A7">Overflow and NaN follow NumKong's casts, rounding to nearest even; the share counts finite codes in [-1, 1].</text>
+</g>
+</svg>
