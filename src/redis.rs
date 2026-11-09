@@ -266,7 +266,11 @@ impl<'a> RedisBackend<'a> {
 
 impl Backend for RedisBackend<'_> {
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
-        self.metadata.clone()
+        let mut metadata = self.metadata.clone();
+        let limits = self.runtime.block_on(self.container.limits());
+        let limits = limits.unwrap_or_else(|error| json!(format!("unread: {error}")));
+        metadata.insert("container_limits".into(), limits);
+        metadata
     }
 
     fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
@@ -332,6 +336,33 @@ impl Backend for RedisBackend<'_> {
 
     fn memory_bytes(&self) -> usize {
         self.runtime.block_on(self.container.memory_usage_bytes()) as usize
+    }
+
+    /// Waits until `FT.INFO` reports the index scan finished and every hash indexed.
+    fn flush(&mut self) -> Result<(), String> {
+        loop {
+            let info: redis::Value = redis::cmd("FT.INFO")
+                .arg(INDEX_NAME)
+                .query(&mut self.connection)
+                .map_err(|error| format!("Redis FT.INFO: {error}"))?;
+            match (info_field(&info, "indexing"), info_field(&info, "percent_indexed")) {
+                (Some(indexing), Some(percent)) if indexing == 0.0 && percent >= 1.0 => return Ok(()),
+                (Some(_), Some(_)) => std::thread::sleep(Duration::from_millis(100)),
+                _ => return Err("Redis FT.INFO reports no indexing or percent_indexed".into()),
+            }
+        }
+    }
+}
+
+/// A numeric field of an `FT.INFO` reply, which alternates names and values.
+fn info_field(info: &redis::Value, name: &str) -> Option<f64> {
+    let redis::Value::Array(items) = info else {
+        return None;
+    };
+    let pair = items.chunks_exact(2).find(|pair| redis_text(&pair[0]) == Some(name))?;
+    match &pair[1] {
+        redis::Value::Int(value) => Some(*value as f64),
+        value => redis_text(value)?.parse().ok(),
     }
 }
 

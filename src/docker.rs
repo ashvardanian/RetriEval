@@ -51,10 +51,15 @@ impl ContainerHandle {
             );
         }
 
+        let budget = crate::output::budget();
+        let memory = i64::try_from(budget.memory_limit).unwrap_or(i64::MAX);
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
             host_config: Some(HostConfig {
                 port_bindings: Some(port_bindings),
+                cpuset_cpus: Some(budget.cpus.clone()),
+                memory: Some(memory),
+                memory_swap: Some(memory),
                 ..Default::default()
             }),
             env: Some(env.to_vec()),
@@ -117,18 +122,30 @@ impl ContainerHandle {
         .await
     }
 
-    /// Get the container's current memory usage in bytes via Docker stats API.
+    /// The container's anonymous resident bytes from its cgroup's `memory.stat`, leaving out the page
+    /// cache that Docker's `usage` counts.
     pub async fn memory_usage_bytes(&self) -> u64 {
         let opts = bollard::query_parameters::StatsOptionsBuilder::default()
             .stream(false)
             .one_shot(true)
             .build();
         let mut stream = self.docker.stats(&self.container_id, Some(opts));
-        if let Some(Ok(stats)) = stream.next().await {
-            stats.memory_stats.and_then(|memory| memory.usage).unwrap_or(0)
-        } else {
-            0
-        }
+        let Some(Ok(stats)) = stream.next().await else {
+            return 0;
+        };
+        let stats = stats.memory_stats.and_then(|memory| memory.stats).unwrap_or_default();
+        stats.get("anon").or_else(|| stats.get("rss")).copied().unwrap_or(0)
+    }
+
+    /// The memory, swap and cpuset limits Docker applied, read back from the container's `HostConfig`.
+    pub async fn limits(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let inspected = self.docker.inspect_container(&self.container_id, None).await?;
+        let host = inspected.host_config.unwrap_or_default();
+        Ok(serde_json::json!({
+            "memory": host.memory,
+            "memory_swap": host.memory_swap,
+            "cpuset_cpus": host.cpuset_cpus,
+        }))
     }
 
     pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -142,5 +159,56 @@ impl ContainerHandle {
             .await?;
         eprintln!("  Container {} removed.", self.name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ContainerHandle;
+
+    /// Marks the run inside the scope, so the test re-executes itself only once.
+    const INSIDE_SCOPE: &str = "RETRIEVAL_BUDGET_SCOPE";
+
+    /// Inside a two-core 512 MiB scope, the budget reads the scope back and a server container is
+    /// created with that cpuset and memory, as its `HostConfig` reports them.
+    #[test]
+    #[ignore = "spawns systemd-run --user and pulls the Qdrant image"]
+    fn containers_take_the_scope_budget() {
+        if std::env::var_os(INSIDE_SCOPE).is_none() {
+            let status = std::process::Command::new("systemd-run")
+                .args(["--user", "--scope", "--quiet", "--collect"])
+                .arg(format!("--unit=retrieval-budget-{}", std::process::id()))
+                .args(["-p", "MemoryMax=512M", "-p", "MemorySwapMax=0", "taskset", "-c", "0-1"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "docker::tests::containers_take_the_scope_budget",
+                    "--include-ignored",
+                ])
+                .env(INSIDE_SCOPE, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let budget = crate::output::budget();
+        assert_eq!(
+            (budget.cores, budget.cpus.as_str(), budget.memory_limit),
+            (2, "0-1", 512 << 20)
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let container = runtime
+            .block_on(ContainerHandle::start(
+                "qdrant/qdrant:v1.19.1",
+                "retrieval-budget-test",
+                &[],
+                &[],
+                &[],
+            ))
+            .unwrap();
+        let limits = runtime.block_on(container.limits()).map_err(|error| error.to_string());
+        runtime.block_on(container.stop()).unwrap();
+        let expected = serde_json::json!({"memory": 512 << 20, "memory_swap": 512 << 20, "cpuset_cpus": "0-1"});
+        assert_eq!(limits.unwrap(), expected);
     }
 }

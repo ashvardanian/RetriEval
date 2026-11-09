@@ -5,6 +5,32 @@ Every row is one NVIDIA B300 holding the whole index in VRAM unless stated, with
 Recall is judged against an exact oracle over 256 queries unless stated, and the scanned share is distances per query over the base size.
 QPS marked † was measured over only 1,000 queries per run, which underfills a B300; later runs use 100,000.
 
+## November 9, 2026
+
+### USearch and FAISS on Graviton5
+
+Both engines on AWS `m9g.48xlarge`: one Graviton5 socket of 192 Neoverse V3 cores without SMT, two NUMA nodes, 768 GiB, all 192 threads, at connectivity 32.
+FAISS's HNSW keeps 64 edges per vector at layer 0, and USearch's single-layer graph keeps 32.
+FAISS 1.15.1 is built from source with its SVE kernels and OpenBLAS; USearch 3.0 dispatches its `apple-m2` class there, so its distances run on NEON `sdot` kernels rather than SVE.
+Each engine builds once per construction expansion and climbs the search expansion until 1-recall@10 reaches 0.99, keeping the first row that searches at least as fast as it builds.
+Inputs and ground truth are SIFT 100M from the BigANN files and PubChem ECFP4 over all 115,627,256 molecules with 10,000 queries; memory is each backend's peak figure.
+
+| Dataset      | Backend      | Type | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory | Build |
+| :----------- | :----------- | :--- | ---------: | -----: | ------: | ------: | -------: | ------: | ----: |
+| SIFT 100M    | USearch 3.0  | `u8` |  256 / 160 | 0.9907 |  0.9807 | 292,833 |  184,891 | 33.8 GB |  5.7m |
+| SIFT 100M    | USearch 3.0  | `u8` |  512 / 160 | 0.9925 |  0.9824 | 161,952 |  173,823 | 33.8 GB | 10.3m |
+| SIFT 100M    | FAISS 1.15.1 | `u8` |  128 / 192 | 0.9927 |  0.9833 | 166,868 |  139,310 | 56.9 GB | 10.0m |
+| SIFT 100M    | FAISS 1.15.1 | `u8` |  256 / 128 | 0.9917 |  0.9792 |  84,536 |  178,600 | 56.9 GB | 19.7m |
+| ECFP4 115.6M | USearch 3.0  | `b1` |  256 / 512 | 0.9787 |  0.8982 | 203,337 |   55,601 | 53.6 GB |  9.5m |
+| ECFP4 115.6M | USearch 3.0  | `b1` | 512 / 1024 | 0.9843 |  0.9073 | 104,412 |   27,404 | 53.6 GB | 18.5m |
+| ECFP4 115.6M | FAISS 1.15.1 | `b1` |    40 / 16 | 0.5623 |  0.4704 | 341,635 |  839,862 | 93.3 GB |  5.6m |
+
+- On SIFT the two engines search at parity once both build slower than they search: USearch builds 1.9 times faster, and FAISS answers 3% more queries per second.
+- The first row of each SIFT pair reaches 99% but builds faster than it searches, so the second, wider build is the one kept in the README.
+- ECFP4 never reaches 99% on the CPU: USearch levels off near 0.984 where the B300 reaches 0.9906 at 512 / 512, and its 10-recall@10 stays near 0.90.
+  That gap is tie scoring, since Hamming distances tie often and 10-recall@10 credits only the exact keys the ground truth kept among tied neighbors.
+- FAISS's `IndexBinaryHNSW` keeps its compiled-in 40 / 16, since FAISS's parameter tuning has no dispatcher for binary indexes.
+
 ## October 22, 2026
 
 ### FAISS on CPU
@@ -20,7 +46,7 @@ Memory is the process's peak resident set, the memory-mapped base included.
 | SIFT 10M | SQ8 direct, `u8` |   128 / 96 | 0.9900 |  0.9765 | 115,643 |  133,919 |  8.6 GB |  1.4m |
 | SIFT 10M | Flat, `f32`      |   128 / 96 | 0.9900 |  0.9765 |  59,688 |   61,027 | 14.4 GB |  2.8m |
 
-- Storing SIFT's bytes as 8-bit codes keeps every neighbor of the `f32` index, since the bytes convert exactly, while building and searching about twice as fast in 40% less memory.
+- Storing SIFT's bytes as 8-bit codes keeps every neighbor of the `f32` index, since the bytes convert exactly, while building and searching about twice as fast.
 - FAISS reaches 99% at a construction expansion of 128 on SIFT 10M, so neither row needed a wider build to search faster than it inserts.
 
 ## October 21, 2026

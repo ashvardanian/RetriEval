@@ -225,6 +225,8 @@ pub struct GroundTruth {
     neighbors_per_query: usize,
     /// Bytes per neighbor row id: 4 in `.ibin`, 8 in `.u64bin`.
     row_bytes: usize,
+    /// Whether every shard follows its rows with one `f32` distance per neighbor, as BigANN files do.
+    distances: bool,
 }
 
 impl Dataset {
@@ -496,11 +498,33 @@ impl GroundTruth {
             }
         };
         let (shards, neighbors_per_query) = load_shards(path, "ground_truth", |neighbors| neighbors * row_bytes)?;
+        let distances = shards.mmaps.iter().enumerate().all(|(shard, mmap)| {
+            let rows = shards.offsets[shard + 1] - shards.offsets[shard];
+            mmap.len() == HEADER_BYTES + rows * neighbors_per_query * (row_bytes + 4)
+        });
         Ok(Self {
             shards,
             neighbors_per_query,
             row_bytes,
+            distances,
         })
+    }
+
+    /// The distances of a query's true neighbors, nearest first, when the file stores them.
+    pub fn distances(&self, query_index: usize) -> Option<impl ExactSizeIterator<Item = f32> + '_> {
+        if !self.distances {
+            return None;
+        }
+        let (shard, within) = self.shards.locate(query_index);
+        let rows = self.shards.offsets[shard + 1] - self.shards.offsets[shard];
+        let width = self.neighbors_per_query;
+        let offset = HEADER_BYTES + rows * width * self.row_bytes + within * width * 4;
+        let bytes = &self.shards.mmaps[shard][offset..offset + width * 4];
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|distance| f32::from_le_bytes(distance.try_into().unwrap())),
+        )
     }
 
     pub fn queries(&self) -> usize {

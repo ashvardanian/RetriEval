@@ -201,8 +201,15 @@ fn run_b1bin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli.top_k
     );
     let mut ground_truth = nk::Matrix::full(&[cli.query_count, cli.top_k], 0u32)?;
-    compute_top_k(&[base.view()], queries.view(), ground_truth.span(), cli.threads)?;
-    write_dataset(cli, "b1bin", &base, &queries, &ground_truth)
+    let mut distances = nk::Matrix::full(&[cli.query_count, cli.top_k], 0.0f32)?;
+    compute_top_k(
+        &[base.view()],
+        queries.view(),
+        ground_truth.span(),
+        distances.span(),
+        cli.threads,
+    )?;
+    write_dataset(cli, "b1bin", &base, &queries, &ground_truth, &distances)
 }
 
 /// Gaussian `f32` base and queries with exact L2 ground truth.
@@ -222,33 +229,48 @@ fn run_fbin(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli.top_k
     );
     let mut ground_truth = nk::Matrix::full(&[cli.query_count, cli.top_k], 0u32)?;
-    compute_top_k(&[base.view()], queries.view(), ground_truth.span(), cli.threads)?;
-    write_dataset(cli, "fbin", &base, &queries, &ground_truth)
+    let mut distances = nk::Matrix::full(&[cli.query_count, cli.top_k], 0.0f32)?;
+    compute_top_k(
+        &[base.view()],
+        queries.view(),
+        ground_truth.span(),
+        distances.span(),
+        cli.threads,
+    )?;
+    write_dataset(cli, "fbin", &base, &queries, &ground_truth, &distances)
 }
 
-/// Writes `base.N.<extension>`, `query.M.<extension>` and `groundtruth.M.ibin`.
+/// Writes `base.N.<extension>`, `query.M.<extension>` and `groundtruth.M.ibin`, its neighbor IDs
+/// followed by their distances.
 fn write_dataset<T: nk::StorageElement + Copy>(
     cli: &Cli,
     extension: &str,
     base: &nk::Matrix<T>,
     queries: &nk::Matrix<T>,
     ground_truth: &nk::Matrix<u32>,
+    distances: &nk::Matrix<f32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output = |name: String| cli.output.join(name);
-    // SAFETY: the generated scalars and the `u32` neighbor ids are POD.
-    let (base_bytes, query_bytes, ground_truth_bytes) = unsafe {
+    // SAFETY: the generated scalars, the `u32` neighbor IDs and the `f32` distances are POD.
+    let (base_bytes, query_bytes, ground_truth_bytes, distance_bytes) = unsafe {
         (
             pod_slice_as_bytes(base.as_slice()),
             pod_slice_as_bytes(queries.as_slice()),
             pod_slice_as_bytes(ground_truth.as_slice()),
+            pod_slice_as_bytes(distances.as_slice()),
         )
     };
     let base_path = output(format!("base.{}.{extension}", cli.base_count));
-    write_bin_file(&base_path, cli.base_count, cli.dims, base_bytes)?;
+    write_bin_file(&base_path, cli.base_count, cli.dims, &[base_bytes])?;
     let query_path = output(format!("query.{}.{extension}", cli.query_count));
-    write_bin_file(&query_path, cli.query_count, cli.dims, query_bytes)?;
+    write_bin_file(&query_path, cli.query_count, cli.dims, &[query_bytes])?;
     let ground_truth_path = output(format!("groundtruth.{}.ibin", cli.query_count));
-    write_bin_file(&ground_truth_path, cli.query_count, cli.top_k, ground_truth_bytes)?;
+    write_bin_file(
+        &ground_truth_path,
+        cli.query_count,
+        cli.top_k,
+        &[ground_truth_bytes, distance_bytes],
+    )?;
     eprintln!(
         "Done! base: {:.1} MB",
         (8 + base_bytes.len()) as f64 / (1u64 << 20) as f64

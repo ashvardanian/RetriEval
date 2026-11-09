@@ -49,6 +49,9 @@ where
     /// Project one raw distance into its ordering key. Cheap, branchless.
     fn ordering_key(distance: Self::Distance) -> Self::OrderingKey;
 
+    /// The distance a ground-truth file stores for an ordering key, on the scale engines report.
+    fn stored_distance(key: Self::OrderingKey) -> f32;
+
     /// Write the full query-vs-base distance matrix into `out` in parallel.
     ///
     /// `out` must be shape `[queries.shape()[0], packed_base.width()]`.
@@ -76,6 +79,10 @@ impl PackedDistance for nk::u1x8 {
     #[inline(always)]
     fn ordering_key(distance: u32) -> u32 {
         distance
+    }
+
+    fn stored_distance(key: u32) -> f32 {
+        key as f32
     }
 
     fn distances_parallel_into(
@@ -116,6 +123,12 @@ impl PackedDistance for f32 {
             "L2 distance must be non-negative and finite, got {distance}"
         );
         distance.to_bits()
+    }
+
+    /// Squared, as engines report L2 and BigANN files store it.
+    fn stored_distance(key: u64) -> f32 {
+        let distance = f64::from_bits(key);
+        (distance * distance) as f32
     }
 
     fn distances_parallel_into(

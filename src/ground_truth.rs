@@ -27,15 +27,17 @@ const DISTANCE_TILE_BYTES: usize = 1 << 30;
 ///
 /// `base` lists the parts of one base set, numbered on from each other; the base parts and
 /// `queries` must agree on width, and `ground_truth` is `[query_count, top_k]`. Every query is
-/// scored against each base tile in one call. Ties break toward the lower base index.
+/// scored against each base tile in one call, and `distances` takes each neighbor's distance on
+/// the scale engines report. Ties break toward the lower base index.
 pub fn compute_top_k<Metric: PackedDistance>(
     base: &[MatrixView<'_, Metric>],
     queries: MatrixView<'_, Metric>,
     ground_truth: MatrixSpan<'_, u32>,
+    distances: MatrixSpan<'_, f32>,
     threads: Threads,
 ) -> Result<(), GroundTruthError> {
     let tile_rows = DISTANCE_TILE_BYTES / (queries.shape()[0].max(1) * std::mem::size_of::<Metric::Distance>());
-    compute_top_k_tiled(base, queries, ground_truth, tile_rows, threads)
+    compute_top_k_tiled(base, queries, ground_truth, distances, tile_rows, threads)
 }
 
 /// [`compute_top_k`] with an explicit base tile, which tests shrink to cross tile boundaries.
@@ -43,6 +45,7 @@ fn compute_top_k_tiled<Metric: PackedDistance>(
     base: &[MatrixView<'_, Metric>],
     queries: MatrixView<'_, Metric>,
     mut ground_truth: MatrixSpan<'_, u32>,
+    mut truth_distances: MatrixSpan<'_, f32>,
     tile_rows: usize,
     threads: Threads,
 ) -> Result<(), GroundTruthError> {
@@ -90,7 +93,13 @@ fn compute_top_k_tiled<Metric: PackedDistance>(
         progress.set_position((tile_start + rows.len()) as u64);
     }
     progress.finish_and_clear();
-    land_ranking(&best, top_k, &mut ground_truth);
+    land_ranking(
+        &best,
+        top_k,
+        &mut ground_truth,
+        &mut truth_distances,
+        Metric::stored_distance,
+    );
     Ok(())
 }
 
@@ -128,10 +137,11 @@ pub fn compute_shape_top_k(
     queries: Clouds<'_>,
     metric: ShapeMetric,
     ground_truth: MatrixSpan<'_, u32>,
+    distances: MatrixSpan<'_, f32>,
     threads: Threads,
 ) -> Result<(), GroundTruthError> {
     let tile_rows = DISTANCE_TILE_BYTES / (queries.counts.len().max(1) * std::mem::size_of::<f32>());
-    compute_shape_top_k_tiled(base, queries, metric, ground_truth, tile_rows, threads)
+    compute_shape_top_k_tiled(base, queries, metric, ground_truth, distances, tile_rows, threads)
 }
 
 /// [`compute_shape_top_k`] with an explicit base tile, which tests shrink to cross tile boundaries.
@@ -140,6 +150,7 @@ fn compute_shape_top_k_tiled(
     queries: Clouds<'_>,
     metric: ShapeMetric,
     mut ground_truth: MatrixSpan<'_, u32>,
+    mut truth_distances: MatrixSpan<'_, f32>,
     tile_rows: usize,
     threads: Threads,
 ) -> Result<(), GroundTruthError> {
@@ -172,8 +183,12 @@ fn compute_shape_top_k_tiled(
         let packed_tile = nk::ShapesPackedMatrix::new_parallel_in(&tile_clouds, nk::Global, &mut pool)?;
         let tile_scores = &mut scores[..query_count * rows.len()];
         match metric {
-            ShapeMetric::Chamfer => packed_queries.chamfers_parallel(&packed_tile, tile_scores, None, &mut pool)?,
-            ShapeMetric::Hausdorff => packed_queries.hausdorffs_parallel(&packed_tile, tile_scores, None, &mut pool)?,
+            ShapeMetric::Chamfer => {
+                packed_queries.chamfers_parallel(&packed_tile, tile_scores, None, f32::INFINITY, &mut pool)?
+            }
+            ShapeMetric::Hausdorff => {
+                packed_queries.hausdorffs_parallel(&packed_tile, tile_scores, None, f32::INFINITY, &mut pool)?
+            }
         }
         fold_tile(
             tile_scores,
@@ -186,7 +201,7 @@ fn compute_shape_top_k_tiled(
         progress.set_position((tile_start + rows.len()) as u64);
     }
     progress.finish_and_clear();
-    land_ranking(&best, top_k, &mut ground_truth);
+    land_ranking(&best, top_k, &mut ground_truth, &mut truth_distances, f32::from_bits);
     Ok(())
 }
 
@@ -275,14 +290,25 @@ fn fold_tile<Distance: Copy + Sync, Key: Ord + Copy + Send + Sync>(
         .map_err(|error| GroundTruthError::ThreadPool(format!("{error}")))
 }
 
-/// Lands every ranking's base indices in `ground_truth`, row by row.
-fn land_ranking<Key>(best: &[(Key, u32)], top_k: usize, ground_truth: &mut MatrixSpan<'_, u32>) {
-    let rows = ground_truth
-        .as_contiguous_slice_mut()
-        .expect("ground-truth rows are contiguous");
-    for (row, ranking) in rows.chunks_exact_mut(top_k).zip(best.chunks_exact(top_k)) {
-        for (slot, &(_, index)) in row.iter_mut().zip(ranking) {
+/// Lands every ranking's base indices in `ground_truth` and their distances in `distances`, row by row.
+fn land_ranking<Key: Copy>(
+    best: &[(Key, u32)],
+    top_k: usize,
+    ground_truth: &mut MatrixSpan<'_, u32>,
+    distances: &mut MatrixSpan<'_, f32>,
+    distance_of: impl Fn(Key) -> f32,
+) {
+    const CONTIGUOUS: &str = "ground-truth rows are contiguous";
+    let rows = ground_truth.as_contiguous_slice_mut().expect(CONTIGUOUS);
+    let distances = distances.as_contiguous_slice_mut().expect(CONTIGUOUS);
+    for ((row, row_distances), ranking) in rows
+        .chunks_exact_mut(top_k)
+        .zip(distances.chunks_exact_mut(top_k))
+        .zip(best.chunks_exact(top_k))
+    {
+        for ((slot, distance), &(key, index)) in row.iter_mut().zip(row_distances).zip(ranking) {
             *slot = index;
+            *distance = distance_of(key);
         }
     }
 }
@@ -296,11 +322,14 @@ pub fn write_bin_header(writer: &mut impl Write, rows: usize, width: usize) -> i
     writer.write_all(&field(width)?.to_le_bytes())
 }
 
-/// Writes a whole BigANN-style file: its header, then `body`.
-pub fn write_bin_file(path: &Path, rows: usize, width: usize, body: &[u8]) -> io::Result<()> {
+/// Writes a whole BigANN-style file: its header, then each of `bodies` in turn, as ground truth
+/// follows its neighbor IDs with their distances.
+pub fn write_bin_file(path: &Path, rows: usize, width: usize, bodies: &[&[u8]]) -> io::Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     write_bin_header(&mut writer, rows, width)?;
-    writer.write_all(body)?;
+    for body in bodies {
+        writer.write_all(body)?;
+    }
     writer.flush()?;
     eprintln!("Wrote {}", path.display());
     Ok(())
@@ -335,14 +364,20 @@ pub fn write_sampled_ground_truth(
 
     eprintln!("Computing brute-force hamming top-{top_k} ground truth (NumKong + ForkUnion)...");
     let mut ground_truth = nk::Matrix::full(&[query_count, top_k], 0u32)?;
-    compute_top_k(&shards, queries, ground_truth.span(), threads)?;
+    let mut distances = nk::Matrix::full(&[query_count, top_k], 0.0f32)?;
+    compute_top_k(&shards, queries, ground_truth.span(), distances.span(), threads)?;
 
     let query_path = output.join(format!("query.{query_count}.b1bin"));
-    write_bin_file(&query_path, query_count, base.dimensions(), &query_bytes)?;
+    write_bin_file(&query_path, query_count, base.dimensions(), &[&query_bytes])?;
     let ground_truth_path = output.join(format!("groundtruth.{query_count}.ibin"));
-    // SAFETY: `u32` is POD.
-    let ground_truth_bytes = unsafe { pod_slice_as_bytes(ground_truth.as_slice()) };
-    write_bin_file(&ground_truth_path, query_count, top_k, ground_truth_bytes)?;
+    // SAFETY: `u32` and `f32` are POD.
+    let bodies = unsafe {
+        [
+            pod_slice_as_bytes(ground_truth.as_slice()),
+            pod_slice_as_bytes(distances.as_slice()),
+        ]
+    };
+    write_bin_file(&ground_truth_path, query_count, top_k, &bodies)?;
     Ok(())
 }
 
@@ -371,7 +406,8 @@ mod tests {
         queries: nk::MatrixView<'_, Metric>,
     ) -> nk::Matrix<u32> {
         let mut ground_truth = nk::Matrix::full(&[QUERY_COUNT, TOP_K], 0u32).unwrap();
-        compute_top_k_tiled(base, queries, ground_truth.span(), 64, two_threads()).unwrap();
+        let mut distances = nk::Matrix::full(&[QUERY_COUNT, TOP_K], 0.0f32).unwrap();
+        compute_top_k_tiled(base, queries, ground_truth.span(), distances.span(), 64, two_threads()).unwrap();
         ground_truth
     }
 
@@ -486,14 +522,30 @@ mod tests {
         for metric in [ShapeMetric::Chamfer, ShapeMetric::Hausdorff] {
             let mut distances = vec![0.0f32; QUERY_COUNT * BASE_COUNT];
             match metric {
-                ShapeMetric::Chamfer => packed_queries.chamfers(&packed_base, &mut distances, None).unwrap(),
-                ShapeMetric::Hausdorff => packed_queries.hausdorffs(&packed_base, &mut distances, None).unwrap(),
+                ShapeMetric::Chamfer => packed_queries
+                    .chamfers(&packed_base, &mut distances, None, f32::INFINITY)
+                    .unwrap(),
+                ShapeMetric::Hausdorff => packed_queries
+                    .hausdorffs(&packed_base, &mut distances, None, f32::INFINITY)
+                    .unwrap(),
             }
             let mut ground_truth = nk::Matrix::full(&[QUERY_COUNT, TOP_K], 0u32).unwrap();
-            compute_shape_top_k_tiled(&parts, queries, metric, ground_truth.span(), 64, two_threads()).unwrap();
+            let mut truth_distances = nk::Matrix::full(&[QUERY_COUNT, TOP_K], 0.0f32).unwrap();
+            compute_shape_top_k_tiled(
+                &parts,
+                queries,
+                metric,
+                ground_truth.span(),
+                truth_distances.span(),
+                64,
+                two_threads(),
+            )
+            .unwrap();
             let (rows, _) = distances.as_chunks::<BASE_COUNT>();
-            for (row, found) in rows.iter().zip(found_ids(&ground_truth)) {
+            let (stored, _) = truth_distances.as_slice().as_chunks::<TOP_K>();
+            for ((row, found), stored) in rows.iter().zip(found_ids(&ground_truth)).zip(stored) {
                 assert_eq!(found, naive_top_k(row), "{metric:?}");
+                assert!(found.iter().zip(stored).all(|(&id, &distance)| row[id] == distance));
             }
         }
     }

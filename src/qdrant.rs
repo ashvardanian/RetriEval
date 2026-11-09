@@ -27,8 +27,8 @@ use clap::Parser;
 use itertools::iproduct;
 use qdrant_client::{
     qdrant::{
-        point_id, quantization_config::Quantization, BinaryQuantization, CreateCollectionBuilder, Datatype,
-        Distance as QdrantDistance, HnswConfigDiffBuilder, Memory, PointId, PointStruct, QuantizationType,
+        point_id, quantization_config::Quantization, BinaryQuantization, CollectionStatus, CreateCollectionBuilder,
+        Datatype, Distance as QdrantDistance, HnswConfigDiffBuilder, Memory, PointId, PointStruct, QuantizationType,
         ScalarQuantization, SearchParamsBuilder, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
     },
     Qdrant,
@@ -278,7 +278,11 @@ impl<'a> QdrantBackend<'a> {
 
 impl Backend for QdrantBackend<'_> {
     fn metadata(&self) -> HashMap<String, serde_json::Value> {
-        self.metadata.clone()
+        let mut metadata = self.metadata.clone();
+        let limits = self.runtime.block_on(self.container.limits());
+        let limits = limits.unwrap_or_else(|error| json!(format!("unread: {error}")));
+        metadata.insert("container_limits".into(), limits);
+        metadata
     }
 
     fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
@@ -350,6 +354,26 @@ impl Backend for QdrantBackend<'_> {
 
     fn memory_bytes(&self) -> usize {
         self.runtime.block_on(self.container.memory_usage_bytes()) as usize
+    }
+
+    /// Waits until the collection turns green, its optimizers done building the HNSW segments.
+    fn flush(&mut self) -> Result<(), String> {
+        self.runtime.block_on(async {
+            loop {
+                let info = self
+                    .client
+                    .collection_info(COLLECTION)
+                    .await
+                    .map_err(|error| format!("Qdrant collection info: {error}"))?;
+                match info.result.map(|info| CollectionStatus::try_from(info.status)) {
+                    Some(Ok(CollectionStatus::Green)) => return Ok(()),
+                    Some(Ok(CollectionStatus::Yellow | CollectionStatus::Grey)) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await
+                    }
+                    status => return Err(format!("Qdrant collection status {status:?} while indexing")),
+                }
+            }
+        })
     }
 }
 

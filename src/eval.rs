@@ -2,7 +2,7 @@
 
 use std::{alloc::System, iter::Sum, ops::Add};
 
-use crate::{dataset::GroundTruth, Key, Keys};
+use crate::{dataset::GroundTruth, Distance, Key, Keys};
 
 /// Membership tester over one query's ground-truth prefix, reused across queries.
 ///
@@ -15,8 +15,11 @@ use crate::{dataset::GroundTruth, Key, Keys};
 /// allocation. Ground-truth rows are ordered by distance, not by key, so the
 /// sort cannot be skipped.
 struct TruthSet {
-    sorted: Vec<Key, System>,
+    /// Each truth key with its stored distance, NaN when the file stores none, sorted by key.
+    sorted: Vec<(Key, Distance), System>,
     nearest: Option<Key>,
+    /// The farthest truth distance, when the file stores distances.
+    farthest: Option<Distance>,
 }
 
 impl Default for TruthSet {
@@ -24,26 +27,45 @@ impl Default for TruthSet {
         Self {
             sorted: Vec::new_in(System),
             nearest: None,
+            farthest: None,
         }
     }
 }
 
 impl TruthSet {
-    /// Replaces the set with `truth`, nearest first.
-    fn load(&mut self, truth: impl Iterator<Item = Key>) {
+    /// Replaces the set with `truth`, nearest first, and its `distances` when the file stores them.
+    fn load(&mut self, truth: impl Iterator<Item = Key>, distances: Option<impl Iterator<Item = Distance>>) {
         self.sorted.clear();
-        self.sorted.extend(truth);
-        self.nearest = self.sorted.first().copied();
-        self.sorted.sort_unstable();
+        match distances {
+            Some(distances) => self.sorted.extend(truth.zip(distances)),
+            None => self.sorted.extend(truth.map(|key| (key, Distance::NAN))),
+        }
+        self.nearest = self.sorted.first().map(|&(key, _)| key);
+        self.farthest = self
+            .sorted
+            .last()
+            .map(|&(_, distance)| distance)
+            .filter(|distance| !distance.is_nan());
+        self.sorted.sort_unstable_by_key(|&(key, _)| key);
     }
 
     fn len(&self) -> usize {
         self.sorted.len()
     }
 
-    fn contains(&self, key: Key) -> bool {
-        self.sorted.binary_search(&key).is_ok()
+    fn distance(&self, key: Key) -> Option<Distance> {
+        let index = self.sorted.binary_search_by_key(&key, |&(key, _)| key).ok()?;
+        Some(self.sorted[index].1)
     }
+
+    fn contains(&self, key: Key) -> bool {
+        self.distance(key).is_some()
+    }
+}
+
+/// Whether an engine's distance and a stored one agree past rounding.
+fn same_distance(first: Distance, second: Distance) -> bool {
+    (first - second).abs() <= 1e-3 * first.abs().max(second.abs()) + 1e-6
 }
 
 /// One pass of a query set scored against its ground truth, every metric at the same `k`.
@@ -61,6 +83,10 @@ pub struct Scores {
     pub intersection_at_k: f64,
     /// Discounted gain of the truth found in the top `k`, normalized by the best possible.
     pub ndcg_at_k: f64,
+    /// The share of the top `k` within the `k`-th true distance, so a neighbor tied with the
+    /// truth's last counts whichever key the truth kept. Present only when the ground truth stores
+    /// distances and the engine's distances match them on every shared key.
+    pub distance_recall_at_k: Option<f64>,
 }
 
 /// Every metric summed over the queries scored. Sums add associatively, so the partial sums of any
@@ -72,6 +98,11 @@ struct ScoreSums {
     recall_at_k: f64,
     intersection_at_k: f64,
     ndcg_at_k: f64,
+    distance_recall_at_k: f64,
+    /// Returned keys also in the truth, whose two distances were compared.
+    distance_checks: usize,
+    /// Compared pairs that disagree, as when an engine reports another scale.
+    distance_mismatches: usize,
 }
 
 impl Add for ScoreSums {
@@ -84,6 +115,9 @@ impl Add for ScoreSums {
             recall_at_k: self.recall_at_k + other.recall_at_k,
             intersection_at_k: self.intersection_at_k + other.intersection_at_k,
             ndcg_at_k: self.ndcg_at_k + other.ndcg_at_k,
+            distance_recall_at_k: self.distance_recall_at_k + other.distance_recall_at_k,
+            distance_checks: self.distance_checks + other.distance_checks,
+            distance_mismatches: self.distance_mismatches + other.distance_mismatches,
         }
     }
 }
@@ -95,8 +129,8 @@ impl Sum for ScoreSums {
 }
 
 impl ScoreSums {
-    /// One query's `results`, best first and at most `k`, against its `truth`.
-    fn of_query(results: &[Key], truth: &TruthSet, discount: &[f64]) -> Self {
+    /// One query's `results` and their `distances`, best first and at most `k`, against its `truth`.
+    fn of_query(results: &[Key], distances: &[Distance], truth: &TruthSet, discount: &[f64]) -> Self {
         let Some(nearest) = truth.nearest else {
             return Self {
                 queries: 1,
@@ -107,6 +141,17 @@ impl ScoreSums {
         let overlap = (0..results.len()).filter(matched).count();
         let gain: f64 = (0..results.len()).filter(matched).map(|rank| discount[rank]).sum();
         let ideal: f64 = discount[..truth.len()].iter().sum();
+        let (mut distance_checks, mut distance_mismatches) = (0, 0);
+        let mut within = 0;
+        if let Some(farthest) = truth.farthest {
+            for (&key, &distance) in results.iter().zip(distances) {
+                if let Some(stored) = truth.distance(key) {
+                    distance_checks += 1;
+                    distance_mismatches += usize::from(!same_distance(distance, stored));
+                }
+                within += usize::from(distance <= farthest || same_distance(distance, farthest));
+            }
+        }
         Self {
             queries: 1,
             recall_at_1: f64::from(results.first() == Some(&nearest)),
@@ -115,6 +160,9 @@ impl ScoreSums {
             intersection_at_k: overlap as f64 / truth.len() as f64,
             // Clamped, since a key returned twice is credited twice.
             ndcg_at_k: (gain / ideal).min(1.0),
+            distance_recall_at_k: (within as f64 / truth.len() as f64).min(1.0),
+            distance_checks,
+            distance_mismatches,
         }
     }
 
@@ -128,13 +176,16 @@ impl ScoreSums {
             recall_at_k: mean(self.recall_at_k),
             intersection_at_k: mean(self.intersection_at_k),
             ndcg_at_k: mean(self.ndcg_at_k),
+            distance_recall_at_k: (self.distance_checks > 0 && self.distance_mismatches == 0)
+                .then(|| mean(self.distance_recall_at_k)),
         }
     }
 }
 
-/// Scores each query's `found` keys, best first, against its ground-truth rows named by `base_keys`.
+/// Scores each query's `found` keys and distances, best first, against its ground-truth rows named
+/// by `base_keys`.
 pub fn score<'a>(
-    found: impl Iterator<Item = &'a [Key]>,
+    found: impl Iterator<Item = (&'a [Key], &'a [Distance])>,
     ground_truth: &GroundTruth,
     base_keys: &Keys,
     k: usize,
@@ -144,14 +195,16 @@ pub fn score<'a>(
     found
         .take(ground_truth.queries())
         .enumerate()
-        .map(|(query_index, found)| {
+        .map(|(query_index, (keys, distances))| {
             truth.load(
                 ground_truth
                     .neighbors(query_index)
                     .take(k)
                     .map(|row| base_keys.get(row)),
+                ground_truth.distances(query_index).map(|distances| distances.take(k)),
             );
-            ScoreSums::of_query(&found[..found.len().min(k)], &truth, &discount)
+            let count = keys.len().min(k);
+            ScoreSums::of_query(&keys[..count], &distances[..count], &truth, &discount)
         })
         .sum::<ScoreSums>()
         .mean()
@@ -188,7 +241,9 @@ fn discount_table(k: usize) -> Vec<f64, System> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Key, TruthSet};
+    use super::{Distance, Key, ScoreSums, TruthSet};
+
+    const NO_DISTANCES: Option<std::iter::Empty<Distance>> = None;
 
     /// The sorted-and-binary-searched set must answer exactly what a linear
     /// scan of the same prefix would, including for duplicate and absent keys.
@@ -204,7 +259,7 @@ mod tests {
             &[u32::MAX, 0, 12345, 6, 6, 999_999],
         ];
         for truth in cases {
-            set.load(truth.iter().map(|&key| Key::from(key)));
+            set.load(truth.iter().map(|&key| Key::from(key)), NO_DISTANCES);
             assert_eq!(set.nearest, truth.first().map(|&key| Key::from(key)));
             for probe in 0..64u32 {
                 assert_eq!(
@@ -223,9 +278,25 @@ mod tests {
     #[test]
     fn truth_set_load_replaces() {
         let mut set = TruthSet::default();
-        set.load([1u32, 2, 3].map(Key::from).into_iter());
-        set.load([4u32, 5].map(Key::from).into_iter());
+        set.load([1u32, 2, 3].map(Key::from).into_iter(), NO_DISTANCES);
+        set.load([4u32, 5].map(Key::from).into_iter(), NO_DISTANCES);
         assert!([4u32, 5].map(Key::from).iter().all(|&key| set.contains(key)));
         assert!(![1u32, 2, 3].map(Key::from).iter().any(|&key| set.contains(key)));
+    }
+
+    /// A neighbor tied with the truth's farthest counts under distance recall, though its key is
+    /// not the one the truth kept; distances on another scale leave the metric out.
+    #[test]
+    fn distance_recall_counts_ties_and_refuses_other_scales() {
+        let mut truth = TruthSet::default();
+        let keys = [1u32, 2, 3].map(Key::from);
+        truth.load(keys.into_iter(), Some([0.0, 4.0, 9.0].into_iter()));
+        let discount = super::discount_table(3);
+        let tied = [1u32, 2, 7].map(Key::from);
+        let sums = ScoreSums::of_query(&tied, &[0.0, 4.0, 9.0], &truth, &discount);
+        assert_eq!(sums.mean().intersection_at_k, 2.0 / 3.0);
+        assert_eq!(sums.mean().distance_recall_at_k, Some(1.0));
+        let similarities = ScoreSums::of_query(&tied, &[-1.0, -0.5, -0.2], &truth, &discount);
+        assert_eq!(similarities.mean().distance_recall_at_k, None);
     }
 }

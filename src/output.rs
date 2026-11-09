@@ -3,7 +3,8 @@
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use serde::Serialize;
@@ -19,6 +20,77 @@ pub struct MachineInfo {
     pub physical_cores: usize,
     pub logical_cores: usize,
     pub ram_bytes: u64,
+    pub budget: Budget,
+}
+
+/// The cores and memory every engine gets: this process's affinity mask and cgroup limit, which containers inherit.
+#[derive(Clone, Debug, Serialize)]
+pub struct Budget {
+    pub cores: usize,
+    /// The affinity mask as a cpuset list, like `0-15`, for `docker create --cpuset-cpus`.
+    pub cpus: String,
+    /// Bytes the engine may use, page cache included.
+    pub memory_limit: u64,
+}
+
+static BUDGET: OnceLock<Budget> = OnceLock::new();
+
+impl Budget {
+    /// The environment's budget, narrowed by `--memory-limit`, which may not exceed the cgroup's limit.
+    pub fn resolve(memory_limit: Option<u64>) -> Result<Self, String> {
+        let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let cpus = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .map_or_else(|| format!("0-{}", cores - 1), |list| list.trim().to_owned());
+        let environment = cgroup_memory_limit().unwrap_or_else(|| System::new_all().total_memory());
+        let memory_limit = match memory_limit {
+            Some(bytes) if bytes > environment => {
+                return Err(format!(
+                    "--memory-limit {bytes} exceeds the {environment} bytes this process may use"
+                ))
+            }
+            Some(bytes) => bytes,
+            None => environment,
+        };
+        Ok(Self {
+            cores,
+            cpus,
+            memory_limit,
+        })
+    }
+    /// Fixes the run's budget; later calls keep the first.
+    pub fn install(self) -> &'static Self {
+        BUDGET.get_or_init(|| self)
+    }
+}
+
+/// The run's budget, or the environment's when no run installed one, as in tests.
+pub fn budget() -> &'static Budget {
+    BUDGET.get_or_init(|| Budget::resolve(None).expect("the environment's budget needs no flag"))
+}
+
+/// The tightest `memory.max` from this process's cgroup up to the root, or `None` when none is set.
+fn cgroup_memory_limit() -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut path = PathBuf::from("/sys/fs/cgroup");
+    path.push(
+        membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?
+            .trim_start_matches('/'),
+    );
+    path.ancestors()
+        .take_while(|directory| directory.starts_with("/sys/fs/cgroup"))
+        .filter_map(|directory| {
+            std::fs::read_to_string(directory.join("memory.max"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .min()
 }
 
 /// Dataset descriptor — describes the input files, not the configuration.
@@ -47,7 +119,11 @@ pub struct DatasetInfo {
 #[derive(Debug, Serialize)]
 pub struct StepEntry {
     pub vectors_indexed: usize,
+    /// The backend's own figure: a server container's anonymous bytes, or an in-process engine's
+    /// index size or anonymous bytes.
     pub memory_bytes: u64,
+    /// This harness process's anonymous resident bytes, which hold any in-process engine whole.
+    pub process_anon_bytes: u64,
     pub add: Option<StepAddEntry>,
     pub ground_truth_search: Option<StepSearchEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +133,7 @@ pub struct StepEntry {
 /// The insertion half of a step.
 #[derive(Debug, Serialize)]
 pub struct StepAddEntry {
+    /// Seconds of inserts plus the wait until the backend finished indexing them.
     pub elapsed: f64,
     pub throughput: u64,
     #[serde(flatten)]
@@ -69,6 +146,8 @@ pub struct StepAddEntry {
 #[derive(Debug, Serialize)]
 pub struct StepSearchEntry {
     pub queries: usize,
+    /// Timed passes over the queries, after one untimed warmup pass; `elapsed` and `throughput` span them all.
+    pub passes: usize,
     /// Neighbors requested per query — the k every metric below is taken at.
     pub top_k: usize,
     pub elapsed: f64,
@@ -85,6 +164,10 @@ pub struct StepSearchEntry {
     pub intersection_at_k: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ndcg_at_k: Option<f64>,
+    /// The share of the top-k within the k-th true distance, crediting ties the truth broke by key;
+    /// present when the ground truth stores distances and the backend's agree with them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_recall_at_k: Option<f64>,
     /// Hardware counters summed across all online CPUs, present only with `--features
     /// perf-counters` on Linux and `CAP_PERFMON` or `kernel.perf_event_paranoid <= 1`.
     #[serde(flatten)]
@@ -116,6 +199,7 @@ pub fn collect_machine_info() -> MachineInfo {
         physical_cores,
         logical_cores,
         ram_bytes,
+        budget: budget().clone(),
     }
 }
 

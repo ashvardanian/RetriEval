@@ -176,7 +176,11 @@ impl<'a> WeaviateBackend<'a> {
 
 impl Backend for WeaviateBackend<'_> {
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
-        self.metadata.clone()
+        let mut metadata = self.metadata.clone();
+        let limits = self.runtime.block_on(self.container.limits());
+        let limits = limits.unwrap_or_else(|error| json!(format!("unread: {error}")));
+        metadata.insert("container_limits".into(), limits);
+        metadata
     }
 
     fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {
@@ -255,6 +259,44 @@ impl Backend for WeaviateBackend<'_> {
 
     fn memory_bytes(&self) -> usize {
         self.runtime.block_on(self.container.memory_usage_bytes()) as usize
+    }
+
+    /// Waits until every shard of the class reports its vector index `READY` with an empty queue.
+    fn flush(&mut self) -> Result<(), String> {
+        let url = format!("{}/v1/nodes/{CLASS_NAME}?output=verbose", self.http_base);
+        self.runtime.block_on(async {
+            loop {
+                let nodes: Value = self
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|error| format!("GET {url} failed: {error}"))?
+                    .json()
+                    .await
+                    .map_err(|error| format!("GET {url} returned invalid JSON: {error}"))?;
+                let shards: Vec<&Value> = nodes
+                    .pointer("/nodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|node| node.get("shards").and_then(Value::as_array))
+                    .flatten()
+                    .collect();
+                if shards.is_empty() {
+                    return Err(format!("GET {url} lists no shards"));
+                }
+                let ready = shards.iter().all(|shard| {
+                    shard.get("vectorIndexingStatus").and_then(Value::as_str) == Some("READY")
+                        && shard.get("vectorQueueLength").and_then(Value::as_u64).unwrap_or(0) == 0
+                });
+                if ready {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
     }
 }
 

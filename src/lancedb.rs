@@ -124,9 +124,9 @@ struct Cli {
     #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "l2")]
     metric: Metric,
 
-    /// Path for LanceDB storage
-    #[arg(long, env = "RETRIEVAL_DB_PATH", default_value = "/tmp/retrieval-lancedb", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    db_path: String,
+    /// Directory of LanceDB's storage
+    #[arg(long, env = "RETRIEVAL_DATA_DIR", default_value = "data")]
+    data_dir: std::path::PathBuf,
 }
 
 // #region Backend
@@ -258,7 +258,7 @@ impl Backend for LanceDbBackend<'_> {
     }
 
     fn memory_bytes(&self) -> usize {
-        0
+        retrieval::process_anon_bytes() as usize
     }
 }
 
@@ -268,7 +268,7 @@ fn main() {
     let cli: Cli = retrieval::parse_cli();
     let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     eprintln!("- Metric: {}", cli.metric);
-    eprintln!("- Database path: {}", cli.db_path);
+    eprintln!("- Data directory: {}", cli.data_dir.display());
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -276,7 +276,7 @@ fn main() {
         .build()
         .unwrap_or_bail("tokio runtime");
     let database = runtime
-        .block_on(lancedb::connect(&cli.db_path).execute())
+        .block_on(lancedb::connect(&cli.data_dir.to_string_lossy()).execute())
         .unwrap_or_bail("LanceDB connect");
     let mut summary = SweepSummary::default();
     for &dimensions in &dimensions_sweep {

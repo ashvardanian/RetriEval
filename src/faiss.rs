@@ -278,23 +278,27 @@ impl FaissBackend {
         let factory = index_factory_string(data_type, connectivity);
         // Binary dimensions are bits, from the `.b1bin` header; float dimensions are scalars.
         let dimensions = dimensions as u32;
-        let (metric_label, index) = match data_type {
+        let (metric_label, index, (expansion_add, expansion_search)) = match data_type {
             DataType::B1 => {
                 let index = faiss::index::index_binary_factory(dimensions, &factory)
                     .map_err(|error| format!("failed to create FAISS binary index: {error}"))?;
                 let rows = Vec::new_in(std::alloc::System);
-                ("hamming", FaissIndex::Binary { index, rows })
+                // Binary HNSW has no dispatcher in `faiss/AutoTune.cpp`, so `IndexBinaryHNSW` keeps
+                // its compile-time efConstruction and efSearch, which the report records.
+                ("hamming", FaissIndex::Binary { index, rows }, (40, 16))
             }
             _ => {
                 let index = faiss::index::index_factory(dimensions, &factory, metric.into())
                     .map_err(|error| format!("failed to create FAISS index: {error}"))?;
-                // Binary HNSW has no dispatcher in `faiss/AutoTune.cpp`, so only the float path tunes
-                // efConstruction and efSearch; `IndexBinaryHNSW` keeps its compile-time 40 and 16.
                 tune(
                     &index,
                     &format!("efConstruction={expansion_add} efSearch={expansion_search}"),
                 )?;
-                (metric_label_for(metric.into()), FaissIndex::Float(index))
+                (
+                    metric_label_for(metric.into()),
+                    FaissIndex::Float(index),
+                    (expansion_add, expansion_search),
+                )
             }
         };
         let metadata = HashMap::from([
@@ -409,7 +413,7 @@ impl Backend for FaissBackend {
     }
 
     fn memory_bytes(&self) -> usize {
-        retrieval::process_rss_bytes() as usize
+        retrieval::process_anon_bytes() as usize
     }
 
     fn save(&self, path: &str) -> Result<(), String> {

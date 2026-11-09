@@ -59,9 +59,10 @@ struct Cli {
     #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "l2")]
     metric: Metric,
 
-    /// Database file, or `:memory:`; only its `bench` table is recreated
-    #[arg(long, env = "RETRIEVAL_DB_PATH", default_value = ":memory:", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    db_path: String,
+    /// Directory of the database file, which keeps the database in memory when unset; only its
+    /// `bench` table is recreated
+    #[arg(long, env = "RETRIEVAL_DATA_DIR")]
+    data_dir: Option<std::path::PathBuf>,
 }
 
 struct TursoBackend {
@@ -176,7 +177,7 @@ impl Backend for TursoBackend {
     }
 
     fn memory_bytes(&self) -> usize {
-        0
+        retrieval::process_anon_bytes() as usize
     }
 }
 
@@ -184,7 +185,14 @@ fn main() {
     let cli: Cli = retrieval::parse_cli();
     let mut state = BenchState::load(&cli.common).unwrap_or_bail("benchmark state");
     eprintln!("- Metric: {}", cli.metric);
-    eprintln!("- Database path: {}", cli.db_path);
+    let database_path = match &cli.data_dir {
+        Some(directory) => {
+            std::fs::create_dir_all(directory).unwrap_or_bail("--data-dir");
+            directory.join("retrieval.db").to_string_lossy().into_owned()
+        }
+        None => ":memory:".to_owned(),
+    };
+    eprintln!("- Database path: {database_path}");
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -194,7 +202,7 @@ fn main() {
     let mut summary = SweepSummary::default();
     for &dimensions in &dimensions_sweep {
         let description = format!("turso · {} · F32 exact scan · {dimensions}d", cli.metric);
-        let backend = runtime.block_on(TursoBackend::open(&cli.db_path, cli.metric, runtime.handle().clone()));
+        let backend = runtime.block_on(TursoBackend::open(&database_path, cli.metric, runtime.handle().clone()));
         summary.record(run_config(
             &description,
             IndexFile::None,

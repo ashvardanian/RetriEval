@@ -305,7 +305,11 @@ impl<'a> SurrealBackend<'a> {
 }
 impl Backend for SurrealBackend<'_> {
     fn metadata(&self) -> HashMap<String, Value> {
-        self.metadata.clone()
+        let mut metadata = self.metadata.clone();
+        let limits = self.server.runtime.block_on(self.server.container.limits());
+        let limits = limits.unwrap_or_else(|error| json!(format!("unread: {error}")));
+        metadata.insert("container_limits".into(), limits);
+        metadata
     }
 
     fn add(&mut self, keys: BatchKeys<'_>, vectors: Vectors) -> Result<(), String> {

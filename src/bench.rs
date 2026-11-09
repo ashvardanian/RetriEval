@@ -329,12 +329,16 @@ pub fn matrix_view<T: nk::StorageElement>(values: &[T], rows: usize, columns: us
     .expect("whole rows are a valid view")
 }
 
-/// Get the current process resident set size (RSS) in bytes.
-pub fn process_rss_bytes() -> u64 {
-    let process_id = sysinfo::get_current_pid().expect("get current pid");
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[process_id]), true);
-    system.process(process_id).map(|process| process.memory()).unwrap_or(0)
+/// This process's anonymous resident bytes, `RssAnon`, leaving out the mapped files a resident
+/// set also counts, such as the base vectors; zero where the kernel does not report it.
+pub fn process_anon_bytes() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("RssAnon:"))
+        .and_then(|value| value.trim().strip_suffix("kB"))
+        .and_then(|kibibytes| kibibytes.trim().parse::<u64>().ok())
+        .map_or(0, |kibibytes| kibibytes << 10)
 }
 
 /// The base rows of one batch, global across shards, resolved once so the harness and the backend
@@ -399,6 +403,12 @@ pub trait Backend: Send {
     /// Answers every row of `queries` into the matching row of `hits`.
     fn search(&mut self, queries: Vectors, hits: Hits<'_>) -> Result<(), String>;
     fn memory_bytes(&self) -> usize;
+
+    /// Waits until everything added is searchable as the index will finally serve it, for servers
+    /// that index in the background; timed into the add phase.
+    fn flush(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 
     /// How many vectors the backend holds, when it can say. A loaded index may
     /// cover a different slice of the base than this run's flags imply, and
@@ -510,6 +520,12 @@ impl SearchBuffers {
     /// Each query's found keys, best first.
     pub fn found(&self) -> impl Iterator<Item = &[Key]> {
         self.rows().map(|(keys, _, found)| &keys[..found])
+    }
+
+    /// Each query's found keys and their distances, best first.
+    pub fn found_hits(&self) -> impl Iterator<Item = (&[Key], &[Distance])> {
+        self.rows()
+            .map(|(keys, distances, found)| (&keys[..found], &distances[..found]))
     }
 }
 
@@ -694,6 +710,15 @@ pub struct CommonArgs {
     #[arg(long, env = "RETRIEVAL_OUTPUT")]
     pub output: Option<PathBuf>,
 
+    /// Memory the engine may use, page cache included, like 16GB; at most this process's cgroup
+    /// limit, which is the default
+    #[arg(long, env = "RETRIEVAL_MEMORY_LIMIT", value_parser = parse_size_flag)]
+    pub memory_limit: Option<u64>,
+
+    /// Record hardware counters per phase; requires the perf-counters feature on Linux
+    #[arg(long, env = "RETRIEVAL_PERF_COUNTERS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
+    pub perf_counters: bool,
+
     /// Cap the number of base vectors used (for calibration on a slice of a larger file).
     /// Queries and ground truth are unaffected; only the add/permutation range shrinks.
     #[arg(long, env = "RETRIEVAL_MAX_BASE_VECTORS", value_parser = parse_count_flag)]
@@ -796,6 +821,7 @@ pub struct BenchState {
     inserts_per_core: usize,
     queries_per_core: usize,
     self_search: Option<SelfSearch>,
+    perf_counters: bool,
     output_dir: Option<PathBuf>,
     dataset_info: DatasetInfo,
     search_buffers: SearchBuffers,
@@ -950,6 +976,10 @@ impl BenchState {
             Some(path) => eprintln!("- Output: {}", path.display()),
             None => eprintln!("- Output: none"),
         }
+        eprintln!("- Perf counters: {}", args.perf_counters);
+        let budget = output::Budget::resolve(args.memory_limit)?.install();
+        eprintln!("- Cores: {} ({})", budget.cores, budget.cpus);
+        eprintln!("- Memory limit: {}", spell_size(budget.memory_limit));
 
         let permutation = match seed {
             None => Permutation::Identity,
@@ -974,6 +1004,7 @@ impl BenchState {
             inserts_per_core: args.inserts_per_core,
             queries_per_core: args.queries_per_core,
             self_search,
+            perf_counters: args.perf_counters,
             output_dir: args.output.clone(),
             dataset_info,
             search_buffers: SearchBuffers::new(query_count, top_k)?,
@@ -1094,6 +1125,7 @@ fn run_add_phase(
             per_second(batch.end - step.start, started.elapsed().as_secs_f64()),
         ));
     }
+    backend.flush()?;
     let elapsed = started.elapsed().as_secs_f64();
     let counters = stop_and_read_counters(perf, "add");
     let throughput = per_second(step.len(), elapsed);
@@ -1106,7 +1138,24 @@ fn run_add_phase(
     })
 }
 
-/// Runs all queries against an index holding `vectors_indexed` vectors and scores them;
+/// Answers every query once into the search buffers.
+fn search_pass(
+    backend: &mut dyn Backend,
+    state: &mut BenchState,
+    dimensions: usize,
+    queries_per_call: usize,
+) -> BenchResult<()> {
+    for batch in row_ranges(0..state.query_dataset.rows(), queries_per_call) {
+        let queries = state
+            .query_dataset
+            .slice(batch.start, batch.len(), dimensions, &mut state.vector_scratch);
+        backend.search(queries, state.search_buffers.hits(batch, &state.keys))?;
+    }
+    Ok(())
+}
+
+/// Runs all queries against an index holding `vectors_indexed` vectors and scores them: one untimed
+/// pass to warm the index, then timed passes until at least `MIN_SEARCH_SECONDS` have passed.
 /// `final_step` drops the `~` that marks metrics over a partial index.
 fn run_search_phase(
     backend: &mut dyn Backend,
@@ -1117,38 +1166,46 @@ fn run_search_phase(
     vectors_indexed: usize,
     final_step: bool,
 ) -> BenchResult<StepSearchEntry> {
+    const MIN_SEARCH_SECONDS: f64 = 5.0;
     let query_count = state.query_dataset.rows();
     let count = state.top_k;
     let progress = progress_bar(query_count, "  search [{elapsed_precise}] {bar:40.green/blue} {msg}");
+    progress.set_message("warmup");
+    search_pass(backend, state, dimensions, queries_per_call)?;
 
     start_counter_capture(perf, "search");
     let started = Instant::now();
-    for batch in row_ranges(0..query_count, queries_per_call) {
-        let queries = state
-            .query_dataset
-            .slice(batch.start, batch.len(), dimensions, &mut state.vector_scratch);
-        backend.search(queries, state.search_buffers.hits(batch.clone(), &state.keys))?;
-        progress.set_position(batch.end as u64);
+    let mut passes = 0;
+    while passes == 0 || started.elapsed().as_secs_f64() < MIN_SEARCH_SECONDS {
+        search_pass(backend, state, dimensions, queries_per_call)?;
+        passes += 1;
+        progress.set_position(query_count as u64);
         progress.set_message(format!(
-            "{}/{} ({} search/s)",
-            Thousands(batch.end as u64),
-            Thousands(query_count as u64),
-            Thousands(per_second(batch.end, started.elapsed().as_secs_f64())),
+            "{passes} passes ({} search/s)",
+            Thousands(per_second(passes * query_count, started.elapsed().as_secs_f64())),
         ));
     }
     let elapsed = started.elapsed().as_secs_f64();
     let counters = stop_and_read_counters(perf, "search");
-    let throughput = per_second(query_count, elapsed);
-    let scores = eval::score(state.search_buffers.found(), &state.ground_truth, &state.keys, count);
+    let throughput = per_second(passes * query_count, elapsed);
+    let scores = eval::score(
+        state.search_buffers.found_hits(),
+        &state.ground_truth,
+        &state.keys,
+        count,
+    );
 
     // Raw metrics, since dividing out coverage would treat the indexed prefix as a uniform sample.
     let coverage = vectors_indexed as f64 / state.dataset.rows().max(1) as f64;
     let approximate = if final_step { "" } else { "~" };
+    let distance_recall = scores.distance_recall_at_k.map_or_else(String::new, |recall| {
+        format!(", {approximate}distance-recall@{count}={recall:.4}")
+    });
     progress.finish_with_message(format!(
         "{} search/s, {approximate}recall@1={:.4}, \
          {approximate}recall@{count}={:.4}, \
          {approximate}intersection@{count}={:.4}, \
-         {approximate}NDCG@{count}={:.4} ({} vectors, {:.0}% coverage)",
+         {approximate}NDCG@{count}={:.4}{distance_recall} ({} vectors, {:.0}% coverage)",
         Thousands(throughput),
         scores.recall_at_1,
         scores.recall_at_k,
@@ -1160,6 +1217,7 @@ fn run_search_phase(
 
     Ok(StepSearchEntry {
         queries: query_count,
+        passes,
         top_k: count,
         elapsed,
         throughput,
@@ -1167,6 +1225,7 @@ fn run_search_phase(
         recall_at_k: scores.recall_at_k,
         intersection_at_k: Some(scores.intersection_at_k),
         ndcg_at_k: Some(scores.ndcg_at_k),
+        distance_recall_at_k: scores.distance_recall_at_k,
         counters,
     })
 }
@@ -1221,6 +1280,7 @@ fn run_self_search_phase(
 
     Ok(StepSearchEntry {
         queries: query_count,
+        passes: 1,
         top_k: count,
         elapsed,
         throughput,
@@ -1229,6 +1289,7 @@ fn run_self_search_phase(
         // Identity truth holds one key per query, so only `recall_at_1` is meaningful.
         intersection_at_k: None,
         ndcg_at_k: None,
+        distance_recall_at_k: None,
         counters,
     })
 }
@@ -1342,10 +1403,15 @@ pub fn run(
     eprintln!("\n── {description} ──");
 
     // Without CAP_PERFMON or on another OS, steps run without counters and their fields stay empty.
-    let mut perf = perf_counters::PerfCounters::new()
-        .inspect(|_| eprintln!("  perf counters: system-wide per-CPU capture enabled"))
-        .inspect_err(|error| eprintln!("  perf counters: unavailable ({error}); running without"))
-        .ok();
+    let mut perf = state
+        .perf_counters
+        .then(|| {
+            perf_counters::PerfCounters::new()
+                .inspect(|_| eprintln!("  perf counters: system-wide per-CPU capture enabled"))
+                .inspect_err(|error| eprintln!("  perf counters: unavailable ({error}); running without"))
+                .ok()
+        })
+        .flatten();
 
     let mut steps = Vec::with_capacity(state.steps);
     match loaded {
@@ -1361,6 +1427,7 @@ pub fn run(
             steps.push(StepEntry {
                 vectors_indexed: indexed,
                 memory_bytes: backend.memory_bytes() as u64,
+                process_anon_bytes: process_anon_bytes(),
                 add: None,
                 ground_truth_search: Some(search),
                 self_search: None,
@@ -1383,6 +1450,7 @@ pub fn run(
                 steps.push(StepEntry {
                     vectors_indexed: step.end,
                     memory_bytes: backend.memory_bytes() as u64,
+                    process_anon_bytes: process_anon_bytes(),
                     add: Some(add),
                     ground_truth_search: Some(search),
                     self_search: None,
@@ -1581,6 +1649,29 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
     }
 }
 
+/// Parses a size like `4096`, `64KB` or `16GB`, in powers of 1024; zero is `None`.
+pub fn parse_size(text: &str) -> Option<u64> {
+    let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let level = ["", "kb", "mb", "gb", "tb"]
+        .iter()
+        .position(|unit| text[split..].eq_ignore_ascii_case(unit))?;
+    let bytes = text[..split].parse::<u64>().ok()?.checked_mul(1 << (10 * level))?;
+    (bytes != 0).then_some(bytes)
+}
+
+/// Spells a size the way `parse_size` reads it: `16GB`, `1000`.
+pub fn spell_size(bytes: u64) -> String {
+    let (mut count, mut unit) = (bytes, "");
+    for larger in ["KB", "MB", "GB", "TB"] {
+        if count == 0 || count % 1024 != 0 {
+            break;
+        }
+        count /= 1024;
+        unit = larger;
+    }
+    format!("{count}{unit}")
+}
+
 /// Spells a duration the way `parse_duration` reads it: `1s`, `1500ms`.
 pub fn spell_duration(duration: Duration) -> String {
     let milliseconds = duration.as_millis();
@@ -1613,10 +1704,9 @@ pub struct Threads(pub NonZeroUsize);
 impl Threads {
     pub const ONE: Threads = Threads(NonZeroUsize::MIN);
 
-    /// Every logical core the machine's topology reports, at least one.
+    /// Every core in this process's affinity mask, at least one.
     pub fn all_cores() -> Self {
-        let cores = Topology::new().and_then(|topology| topology.logical_cores_count());
-        Self(cores.ok().and_then(NonZeroUsize::new).unwrap_or(NonZeroUsize::MIN))
+        Self(std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
     }
 }
 
@@ -1691,6 +1781,11 @@ pub fn parse_count_flag(text: &str) -> Result<usize, String> {
 /// `parse_threads` for clap, with `0` resolved to every available core.
 pub fn parse_threads_flag(text: &str) -> Result<Threads, String> {
     parse_threads(text, Threads::all_cores().0).ok_or_else(|| "expected a count, 0 for all cores".into())
+}
+
+/// `parse_size` for clap.
+pub fn parse_size_flag(text: &str) -> Result<u64, String> {
+    parse_size(text).ok_or_else(|| "expected a size like 4096, 64KB or 16GB".into())
 }
 
 /// `parse_seed` for clap.
@@ -1779,6 +1874,17 @@ mod tests {
         assert_eq!(distances, [0.5, 1.5, Distance::INFINITY]);
         assert_eq!(found, 2);
         assert_eq!(rows.next().unwrap().0[0], base_keys.get(2));
+    }
+
+    #[test]
+    fn sizes_round_trip_in_powers_of_1024() {
+        for text in ["4095", "64KB", "1000", "3GB", "1TB"] {
+            assert_eq!(super::spell_size(super::parse_size(text).unwrap()), text);
+        }
+        assert_eq!(super::parse_size("1gb"), Some(1 << 30));
+        for text in ["0", "", "GB", "1PB", "-1", "1.5GB"] {
+            assert_eq!(super::parse_size(text), None, "{text}");
+        }
     }
 
     #[test]

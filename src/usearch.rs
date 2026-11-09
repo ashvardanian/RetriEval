@@ -223,7 +223,7 @@ impl USearchBackend {
             ..DenseOptions::default()
         };
         let index = DenseIndex::init_ram(&options, memory_domains).map_err(failed("init_ram"))?;
-        let executor = Executor::for_ram(memory_domains, threads.0.get(), 0).map_err(failed("for_ram"))?;
+        let executor = Executor::for_ram(memory_domains, None, threads.0.get()).map_err(failed("for_ram"))?;
         Self::wrap(
             index,
             executor,
@@ -237,7 +237,7 @@ impl USearchBackend {
     /// Opens a saved `.safegraphs` monolith or `.safegraphs.json` manifest, whose header carries the
     /// geometry, metric, quantization and connectivity; only the search expansion is the caller's.
     pub fn load(path: &str, expansion_search: usize, threads: Threads, memory_domains: &[i32]) -> Result<Self, String> {
-        let executor = Executor::for_ram(memory_domains, threads.0.get(), 0).map_err(failed("for_ram"))?;
+        let executor = Executor::for_ram(memory_domains, None, threads.0.get()).map_err(failed("for_ram"))?;
         let index = DenseIndex::load_ram(DenseLoadRamConfig {
             executor: Some(&executor),
             memory_domains,
@@ -260,13 +260,13 @@ impl USearchBackend {
         let described = index.describe().map_err(failed("describe"))?;
         let metadata = described.metadata;
         let (metric, quantization, connectivity) = (metadata.metric, metadata.quantization, metadata.connectivity);
-        eprintln!("  dispatch[{quantization}/{metric}]: {}", described.capabilities);
+        eprintln!("  dispatch[{quantization}/{metric}]: {}", described.cpu_class);
         let metadata = HashMap::from([
             ("backend".into(), json!("usearch")),
             ("library_version".into(), json!(usearch::version())),
             ("library_isa_compiled".into(), json!(usearch::capabilities_compiled())),
             ("library_isa_available".into(), json!(usearch::capabilities_available())),
-            ("library_isa_dispatched".into(), json!(described.capabilities)),
+            ("library_isa_dispatched".into(), json!(described.cpu_class)),
             ("data_type".into(), json!(quantization.to_string())),
             ("metric".into(), json!(metric.to_string())),
             ("connectivity".into(), json!(connectivity)),
@@ -331,7 +331,7 @@ impl Backend for USearchBackend {
         }
         .map_err(failed("search"))?;
 
-        for (found, row) in matches.rows().map_err(failed("search"))?.zip(hits.rows()) {
+        for (found, row) in matches.iter().map_err(failed("search"))?.zip(hits.rows()) {
             row.write(
                 found
                     .keys

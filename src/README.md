@@ -5,7 +5,7 @@ This page covers the deeper attribution: hardware counters, an external `perf st
 
 ## Hardware Counters
 
-Build with `--features perf-counters` to attribute cost inside the measured loops, like how many cycles construction spent in cache misses.
+Build with `--features perf-counters` and pass `--perf-counters` to attribute cost inside the measured loops, like how many cycles construction spent in cache misses.
 On Linux this pulls [`perf-event2`][perf-event2] and wraps the `index.add` and `index.search` loops of `bench.rs` with system-wide hardware counters.
 Five optional fields land on each phase of each step, in `steps[].add`, `steps[].ground_truth_search` and `steps[].self_search`:
 
@@ -24,7 +24,7 @@ retri-eval-usearch \
     --base-vectors data/pubchem-maccs/base.115627267.b1bin \
     --query-vectors data/pubchem-maccs/query.10000.b1bin \
     --query-neighbors data/pubchem-maccs/groundtruth.10000.ibin \
-    --data-type b1 --metric hamming --output results/pubchem-maccs
+    --data-type b1 --metric hamming --perf-counters --output results/pubchem-maccs
 ```
 
 - __Scope__ is system-wide per CPU, `pid == -1` and `cpu == i`, one counter group per online CPU, summed at read.
@@ -65,10 +65,11 @@ This covers the whole process lifetime, dataset loading and ground-truth I/O inc
 `steps[].memory_bytes` is whatever the backend reports after each step, so the figures differ in what they count:
 
 - __USearch__ reports the index's own `memory_usage`, without the dataset mapping.
-- __FAISS__ reports the resident set of the whole process, dataset pages included.
+- __FAISS, LanceDB and Turso__ report the process's anonymous resident bytes, `RssAnon`, which leave out the memory-mapped dataset.
 - __cuVS__ computes it: the host copy of the vectors and keys, plus the device vectors and a graph of `--connectivity` edges per vector.
-- __Qdrant, Redis, Weaviate and SurrealDB__ sample the Docker stats API, the container's whole resident set; see [`docker/README.md`](../docker/README.md).
-- __LanceDB and Turso__ report 0.
+- __Qdrant, Redis, Weaviate and SurrealDB__ report the container's anonymous bytes from its cgroup's `memory.stat`, without the page cache; see [`docker/README.md`](../docker/README.md).
+
+`steps[].process_anon_bytes` is the harness process's own `RssAnon` on every backend, so USearch's index figure sits beside the process's.
 
 The `peak memory` line printed at the end of a run is the largest `memory_bytes` across its steps.
 
