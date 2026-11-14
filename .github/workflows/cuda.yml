@@ -8,7 +8,7 @@ jobs:
       - name: Check Out Repository
         uses: actions/checkout@v7
       - name: Install Rust 1.100 with Rustfmt and Clippy
-        run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.100 --profile minimal --component rustfmt,clippy
       - name: Lint cuVS Backend
         run: cargo clippy --locked --no-default-features --features cuvs-backend --all-targets -- -D warnings
       - name: Test cuVS Backend
