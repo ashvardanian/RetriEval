@@ -20,7 +20,7 @@ jobs:
       - name: Install BLAS, LAPACK, OpenMP and Protobuf
         run: sudo apt-get update && sudo apt-get install -y libblas-dev liblapack-dev libomp-dev protobuf-compiler
       - name: Install Rust 1.100 with Rustfmt and Clippy
-        run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.100 --profile minimal --component rustfmt,clippy
       - name: Check Formatting
         run: cargo fmt --all -- --check
       - name: Set Up uv

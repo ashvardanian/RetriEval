@@ -612,7 +612,7 @@ Its metrics drop the `self_` prefix because the container already says it, and i
 
 ## Development
 
-The repository pins Rust 1.100, as `beta-2026-10-18` until its stable release.
+The repository pins Rust 1.100.
 CI runs `cargo fmt --check`, Ruff on the plotting script, then `cargo clippy` and `cargo test` per feature set; pass the same `--features` locally for optional native engines.
 `src/` holds the shared library in `bench.rs`, one binary per backend and `retri-generate`, `scripts/` the dataset downloaders and plotting, `.githooks/` the Git hooks, and `docker/` the compose files for the server backends.
 Arm the hooks once per clone with `git config core.hooksPath .githooks`.
