@@ -1,7 +1,7 @@
 //! Download a subset of the USearchMolecules dataset, extract one binary
 //! fingerprint column into `.b1bin` base parts, and precompute
 //! Hamming top-K ground truth with NumKong + ForkUnion; or extract the
-//! first conformer of every embedded molecule into point-cloud parts.
+//! lowest-energy conformer of every embedded molecule into point-cloud parts.
 //!
 //! ## Build & Install
 //!
@@ -33,7 +33,7 @@
 //!     --output datasets/gdb13_100M_ecfp4/
 //! ```
 //!
-//! Every embedded PubChem molecule's first conformer, hydrogens included, in 8 parts
+//! Every embedded PubChem molecule's lowest-energy conformer, hydrogens included, in 8 parts
 //! of `f16` xyz points beside their per-cloud counts:
 //! ```sh
 //! retri-download-molecules \
@@ -41,6 +41,16 @@
 //!     --conformers \
 //!     --part-rows 15000000 \
 //!     --output datasets/pubchem-conformers-113m/
+//! ```
+//!
+//! 256 conformers sampled out of the first 1M Enamine REAL molecules, as shape queries:
+//! ```sh
+//! retri-download-molecules \
+//!     --source enamine \
+//!     --conformers \
+//!     --limit 1000000 \
+//!     --query-count 256 \
+//!     --output datasets/real-conformers-1m/
 //! ```
 
 use std::{
@@ -53,15 +63,17 @@ use std::{
 
 use arrow_array::{
     cast::AsArray,
-    types::{Float16Type, UInt8Type},
+    types::{Float16Type, UInt16Type},
     Array, FixedSizeBinaryArray,
 };
 use bytes::Bytes;
 use clap::Parser;
 use futures::stream::{self, Stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use memmap2::Mmap;
 use numkong as nk;
 use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
+use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, SeedableRng};
 
 use retrieval::{
     download::{download_shard, http_client, OUTPUT_BUFFER_BYTES},
@@ -87,8 +99,9 @@ struct Cli {
     #[arg(long, value_enum, required_unless_present = "conformers")]
     fingerprint: Option<Fingerprint>,
 
-    /// Extract each embedded molecule's first conformer from the `.3D.parquet` shards instead of a
-    /// fingerprint: `base.part_N.f16bin` xyz points and `counts.part_N.ibin` points per cloud.
+    /// Extract each embedded molecule's lowest-energy conformer from the `.3D.parquet` shards instead
+    /// of a fingerprint: `base.part_N.f16bin` xyz points and `counts.part_N.ibin` points per cloud.
+    /// With `--query-count`, also `query.N.f16bin` and `query.N.counts.ibin` of N sampled clouds.
     #[arg(long, conflicts_with_all = ["fingerprint", "top_k"])]
     conformers: bool,
 
@@ -101,9 +114,15 @@ struct Cli {
     #[arg(long, default_value_t = 512 * SHARD_ROWS, value_parser = retrieval::parse_count_flag)]
     part_rows: usize,
 
-    /// Number of query vectors to randomly sample from the base set; needs `--top-k`.
-    #[arg(long, default_value_t = 10_000, value_parser = retrieval::parse_count_flag)]
-    query_count: usize,
+    /// Number of queries to randomly sample from the base set: fingerprints for `--top-k`, 10,000
+    /// when unset; conformer clouds only when set.
+    #[arg(long, value_parser = retrieval::parse_count_flag)]
+    query_count: Option<usize>,
+
+    /// Move the sampled queries out of the base parts before computing their truth, so the base
+    /// holds none of them; the queries must fit in the last part.
+    #[arg(long, requires = "top_k")]
+    hold_out: bool,
 
     /// Top-K neighbors to record per query in the ground truth file.
     /// Without it, only the base parts are written, for self-recall benchmarks.
@@ -345,32 +364,41 @@ fn extract_and_append<W: Write>(
     Ok(appended)
 }
 
-/// Appends the first conformer of every embedded molecule in one `.3D.parquet` shard: its xyz
-/// points to `points` and its point count to `counts`. Returns the clouds and points appended.
+/// Appends the lowest-energy conformer of every embedded molecule in one `.3D.parquet` shard,
+/// whose rows hold each molecule's conformers end to end in `points`, `n_atoms` atoms apiece and
+/// lowest energy first: its xyz points to `points` and its point count to `counts`. Returns the
+/// clouds and points appended.
 fn extract_conformers<W: Write>(
     shard_bytes: Bytes,
     points: &mut W,
     counts: &mut W,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(shard_bytes)?;
-    let columns = root_columns(&builder, ["conformer_index", "conformer_coords"])?;
+    let columns = root_columns(&builder, ["n_atoms", "points"])?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), columns);
     let (mut clouds, mut points_appended) = (0, 0);
     for batch in builder.with_projection(mask).build()? {
         let batch = batch?;
-        let indices = batch.column(0).as_primitive::<UInt8Type>();
-        let coordinates = batch.column(1).as_list::<i32>();
-        let scalars = coordinates.values().as_primitive::<Float16Type>().values();
-        let offsets = coordinates.value_offsets();
-        for row in 0..batch.num_rows() {
-            // Molecules that failed to embed keep their rows with null coordinates.
-            if indices.value(row) != 0 || coordinates.is_null(row) {
+        let atoms = batch.column(0).as_primitive::<UInt16Type>();
+        let conformers = batch.column(1).as_list::<i32>();
+        let scalars = conformers
+            .values()
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float16Type>()
+            .values();
+        let offsets = conformers.value_offsets();
+        for (row, &first) in offsets.iter().enumerate().take(batch.num_rows()) {
+            let atoms = usize::from(atoms.value(row));
+            let (first, stored) = (first as usize, conformers.value_length(row) as usize);
+            // Molecules that failed to embed keep their rows with no atoms or no points.
+            if atoms == 0 || stored == 0 {
                 continue;
             }
-            let cloud = &scalars[offsets[row] as usize..offsets[row + 1] as usize];
-            if !cloud.len().is_multiple_of(3) {
-                return Err(format!("a conformer holds {} scalars, not xyz triples", cloud.len()).into());
+            if stored < atoms {
+                return Err(format!("a row holds {stored} points, fewer than its {atoms} atoms").into());
             }
+            let cloud = &scalars[first * 3..(first + atoms) * 3];
             // SAFETY: `f16` is POD.
             points.write_all(unsafe { retrieval::pod_slice_as_bytes(cloud) })?;
             counts.write_all(&((cloud.len() / 3) as u32).to_le_bytes())?;
@@ -465,7 +493,7 @@ async fn download_fingerprints(
     Ok(total_rows)
 }
 
-/// Writes every shard's first conformers into part pairs of `shards_per_part` input shards each,
+/// Writes every shard's lowest-energy conformers into part pairs of `shards_per_part` input shards each,
 /// resuming after the pairs an earlier run finished.
 async fn download_conformers(
     cli: &Cli,
@@ -546,24 +574,79 @@ async fn download_conformers(
     Ok(())
 }
 
+/// Samples `query_count` clouds of every finished conformer part under `seed` into
+/// `query.<count>.f16bin` points and `query.<count>.counts.ibin` points per cloud, in part order.
+fn write_sampled_conformers(output: &Path, query_count: usize, seed: Seed) -> Result<(), Box<dyn std::error::Error>> {
+    const HEADER_BYTES: usize = 8;
+    const POINT_BYTES: usize = std::mem::size_of::<[nk::f16; 3]>();
+    let mut parts = Vec::new();
+    for part_index in 0.. {
+        if !part_rows_of(&counts_part_path(output, part_index))?.is_some_and(|clouds| clouds != 0) {
+            break;
+        }
+        // SAFETY: finished parts are never written again while mapped.
+        let counts = unsafe { Mmap::map(&File::open(counts_part_path(output, part_index))?)? };
+        let points = unsafe { Mmap::map(&File::open(points_part_path(output, part_index))?)? };
+        parts.push((counts, points));
+    }
+    let clouds: usize = parts.iter().map(|(counts, _)| (counts.len() - HEADER_BYTES) / 4).sum();
+    let query_count = query_count.min(clouds);
+    let mut sampled =
+        sample_without_replacement(&mut StdRng::seed_from_u64(seed.into()), clouds, query_count).into_vec();
+    sampled.sort_unstable();
+
+    let (points_path, counts_path) = (
+        output.join(format!("query.{query_count}.f16bin")),
+        output.join(format!("query.{query_count}.counts.ibin")),
+    );
+    let (mut points, mut counts) = (create_part(&points_path, 3)?, create_part(&counts_path, 1)?);
+    let mut wanted = sampled.iter().copied().peekable();
+    let (mut first_cloud, mut points_written) = (0, 0);
+    for (part_counts, part_points) in &parts {
+        let mut point_offset = 0;
+        for (cloud, &count) in part_counts[HEADER_BYTES..].as_chunks::<4>().0.iter().enumerate() {
+            let count = u32::from_le_bytes(count) as usize;
+            if wanted.next_if_eq(&(first_cloud + cloud)).is_some() {
+                let start = HEADER_BYTES + point_offset * POINT_BYTES;
+                points.write_all(&part_points[start..start + count * POINT_BYTES])?;
+                counts.write_all(&(count as u32).to_le_bytes())?;
+                points_written += count;
+            }
+            point_offset += count;
+        }
+        first_cloud += (part_counts.len() - HEADER_BYTES) / 4;
+    }
+    finish_part(points, points_written, 3)?;
+    finish_part(counts, query_count, 1)?;
+    eprintln!(
+        "Sampled {query_count} of {clouds} clouds, {points_written} points, into {}",
+        points_path.display()
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli: Cli = retrieval::parse_cli();
     eprintln!("- Source: {}", cli.source);
     match cli.fingerprint {
         Some(fingerprint) => eprintln!("- Fingerprint: {fingerprint}"),
-        None => eprintln!("- Conformers: first per embedded molecule"),
+        None => eprintln!("- Conformers: lowest energy per embedded molecule"),
     }
     match cli.limit {
         Some(limit) => eprintln!("- Limit: {limit}"),
         None => eprintln!("- Limit: all"),
     }
     eprintln!("- Part rows: {}", cli.part_rows);
-    eprintln!("- Query count: {}", cli.query_count);
+    match cli.query_count {
+        Some(query_count) => eprintln!("- Query count: {query_count}"),
+        None => eprintln!("- Query count: default"),
+    }
     match cli.top_k {
         Some(top_k) => eprintln!("- Top k: {top_k}"),
         None => eprintln!("- Top k: none, no queries or ground truth"),
     }
+    eprintln!("- Hold out: {}", cli.hold_out);
     eprintln!("- Threads: {}", cli.threads);
     eprintln!("- Download concurrency: {}", cli.download_concurrency);
     eprintln!("- Seed: {}", cli.seed);
@@ -581,7 +664,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // bucket answers 403 or 404 past its last shard.
     let max_shards = cli.limit.unwrap_or(usize::MAX).div_ceil(SHARD_ROWS);
     let Some(fingerprint) = cli.fingerprint else {
-        return download_conformers(&cli, &client, shards_per_part, max_shards).await;
+        download_conformers(&cli, &client, shards_per_part, max_shards).await?;
+        return match cli.query_count {
+            Some(query_count) => write_sampled_conformers(&cli.output, query_count, cli.seed),
+            None => Ok(()),
+        };
     };
     let total_rows = download_fingerprints(&cli, &client, &fingerprint.info(), shards_per_part, max_shards).await?;
     let Some(top_k) = cli.top_k else {
@@ -597,10 +684,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    write_sampled_ground_truth(&base, cli.query_count, top_k, cli.seed, cli.threads, &cli.output)?;
-    eprintln!(
-        "Done: {total_rows} base x {} queries, top-{top_k}",
-        cli.query_count.min(total_rows)
-    );
+    let query_count = cli.query_count.unwrap_or(10_000);
+    write_sampled_ground_truth(
+        base,
+        query_count,
+        top_k,
+        cli.seed,
+        cli.threads,
+        cli.hold_out,
+        &cli.output,
+    )?;
+    let query_count = query_count.min(total_rows);
+    let base_rows = if cli.hold_out {
+        total_rows - query_count
+    } else {
+        total_rows
+    };
+    eprintln!("Done: {base_rows} base x {query_count} queries, top-{top_k}");
     Ok(())
 }

@@ -1,6 +1,11 @@
 //! Memory-mapped vector datasets, key mappings, and ground truth.
 
-use std::{alloc::System, fs::File, io, path::Path};
+use std::{
+    alloc::System,
+    fs::{File, OpenOptions},
+    io::{self, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
 
 use memmap2::Mmap;
 
@@ -53,10 +58,10 @@ fn natural_key(name: &str) -> Vec<NaturalSegment<'_>, System> {
 /// glob metacharacters (`*`, `?`, `[`) is returned as-is — single-file
 /// callers stay on the zero-glob fast path. Globbed expansions are sorted
 /// with `natural_key` so `shard_2.fbin` comes before `shard_10.fbin`.
-fn expand_glob(pattern: &str) -> io::Result<Vec<std::path::PathBuf, System>> {
+fn expand_glob(pattern: &str) -> io::Result<Vec<PathBuf, System>> {
     if !pattern.contains(['*', '?', '[']) {
         let mut paths = Vec::with_capacity_in(1, System);
-        paths.push(std::path::PathBuf::from(pattern));
+        paths.push(PathBuf::from(pattern));
         return Ok(paths);
     }
     let entries = glob::glob(pattern).map_err(|error| io::Error::other(format!("glob({pattern}): {error}")))?;
@@ -208,6 +213,8 @@ pub struct Dataset {
     /// through their `dimensions` argument.
     dimensions: usize,
     format: ScalarFormat,
+    /// The path or glob the shards were mapped from, in the order `expand_glob` lists them.
+    pattern: PathBuf,
 }
 
 /// Bytes occupied by a vector of the given format and dimensionality.
@@ -225,8 +232,6 @@ pub struct GroundTruth {
     neighbors_per_query: usize,
     /// Bytes per neighbor row id: 4 in `.ibin`, 8 in `.u64bin`.
     row_bytes: usize,
-    /// Whether every shard follows its rows with one `f32` distance per neighbor, as BigANN files do.
-    distances: bool,
 }
 
 impl Dataset {
@@ -251,7 +256,53 @@ impl Dataset {
             shards,
             dimensions,
             format,
+            pattern: path.to_path_buf(),
         })
+    }
+
+    /// Moves the distinct `rows` out of the files in place, about one row write each: a listed row
+    /// before the last `rows.len()` takes the bytes of an unlisted row from among them, then the
+    /// last shard drops that tail, which must lie within it. Returns the dataset reopened.
+    pub fn without_rows(self, rows: &[usize]) -> io::Result<Self> {
+        let total = self.rows();
+        let last_shard = self.shards.mmaps.len() - 1;
+        let first_of_last = self.shards.offsets[last_shard];
+        let kept = total
+            .checked_sub(rows.len())
+            .filter(|&kept| kept >= first_of_last)
+            .ok_or_else(|| io::Error::other(format!("{} rows to remove reach past the last shard", rows.len())))?;
+        let mut removed = Vec::with_capacity_in(rows.len(), System);
+        removed.extend_from_slice(rows);
+        removed.sort_unstable();
+        let mut fillers = (kept..total).filter(|row| removed.binary_search(row).is_err());
+        let paths = expand_glob(&self.pattern.to_string_lossy())?;
+        let mut writers: Vec<Option<File>, System> = Vec::with_capacity_in(paths.len(), System);
+        writers.resize_with(paths.len(), || None);
+        let stride = self.shards.stride_bytes;
+        for &row in removed.iter().take_while(|&&row| row < kept) {
+            let filler = fillers
+                .next()
+                .expect("an unlisted tail row for every listed row before the tail");
+            let (shard, within) = self.shards.locate(row);
+            let writer = match &mut writers[shard] {
+                Some(writer) => writer,
+                slot => slot.insert(OpenOptions::new().write(true).open(&paths[shard])?),
+            };
+            writer.seek(SeekFrom::Start((HEADER_BYTES + within * stride) as u64))?;
+            writer.write_all(self.shards.row_bytes(filler, stride))?;
+        }
+        for writer in writers.iter().flatten() {
+            writer.sync_all()?;
+        }
+        let last_rows = kept - first_of_last;
+        let mut last = OpenOptions::new().write(true).open(&paths[last_shard])?;
+        last.write_all(&(last_rows as u32).to_le_bytes())?;
+        let pattern = self.pattern.clone();
+        // Unmapped before the shrink, so no mapping outlives the bytes it covers.
+        drop(self);
+        last.set_len((HEADER_BYTES + last_rows * stride) as u64)?;
+        last.sync_all()?;
+        Self::load(&pattern)
     }
 
     pub fn rows(&self) -> usize {
@@ -429,11 +480,23 @@ pub enum Keys {
     Mapped {
         shards: Shards,
         key_bytes: usize,
+        /// Every row, ordered by its key, so a key finds its row by binary search.
+        rows_by_key: Vec<usize, System>,
     },
     Generated {
         count: usize,
         key_type: KeyType,
     },
+}
+
+/// The key mapped `shards` of `key_bytes`-wide keys hold for `row`.
+fn mapped_key(shards: &Shards, key_bytes: usize, row: usize) -> Key {
+    let bytes = shards.row_bytes(row, key_bytes);
+    match key_bytes {
+        4 => Key::from(u32::from_le_bytes(bytes.try_into().unwrap())),
+        8 => Key::from(u64::from_le_bytes(bytes.try_into().unwrap())),
+        _ => Key(u128::from_be_bytes(bytes.try_into().unwrap())),
+    }
 }
 
 impl Keys {
@@ -451,22 +514,33 @@ impl Keys {
             }
         };
         let (shards, _) = load_shards(path, "keys", |_| key_bytes)?;
-        Ok(Keys::Mapped { shards, key_bytes })
+        let mut rows_by_key = Vec::with_capacity_in(shards.rows(), System);
+        rows_by_key.extend(0..shards.rows());
+        rows_by_key.sort_unstable_by_key(|&row| mapped_key(&shards, key_bytes, row));
+        Ok(Keys::Mapped {
+            shards,
+            key_bytes,
+            rows_by_key,
+        })
     }
 
     /// The key of base `row`.
     pub fn get(&self, row: usize) -> Key {
         match self {
-            Keys::Mapped { shards, key_bytes } => {
-                let bytes = shards.row_bytes(row, *key_bytes);
-                match *key_bytes {
-                    4 => Key::from(u32::from_le_bytes(bytes.try_into().unwrap())),
-                    8 => Key::from(u64::from_le_bytes(bytes.try_into().unwrap())),
-                    _ => Key(u128::from_be_bytes(bytes.try_into().unwrap())),
-                }
-            }
+            Keys::Mapped { shards, key_bytes, .. } => mapped_key(shards, *key_bytes, row),
             Keys::Generated { key_type, .. } => key_type.encode(row),
         }
+    }
+
+    /// The base row holding `key`, when one does.
+    pub fn row_of(&self, key: Key) -> Option<usize> {
+        let row = match self {
+            Keys::Mapped { rows_by_key, .. } => {
+                rows_by_key[rows_by_key.binary_search_by_key(&key, |&row| self.get(row)).ok()?]
+            }
+            Keys::Generated { key_type, .. } => key_type.decode(key)?,
+        };
+        (row < self.rows() && self.get(row) == key).then_some(row)
     }
 
     pub fn rows(&self) -> usize {
@@ -498,33 +572,11 @@ impl GroundTruth {
             }
         };
         let (shards, neighbors_per_query) = load_shards(path, "ground_truth", |neighbors| neighbors * row_bytes)?;
-        let distances = shards.mmaps.iter().enumerate().all(|(shard, mmap)| {
-            let rows = shards.offsets[shard + 1] - shards.offsets[shard];
-            mmap.len() == HEADER_BYTES + rows * neighbors_per_query * (row_bytes + 4)
-        });
         Ok(Self {
             shards,
             neighbors_per_query,
             row_bytes,
-            distances,
         })
-    }
-
-    /// The distances of a query's true neighbors, nearest first, when the file stores them.
-    pub fn distances(&self, query_index: usize) -> Option<impl ExactSizeIterator<Item = f32> + '_> {
-        if !self.distances {
-            return None;
-        }
-        let (shard, within) = self.shards.locate(query_index);
-        let rows = self.shards.offsets[shard + 1] - self.shards.offsets[shard];
-        let width = self.neighbors_per_query;
-        let offset = HEADER_BYTES + rows * width * self.row_bytes + within * width * 4;
-        let bytes = &self.shards.mmaps[shard][offset..offset + width * 4];
-        Some(
-            bytes
-                .chunks_exact(4)
-                .map(|distance| f32::from_le_bytes(distance.try_into().unwrap())),
-        )
     }
 
     pub fn queries(&self) -> usize {

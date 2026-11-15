@@ -14,8 +14,8 @@ use numkong::{self as nk, MatrixSpan, MatrixView};
 use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, SeedableRng};
 
 use crate::{
-    error::GroundTruthError, packed_distance::PackedDistance, pod_slice_as_bytes, row_ranges, spawn_pool, Dataset,
-    Seed, Threads, Vectors,
+    error::GroundTruthError, eval, packed_distance::PackedDistance, pod_slice_as_bytes, row_ranges, spawn_pool,
+    Dataset, Seed, Threads, Vectors,
 };
 
 /// Bytes of the per-call distance tile, enough cells for one kernel call to keep every core busy.
@@ -337,13 +337,15 @@ pub fn write_bin_file(path: &Path, rows: usize, width: usize, bodies: &[&[u8]]) 
 
 /// Samples `query_count` rows of the bit-packed `base` as queries with `seed`, computes their exact
 /// Hamming top-`top_k` over every base shard, and writes `query.<count>.b1bin` and
-/// `groundtruth.<count>.ibin` into `output`.
+/// `groundtruth.<count>.ibin` into `output`. With `hold_out`, the sampled rows leave the base files
+/// first, so the truth names rows of the reduced base.
 pub fn write_sampled_ground_truth(
-    base: &Dataset,
+    base: Dataset,
     query_count: usize,
     top_k: usize,
     seed: Seed,
     threads: Threads,
+    hold_out: bool,
     output: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let query_count = query_count.min(base.rows());
@@ -353,6 +355,11 @@ pub fn write_sampled_ground_truth(
     query_bytes.resize(query_count * base.vector_bytes(), 0u8);
     let Vectors::B1x8(queries) = base.gather(sampled.iter(), base.dimensions(), &mut query_bytes) else {
         return Err("sampled ground truth needs a bit-packed base".into());
+    };
+    // Held-out queries leave the base, so no engine indexes the rows it is judged on.
+    let base = match hold_out {
+        true => base.without_rows(&sampled.into_vec())?,
+        false => base,
     };
     let mut shards = Vec::new_in(System);
     for shard in base.shards() {
@@ -369,7 +376,109 @@ pub fn write_sampled_ground_truth(
 
     let query_path = output.join(format!("query.{query_count}.b1bin"));
     write_bin_file(&query_path, query_count, base.dimensions(), &[&query_bytes])?;
-    let ground_truth_path = output.join(format!("groundtruth.{query_count}.ibin"));
+    write_ground_truth_file(
+        &output.join(format!("groundtruth.{query_count}.ibin")),
+        &ground_truth,
+        &distances,
+    )?;
+    Ok(())
+}
+
+/// Computes the exact top-`top_k` of every row of `queries` over every shard of `base` under
+/// `metric`, and writes it to `output` as ground truth.
+pub fn write_ground_truth(
+    base: &Dataset,
+    queries: &Dataset,
+    metric: eval::Metric,
+    top_k: usize,
+    threads: Threads,
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let query_count = queries.rows();
+    let mut query_bytes = Vec::with_capacity_in(query_count * queries.vector_bytes(), System);
+    query_bytes.resize(query_count * queries.vector_bytes(), 0u8);
+    let queries = queries.gather(0..query_count, queries.dimensions(), &mut query_bytes);
+    let mut ground_truth = nk::Matrix::full(&[query_count, top_k], 0u32)?;
+    let mut distances = nk::Matrix::full(&[query_count, top_k], 0.0f32)?;
+    let (truth_span, distances_span) = (ground_truth.span(), distances.span());
+    match (metric, queries) {
+        (eval::Metric::Euclidean, Vectors::F32(queries)) => top_k_over_shards(
+            base,
+            queries,
+            |shard| match shard {
+                Vectors::F32(view) => Some(view),
+                _ => None,
+            },
+            truth_span,
+            distances_span,
+            threads,
+        )?,
+        (eval::Metric::Euclidean, Vectors::I8(queries)) => top_k_over_shards(
+            base,
+            queries,
+            |shard| match shard {
+                Vectors::I8(view) => Some(view),
+                _ => None,
+            },
+            truth_span,
+            distances_span,
+            threads,
+        )?,
+        (eval::Metric::Euclidean, Vectors::U8(queries)) => top_k_over_shards(
+            base,
+            queries,
+            |shard| match shard {
+                Vectors::U8(view) => Some(view),
+                _ => None,
+            },
+            truth_span,
+            distances_span,
+            threads,
+        )?,
+        (eval::Metric::Hamming, Vectors::B1x8(queries)) => top_k_over_shards(
+            base,
+            queries,
+            |shard| match shard {
+                Vectors::B1x8(view) => Some(view),
+                _ => None,
+            },
+            truth_span,
+            distances_span,
+            threads,
+        )?,
+        (metric, _) => {
+            return Err(format!(
+                "no packed {metric:?} kernel for these vectors: l2 ranks .fbin, .i8bin and .u8bin, hamming .b1bin"
+            )
+            .into())
+        }
+    }
+    write_ground_truth_file(output, &ground_truth, &distances)
+}
+
+/// Ranks `queries` over every shard of `base`, each taken as the queries' scalar type by `part_of`.
+fn top_k_over_shards<'base, Scalar: PackedDistance + 'base>(
+    base: &'base Dataset,
+    queries: MatrixView<'_, Scalar>,
+    part_of: impl Fn(Vectors<'base>) -> Option<MatrixView<'base, Scalar>>,
+    ground_truth: MatrixSpan<'_, u32>,
+    distances: MatrixSpan<'_, f32>,
+    threads: Threads,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut parts = Vec::new_in(System);
+    for shard in base.shards() {
+        parts.push(part_of(shard).ok_or("the base and the queries hold different scalar types")?);
+    }
+    compute_top_k(&parts, queries, ground_truth, distances, threads)?;
+    Ok(())
+}
+
+/// Writes `[queries, top_k]` neighbor rows, then their distances, as one `.ibin` file.
+fn write_ground_truth_file(
+    path: &Path,
+    ground_truth: &nk::Matrix<u32>,
+    distances: &nk::Matrix<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: `u32` and `f32` are POD.
     let bodies = unsafe {
         [
@@ -377,7 +486,7 @@ pub fn write_sampled_ground_truth(
             pod_slice_as_bytes(distances.as_slice()),
         ]
     };
-    write_bin_file(&ground_truth_path, query_count, top_k, &bodies)?;
+    write_bin_file(path, ground_truth.shape()[0], ground_truth.shape()[1], &bodies)?;
     Ok(())
 }
 
@@ -387,8 +496,11 @@ mod tests {
 
     use rand::{rngs::StdRng, RngExt, SeedableRng};
 
-    use super::{compute_shape_top_k_tiled, compute_top_k_tiled, nk, Clouds, ShapeMetric};
-    use crate::{binary_view, matrix_view, Threads};
+    use super::{
+        compute_shape_top_k_tiled, compute_top_k_tiled, nk, write_bin_file, write_ground_truth,
+        write_sampled_ground_truth, Clouds, ShapeMetric,
+    };
+    use crate::{binary_view, eval, matrix_view, pod_slice_as_bytes, Dataset, GroundTruth, Seed, Threads};
 
     const BASE_COUNT: usize = 300;
     const QUERY_COUNT: usize = 20;
@@ -483,6 +595,108 @@ mod tests {
                 assert_eq!(found, naive_top_k(&distances), "bits {bits}");
             }
         }
+    }
+
+    /// Held-out queries leave the base: no query row remains in it, it shrinks by their count, and
+    /// the truth matches a naive top-k over what remains.
+    #[test]
+    fn held_out_queries_leave_the_base_and_truth_covers_the_rest() {
+        let (bits, bytes) = (64, 8);
+        let directory = std::env::temp_dir().join(format!("retrieval-hold-out-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut random = StdRng::seed_from_u64(11);
+        let rows: Vec<u8> = (0..BASE_COUNT * bytes).map(|_| random.random()).collect();
+        let base_path = directory.join("base.b1bin");
+        write_bin_file(&base_path, BASE_COUNT, bits, &[&rows]).unwrap();
+        let base = Dataset::load(&base_path).unwrap();
+        write_sampled_ground_truth(base, QUERY_COUNT, TOP_K, Seed(3), two_threads(), true, &directory).unwrap();
+
+        assert_eq!(Dataset::load(&base_path).unwrap().rows(), BASE_COUNT - QUERY_COUNT);
+        let base = std::fs::read(&base_path).unwrap();
+        let (base, queries) = (
+            &base[8..],
+            std::fs::read(directory.join(format!("query.{QUERY_COUNT}.b1bin"))).unwrap(),
+        );
+        let truth = GroundTruth::load(&directory.join(format!("groundtruth.{QUERY_COUNT}.ibin"))).unwrap();
+        for (index, query) in queries[8..].chunks_exact(bytes).enumerate() {
+            assert!(
+                base.chunks_exact(bytes).all(|row| row != query),
+                "query {index} stayed in the base"
+            );
+            let distances: Vec<u32> = base
+                .chunks_exact(bytes)
+                .map(|row| row.iter().zip(query).map(|(&b, &q)| (b ^ q).count_ones()).sum())
+                .collect();
+            assert_eq!(truth.neighbors(index).collect::<Vec<_>>(), naive_top_k(&distances));
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Ground truth of an existing i8 base names the rows a naive top-k ranks, with their squared L2
+    /// distances after them.
+    #[test]
+    fn i8bin_ground_truth_matches_naive_squared_l2() {
+        let dimensions = 37;
+        let directory = std::env::temp_dir().join(format!("retrieval-i8-truth-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut random = StdRng::seed_from_u64(5);
+        let base: Vec<i8> = (0..BASE_COUNT * dimensions).map(|_| random.random()).collect();
+        let queries: Vec<i8> = (0..QUERY_COUNT * dimensions).map(|_| random.random()).collect();
+        let (base_path, query_path, truth_path) = (
+            directory.join("base.i8bin"),
+            directory.join("query.i8bin"),
+            directory.join("groundtruth.ibin"),
+        );
+        // SAFETY: `i8` is POD.
+        write_bin_file(
+            &base_path,
+            BASE_COUNT,
+            dimensions,
+            &[unsafe { pod_slice_as_bytes(&base) }],
+        )
+        .unwrap();
+        write_bin_file(
+            &query_path,
+            QUERY_COUNT,
+            dimensions,
+            &[unsafe { pod_slice_as_bytes(&queries) }],
+        )
+        .unwrap();
+        write_ground_truth(
+            &Dataset::load(&base_path).unwrap(),
+            &Dataset::load(&query_path).unwrap(),
+            eval::Metric::Euclidean,
+            TOP_K,
+            two_threads(),
+            &truth_path,
+        )
+        .unwrap();
+
+        let truth = GroundTruth::load(&truth_path).unwrap();
+        let file = std::fs::read(&truth_path).unwrap();
+        let stored: Vec<f32> = file[8 + QUERY_COUNT * TOP_K * 4..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&bytes| f32::from_le_bytes(bytes))
+            .collect();
+        for (index, query) in queries.chunks_exact(dimensions).enumerate() {
+            let distances: Vec<i32> = base
+                .chunks_exact(dimensions)
+                .map(|row| row.iter().zip(query).map(|(&b, &q)| (b as i32 - q as i32).pow(2)).sum())
+                .collect();
+            let found: Vec<usize> = truth.neighbors(index).collect();
+            let found_distances: Vec<i32> = found.iter().map(|&row| distances[row]).collect();
+            let naive_distances: Vec<i32> = naive_top_k(&distances).iter().map(|&row| distances[row]).collect();
+            assert_eq!(found_distances, naive_distances, "query {index}");
+            for (&exact, &stored) in found_distances.iter().zip(&stored[index * TOP_K..][..TOP_K]) {
+                assert!(
+                    (stored - exact as f32).abs() <= 1e-3 * exact as f32,
+                    "{stored} != {exact}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

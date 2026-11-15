@@ -36,7 +36,9 @@ use serde_json::Value;
 pub use crate::{
     dataset::{Dataset, GroundTruth, Keys, Permutation, Shuffle},
     error::{DatasetError, GroundTruthError},
-    output::{config_hash, write_report, ConfigReport, DatasetInfo, StepAddEntry, StepEntry, StepSearchEntry},
+    output::{
+        config_hash, write_report, ConfigReport, DatasetInfo, StepAddEntry, StepEntry, StepRefineEntry, StepSearchEntry,
+    },
 };
 
 // #region Core types
@@ -135,6 +137,17 @@ impl KeyType {
             Self::UuidV4 => uuid(4, mix(row), mix(row ^ SPLITMIX64_GAMMA)),
             Self::UuidV7 => uuid(7, row, mix(row)),
         }
+    }
+
+    /// The row [`KeyType::encode`] could have named `key` for; the caller checks it round-trips.
+    pub fn decode(self, key: Key) -> Option<usize> {
+        let payload = (key.0 >> 80) << 16 | (key.0 >> 64 & 0xFFF) << 4 | (key.0 >> 58 & 0xF);
+        let row = match self {
+            Self::U32 | Self::U64 => u64::try_from(key.0).ok()?,
+            Self::UuidV4 => unmix(payload as u64),
+            Self::UuidV7 => payload as u64,
+        };
+        usize::try_from(row).ok()
     }
 
     /// Bytes per key: 4, 8 or 16.
@@ -408,6 +421,12 @@ pub trait Backend: Send {
     /// that index in the background; timed into the add phase.
     fn flush(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Completes the build after the last insert step, before its search: refinement passes, then
+    /// any move to where the index serves from, reporting the passes when there were any.
+    fn finish(&mut self) -> Result<Option<StepRefineEntry>, String> {
+        Ok(None)
     }
 
     /// How many vectors the backend holds, when it can say. A loaded index may
@@ -931,6 +950,20 @@ impl BenchState {
             Thousands(ground_truth.queries() as u64),
             ground_truth.neighbors_per_query(),
         );
+        let past_base = (0..ground_truth.queries()).find_map(|query| {
+            ground_truth
+                .neighbors(query)
+                .find(|&row| row >= file_vectors)
+                .map(|row| (query, row))
+        });
+        if let Some((query, row)) = past_base {
+            return Err(format!(
+                "{}: query {query} names base row {row}, past the {} base rows",
+                args.query_neighbors.display(),
+                Thousands(file_vectors as u64),
+            )
+            .into());
+        }
 
         let ground_truth_width = ground_truth.neighbors_per_query();
         let top_k = args.top_k.unwrap_or(ground_truth_width);
@@ -1188,24 +1221,32 @@ fn run_search_phase(
     let elapsed = started.elapsed().as_secs_f64();
     let counters = stop_and_read_counters(perf, "search");
     let throughput = per_second(passes * query_count, elapsed);
-    let scores = eval::score(
-        state.search_buffers.found_hits(),
-        &state.ground_truth,
-        &state.keys,
-        count,
-    );
+    let label = backend
+        .metadata()
+        .get("metric")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let metric = eval::Metric::from_label(&label).ok_or_else(|| format!("no exact distance for metric {label:?}"))?;
+    let truth = eval::ExactTruth {
+        ground_truth: &state.ground_truth,
+        base: &state.dataset,
+        queries: &state.query_dataset,
+        base_keys: &state.keys,
+        metric,
+    };
+    let scores = eval::score(state.search_buffers.found(), &truth, dimensions, count)?;
 
     // Raw metrics, since dividing out coverage would treat the indexed prefix as a uniform sample.
     let coverage = vectors_indexed as f64 / state.dataset.rows().max(1) as f64;
     let approximate = if final_step { "" } else { "~" };
-    let distance_recall = scores.distance_recall_at_k.map_or_else(String::new, |recall| {
-        format!(", {approximate}distance-recall@{count}={recall:.4}")
-    });
-    progress.finish_with_message(format!(
-        "{} search/s, {approximate}recall@1={:.4}, \
-         {approximate}recall@{count}={:.4}, \
-         {approximate}intersection@{count}={:.4}, \
-         {approximate}NDCG@{count}={:.4}{distance_recall} ({} vectors, {:.0}% coverage)",
+    // Printed rather than left on the bar, which draws nothing when stderr is a log file.
+    progress.finish_and_clear();
+    eprintln!(
+        "  searched at {} search/s, {approximate}1-recall@1={:.4}, \
+         {approximate}1-recall@{count}={:.4}, \
+         {approximate}{count}-recall@{count}={:.4}, \
+         {approximate}NDCG@{count}={:.4} ({} vectors, {:.0}% coverage)",
         Thousands(throughput),
         scores.recall_at_1,
         scores.recall_at_k,
@@ -1213,7 +1254,7 @@ fn run_search_phase(
         scores.ndcg_at_k,
         Thousands(vectors_indexed as u64),
         coverage * 100.0,
-    ));
+    );
 
     Ok(StepSearchEntry {
         queries: query_count,
@@ -1225,7 +1266,6 @@ fn run_search_phase(
         recall_at_k: scores.recall_at_k,
         intersection_at_k: Some(scores.intersection_at_k),
         ndcg_at_k: Some(scores.ndcg_at_k),
-        distance_recall_at_k: scores.distance_recall_at_k,
         counters,
     })
 }
@@ -1272,11 +1312,12 @@ fn run_self_search_phase(
     let throughput = per_second(query_count, elapsed);
     let recall_at_1 = hits_at_1 as f64 / query_count as f64;
     let recall_at_k = hits_at_k as f64 / query_count as f64;
-    progress.finish_with_message(format!(
-        "{} search/s, recall@1={recall_at_1:.4}, recall@{count}={recall_at_k:.4} ({} queries)",
+    progress.finish_and_clear();
+    eprintln!(
+        "  self-searched at {} search/s, recall@1={recall_at_1:.4}, recall@{count}={recall_at_k:.4} ({} queries)",
         Thousands(throughput),
         Thousands(query_count as u64),
-    ));
+    );
 
     Ok(StepSearchEntry {
         queries: query_count,
@@ -1289,7 +1330,6 @@ fn run_self_search_phase(
         // Identity truth holds one key per query, so only `recall_at_1` is meaningful.
         intersection_at_k: None,
         ndcg_at_k: None,
-        distance_recall_at_k: None,
         counters,
     })
 }
@@ -1383,13 +1423,14 @@ fn save_report(
 }
 
 /// Runs one configuration and writes its report. A fresh index fills step by step and is
-/// measured after each; an index loaded holding `loaded` vectors is measured once.
+/// measured after each, saved before the last step's search when `index_file` asks; a loaded
+/// index is measured once.
 pub fn run(
     backend: &mut dyn Backend,
     state: &mut BenchState,
     description: &str,
     dimensions: usize,
-    loaded: Option<usize>,
+    index_file: IndexFile<'_>,
 ) -> BenchResult<()> {
     let metadata = backend.metadata();
     let cores = metadata.get("threads").and_then(Value::as_u64).unwrap_or(1) as usize;
@@ -1414,8 +1455,9 @@ pub fn run(
         .flatten();
 
     let mut steps = Vec::with_capacity(state.steps);
-    match loaded {
-        Some(indexed) => {
+    match index_file {
+        IndexFile::Load(_) => {
+            let indexed = backend.indexed_count().unwrap_or(state.total_vectors);
             if indexed != state.total_vectors {
                 eprintln!(
                     "  loaded index holds {} vectors, dataset implies {} — using the index's count",
@@ -1429,15 +1471,32 @@ pub fn run(
                 memory_bytes: backend.memory_bytes() as u64,
                 process_anon_bytes: process_anon_bytes(),
                 add: None,
+                refine: None,
                 ground_truth_search: Some(search),
                 self_search: None,
             });
         }
-        None => {
+        IndexFile::None | IndexFile::Save(_) => {
             let total_vectors = state.total_vectors;
+            let mut add_seconds = 0.0;
             for step in row_ranges(0..total_vectors, total_vectors.div_ceil(state.steps)) {
                 let add = run_add_phase(backend, state, &mut perf, step.clone(), dimensions, inserts_per_call)?;
+                add_seconds += add.elapsed;
+                eprintln!(
+                    "  added {}/{} vectors in {:.1} s at {} vectors/s, {:.1} s of adds so far",
+                    Thousands(step.end as u64),
+                    Thousands(total_vectors as u64),
+                    add.elapsed,
+                    Thousands(add.throughput),
+                    add_seconds,
+                );
                 let final_step = step.end == total_vectors;
+                let refine = if final_step { backend.finish()? } else { None };
+                // Saved before searching, so a failure while searching or scoring keeps the build.
+                if let (true, IndexFile::Save(path)) = (final_step, index_file) {
+                    backend.save(path)?;
+                    eprintln!("  saved index → {path}");
+                }
                 let search = run_search_phase(
                     backend,
                     state,
@@ -1452,6 +1511,7 @@ pub fn run(
                     memory_bytes: backend.memory_bytes() as u64,
                     process_anon_bytes: process_anon_bytes(),
                     add: Some(add),
+                    refine,
                     ground_truth_search: Some(search),
                     self_search: None,
                 });
@@ -1525,21 +1585,8 @@ pub fn run_config(
         Ok(backend) => backend,
         Err(error) => return ConfigOutcome::skipped(description, error),
     };
-    let loaded = match index_file {
-        IndexFile::Load(_) => Some(backend.indexed_count().unwrap_or(state.total_vectors)),
-        IndexFile::None | IndexFile::Save(_) => None,
-    };
-    if let Err(error) = run(&mut backend, state, description, dimensions, loaded) {
-        return ConfigOutcome::failed(description, error);
-    }
-    let IndexFile::Save(path) = index_file else {
-        return ConfigOutcome::Ran;
-    };
-    match backend.save(path) {
-        Ok(()) => {
-            eprintln!("  saved index → {path}");
-            ConfigOutcome::Ran
-        }
+    match run(&mut backend, state, description, dimensions, index_file) {
+        Ok(()) => ConfigOutcome::Ran,
         Err(error) => ConfigOutcome::failed(description, error),
     }
 }
@@ -1731,6 +1778,13 @@ pub fn mix(value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// The inverse of [`mix`].
+pub fn unmix(value: u64) -> u64 {
+    let value = (value ^ (value >> 31) ^ (value >> 62)).wrapping_mul(0x3196_42B2_D24D_8EC3);
+    let value = (value ^ (value >> 27) ^ (value >> 54)).wrapping_mul(0x96DE_1B17_3F11_9089);
+    value ^ (value >> 30) ^ (value >> 60)
+}
+
 /// The key of stream `index` of `name`, two mixes away from `seed`, so neighboring seeds and indices never meet.
 pub fn stream_key(seed: Seed, name: &str, index: u64) -> u64 {
     let hashed = name.bytes().fold(0xCBF2_9CE4_8422_2325, |hash: u64, byte| {
@@ -1910,14 +1964,15 @@ mod tests {
     }
 
     #[test]
-    fn generated_uuids_are_unique_versioned_and_v7_sorts_by_row() {
+    fn generated_uuids_are_unique_versioned_decodable_and_v7_sorts_by_row() {
         let rows = [0, 1, 2, 15, 16, 4095, 4096, 65_535, 65_536, 6_039_411_649];
         for (key_type, version) in [(KeyType::UuidV4, 4), (KeyType::UuidV7, 7)] {
             let keys: Vec<Key> = rows.iter().map(|&row| key_type.encode(row)).collect();
-            for key in &keys {
+            for (key, &row) in keys.iter().zip(&rows) {
                 assert_eq!(key.0 >> 76 & 0xF, version);
                 assert_eq!(key.0 >> 62 & 0b11, 0b10);
                 assert_eq!(key.to_string().parse::<Key>(), Ok(*key));
+                assert_eq!(key_type.decode(*key), Some(row));
             }
             let mut unique = keys.clone();
             unique.sort_unstable();

@@ -61,6 +61,11 @@ path = "src/generate.rs"
 required-features = ["generate"]
 
 [[bin]]
+name = "retri-ground-truth"
+path = "src/compute_ground_truth.rs"
+required-features = ["generate"]
+
+[[bin]]
 name = "retri-download-molecules"
 path = "scripts/download_molecules.rs"
 required-features = ["download"]
@@ -133,6 +138,10 @@ bytes = { version = "1", optional = true }
 # dep entirely) and the `perf-counters` feature flag (opt-in).
 [target.'cfg(target_os = "linux")'.dependencies]
 perf-event2 = { version = "0.7", optional = true }
+
+# Compiles `src/faiss.cpp` under the FAISS backend.
+[build-dependencies]
+cc = "1"
 
 [features]
 default = ["usearch-backend"]

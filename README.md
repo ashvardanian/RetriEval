@@ -129,6 +129,8 @@ The tables below group the datasets by scale, and each name links to its downloa
 | :----------------------------------- | ----------: | ---------: | ------: | --------: | :---------------- |
 | [Meta BIGANN — SIFT][meta-bigann]    |        `u8` |        128 |      L2 |    1.2 GB | 10K queries, yes  |
 | [Microsoft Turing-ANNS][msft-turing] |       `f32` |        100 |      L2 |    3.7 GB | 100K queries, yes |
+| [Microsoft SpaceV][msft-spacev]      |        `i8` |        100 |      L2 |    0.9 GB | 30K queries, yes  |
+| [Yandex Deep][yandex-deep]           |       `f32` |         96 |      L2 |    3.6 GB | 10K queries, yes  |
 | [Cohere Wiki EN][cohere-wiki]        |        `b1` |       1024 | Hamming |    5.3 GB | self-sampled ¹    |
 
 > ¹ These sources ship vectors without ground truth, so their `retri-download-*` binaries sample queries with a fixed seed and compute exact Hamming top-K.
@@ -140,6 +142,7 @@ The tables below group the datasets by scale, and each name links to its downloa
 | [Meta BIGANN — SIFT][meta-bigann]     |        `u8` |        128 |      L2 |     12 GB | 10K queries, yes  |
 | [Microsoft Turing-ANNS][msft-turing]  |       `f32` |        100 |      L2 |     37 GB | 100K queries, yes |
 | [Microsoft SpaceV][msft-spacev]       |        `i8` |        100 |      L2 |    9.3 GB | 30K queries, yes  |
+| [Yandex Deep][yandex-deep]            |       `f32` |         96 |      L2 |     36 GB | 10K queries, yes  |
 | [Unum WikiVerse][wikiverse] ²         |       `f16` |  128–4096³ |  Cos/IP |  95-505GB | pipeline pending  |
 | [USearchMolecules PubChem][usm] MACCS |        `b1` |        168 | Hamming |    2.4 GB | self-sampled ¹    |
 | [USearchMolecules PubChem][usm] ECFP4 |        `b1` |       2048 | Hamming |     29 GB | self-sampled ¹    |
@@ -174,7 +177,7 @@ The tables below group the datasets by scale, and each name links to its downloa
 
 ## Results
 
-These numbers were measured for reference on DGX-B300 and DGX-H100 class nodes, the main drivers of AI neoclouds, and on single-socket AWS Graviton5 hosts, and mostly guide the design of USearch.
+These numbers were measured for reference on DGX-B300 and DGX-H100 class nodes, the main drivers of AI neoclouds, and on single-socket AWS Graviton4 and Graviton5 hosts, and mostly guide the design of USearch.
 They shift with the data, the software versions and the hardware, so treat them as reference points for your own runs, not as fixed rankings.
 
 Each table holds one row per backend, device and data type, so a new run is a new row and nothing else moves:
@@ -193,9 +196,14 @@ Each table holds one row per backend, device and data type, so a new run is a ne
 
 Every row follows the same methodology:
 
-- Sweep each backend's settings until it reaches 99% recall@10 or more on the dataset.
+- Tune each backend's settings until it reaches 99% 1-recall@10 or more on the dataset.
 - Never let a row build faster than it searches: when `Add/s` exceeds `Search/s`, raise the construction expansion and lower the search expansion until search is at least as fast at that recall.
-- Confirm the behavior on a 1M–10M subset, then validate the scaling curves at 100M–1B.
+- Run every command on a 1M prefix first, then on a 10M prefix, before the full file.
+- Match the links each vector keeps: 64 means connectivity 64 in a single-layer graph and M=32 in HNSW.
+- Start every engine from the same expansions, and widen the construction only where a dataset misses 0.99.
+- Hold the 0.99 target on every dataset.
+- Give each engine its best pages and kernels, and name them under the table.
+- Build in 20 steps, and validate the ground truth against the base before the first insert.
 
 Compare the fastest measured configuration meeting the same recall target, with the same recall definition, queries, K, and ground truth.
 Report build time and memory alongside query throughput, and keep query concurrency, batch size, and cache state comparable.
@@ -204,11 +212,10 @@ Report build time and memory alongside query throughput, and keep query concurre
 
 Each search reports both recall conventions, because they answer different questions and one of them saturates:
 
-- `recall_at_k` is 1-recall@K, FAISS's `OneRecallAtRCriterion` and the measure USearch reports.
-- `intersection_at_k` is K-recall@K, `|top-K ∩ ground-truth-K| / K`, order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
+- `recall_at_k` is 1-recall@K, FAISS's `OneRecallAtRCriterion` and the measure USearch reports: any of the top K within the true nearest distance.
+- `intersection_at_k` is K-recall@K, the share of the top K within the K-th true distance, order-independent, and what ann-benchmarks and cuVS's own harness publish as recall.
 - `ndcg_at_k` weights true hits by `1 / log2(rank + 1)`, normalized by ideal gain.
-- `distance_recall_at_k` is the share of the top K within the K-th true distance, so a neighbor tied with the truth's last counts whichever key the truth kept.
-  It needs ground truth that stores distances, as the BigANN files and `retri-generate` do, and appears only when the backend's distances match the stored ones on shared keys.
+- Ties are counted by exact distance: the harness recomputes the distance of every true neighbor and every answer from the base vectors, whatever the engine stores, so a neighbor tied with a true one counts whichever key the ground truth kept, within a relative 10⁻⁶ for rounding.
 - Neither 1-recall@K nor K-recall@K generally bounds the other, so the two are never interchangeable.
 - K is `--top-k`, which defaults to the ground-truth file's width, 10 on the Wiki sets and 100 on the BigANN ones.
 - 1-recall@K stops discriminating as K grows: at K=100 nearly any sane configuration finds the single true neighbor somewhere in the list.
@@ -242,17 +249,20 @@ Each search reports both recall conventions, because they answer different quest
 
 #### PubChem ECFP4 100M
 
-| Backend      | Device             | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory | Build |
-| :----------- | :----------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | ------: | -------: | ------: | ----: |
-| USearch 3.0  | 148× NVIDIA SM103  | `b1` |           32 |      32 |  512 / 512 | 0.9906 |       … | 146,810 |  285,230 |       … | 13.1m |
-| USearch 3.0  | 192× Arm Graviton5 | `b1` |           32 |      32 |  512 / 512 | 0.9821 |  0.9038 | 104,412 |   57,807 | 53.6 GB | 18.5m |
-| FAISS 1.15.1 | 192× Arm Graviton5 | `b1` |           32 |      64 |    40 / 16 | 0.5623 |  0.4704 | 341,635 |  839,862 | 93.3 GB |  5.6m |
+| Backend      | Device             | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory |  Build |
+| :----------- | :----------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | ------: | -------: | ------: | -----: |
+| USearch 3.0  | 148× NVIDIA SM103  | `b1` |           32 |      32 |  512 / 512 | 0.9906 |       … | 146,810 |  285,230 |       … |  13.1m |
+| USearch 3.0  | 192× Arm Graviton5 | `b1` |           32 |      32 |  512 / 512 | 0.9821 |  0.9038 | 104,412 |   57,807 | 53.6 GB |  18.5m |
+| FAISS 1.15.1 | 192× Arm Graviton5 | `b1` |           32 |      64 |    40 / 16 | 0.5623 |  0.4704 | 341,635 |  839,862 | 93.3 GB |   5.6m |
+| USearch 3.0  | 84× Arm Graviton4  | `b1` |           64 |      64 |  512 / 512 | 0.9931 |  0.9953 |  41,008 |   49,048 | 68.6 GB |  47.0m |
+| FAISS 1.15.1 | 84× Arm Graviton4  | `b1` |           32 |      64 | 512 / 1024 | 0.9870 |  0.9925 |  27,175 |   11,750 | 62.9 GB | 1h 11m |
 
-Neither CPU row reaches 99%, so both break the methodology above:
+Neither Graviton5 row reaches 99%, so both break the methodology above:
 
-- USearch on CPU levels off at 0.9843 even at a search expansion of 1,024, short of the 0.9906 the B300 reaches at the same 512 / 512, and at that recall it builds faster than it searches.
-- FAISS's binary HNSW runs at its compiled-in 40 / 16, since FAISS's parameter tuning has no dispatcher for `IndexBinaryHNSW`.
-- 10-recall@10 near 0.90 is tie scoring: Hamming distances tie often, and K-recall@K credits only the exact keys the ground truth kept among tied neighbors, which `distance_recall_at_k` counts instead.
+- USearch on Graviton5 levels off at 0.9843 even at a search expansion of 1,024, short of the 0.9906 the B300 reaches at the same 512 / 512, and at that recall it builds faster than it searches.
+- FAISS's binary HNSW ran there at its compiled-in 40 / 16, since FAISS's parameter tuning has no dispatcher for `IndexBinaryHNSW`.
+- On Graviton4 the harness sets FAISS's expansions directly, and FAISS still levels off at 0.9870, where it builds faster than it searches.
+- 10-recall@10 near 0.90 is tie scoring: Hamming distances tie often, and those rows credited only the exact keys the ground truth kept among tied neighbors.
 
 ### SIFT
 
@@ -279,6 +289,30 @@ Meta's 128-dimensional `u8` descriptors under L2, compared at the setting that f
 | USearch 3.0  | 148× NVIDIA SM103  | `u8` |           32 |      32 |  256 / 256 | 0.9913 |  0.9810 | 431,520 |  604,490 | 24.8 GB |         3.9m |
 | USearch 3.0  | 192× Arm Graviton5 | `u8` |           32 |      32 |  512 / 160 | 0.9925 |  0.9824 | 161,952 |  173,823 | 33.8 GB |        10.3m |
 | FAISS 1.15.1 | 192× Arm Graviton5 | `u8` |           32 |      64 |  256 / 128 | 0.9917 |  0.9792 |  84,536 |  178,600 | 56.9 GB |        19.7m |
+| USearch 3.0  | 84× Arm Graviton4  | `u8` |           64 |      64 |  128 / 128 | 0.9921 |  0.9775 | 185,046 |  208,835 | 46.7 GB |         9.0m |
+| FAISS 1.15.1 | 84× Arm Graviton4  | `u8` |           32 |      64 |  256 / 128 | 0.9912 |  0.9793 |  41,917 |   93,549 | 42.3 GB |        39.8m |
+
+### SpaceV
+
+Microsoft's 100-dimensional `i8` web-search embeddings under L2, compared at the setting that first reaches 99% 1-recall@10; recipes in [`data/README.md`](data/README.md#microsoft-spacev).
+
+#### SpaceV 100M
+
+| Backend      | Device            | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory |  Build |
+| :----------- | :---------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | -----: | -------: | ------: | -----: |
+| USearch 3.0  | 84× Arm Graviton4 | `i8` |           64 |      64 |  512 / 384 | 0.9934 |  0.9929 | 38,713 |   57,971 | 45.1 GB |  43.1m |
+| FAISS 1.15.1 | 84× Arm Graviton4 | `i8` |           32 |      64 |  512 / 640 | 0.9912 |  0.9908 | 14,975 |   15,773 | 39.5 GB | 1h 51m |
+
+### Deep
+
+Yandex's 96-dimensional `f32` image embeddings under L2, stored as `bf16` by both backends and compared at the setting that first reaches 99% 1-recall@10; recipes in [`data/README.md`](data/README.md#yandex-deep).
+
+#### Deep 100M
+
+| Backend      | Device            | Type   | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory | Build |
+| :----------- | :---------------- | :----- | -----------: | ------: | ---------: | -----: | ------: | -----: | -------: | ------: | ----: |
+| USearch 3.0  | 84× Arm Graviton4 | `bf16` |           64 |      64 |  256 / 192 | 0.9934 |  0.9804 | 87,964 |  118,976 | 53.1 GB | 18.9m |
+| FAISS 1.15.1 | 84× Arm Graviton4 | `bf16` |           32 |      64 |  256 / 256 | 0.9929 |  0.9827 | 48,503 |   56,920 | 48.6 GB | 34.4m |
 
 ### Turing-ANNS
 
@@ -390,6 +424,14 @@ retri-eval-usearch
       Comma-separated NUMA nodes, one shard on each.
   --threads <N,...>                     0
       Threads, 0 for every core in the affinity mask.
+  --residency <WHERE>                   ram
+      ram, vram, or nvme: built in RAM, saved to --index and searched as a view on the last step.
+  --refines <N>                         0
+      Single-pass refinements after the last insert step, reported as the step's refine entry.
+  --nvme-paths <PATHS>                  where --index points
+      Devices or directories an NVMe view serves its parts from.
+  --devices <ORDINALS>                  one free device
+      GPU ordinals, one shard on each.
 
 retri-eval-faiss
   --data-type <TYPE,...>                bf16
@@ -541,10 +583,13 @@ retri-download-molecules
   --fingerprint <COLUMN>                required unless --conformers
       maccs (166 bits), pubchem (881), ecfp4 (2048) or fcfp4 (2048).
   --conformers                          off
-      Each embedded molecule's first conformer, as base.part_N.f16bin xyz points beside
-      counts.part_N.ibin points per cloud; excludes --fingerprint and --top-k.
+      Each embedded molecule's lowest-energy conformer, as base.part_N.f16bin xyz points beside
+      counts.part_N.ibin points per cloud; excludes --fingerprint and --top-k. With
+      --query-count, also query.N.f16bin and query.N.counts.ibin of N sampled clouds.
   --top-k <K>                           none
       Neighbors per query in the ground-truth file, which only this flag writes.
+  --hold-out                            off
+      Move the sampled queries out of the base parts first, so the truth covers the rest.
   --part-rows <N>                       512000000
       Rows per base part, a multiple of the bucket's 1M-row shards.
   --url-prefix <URL>                    the public bucket
@@ -624,11 +669,12 @@ Files are auto-named `<backend>-<hash>.json`.
       "vectors_indexed": 1000000,
       "memory_bytes": 412000000, "process_anon_bytes": 436000000,
       "add": { "elapsed": 12.3, "throughput": 81300 },
+      "refine": { "passes": 2, "elapsed": 6.8, "changed": [412000, 61000] },
       "ground_truth_search": {
         "queries": 100000, "passes": 23, "top_k": 10,
         "elapsed": 5.1, "throughput": 451000,
         "recall_at_1": 0.0942, "recall_at_k": 0.2815,
-        "intersection_at_k": 0.2604, "ndcg_at_k": 0.1847, "distance_recall_at_k": 0.2611
+        "intersection_at_k": 0.2611, "ndcg_at_k": 0.1847
       },
       "self_search": {
         "queries": 1000000, "passes": 1, "top_k": 10,
@@ -643,6 +689,7 @@ Files are auto-named `<backend>-<hash>.json`.
 A step pairs the index state (`vectors_indexed`, `memory_bytes`, `process_anon_bytes`) with the phases that acted on it.
 `add.elapsed` includes the wait until a server finishes indexing what was added.
 A ground-truth search runs one untimed pass to warm the index, then repeats every query until at least 5 seconds pass, and `passes` counts the timed ones.
+`refine` appears on the last insert step when the backend ran refinement passes, `changed` counting the rows each pass re-wired.
 `add` is `null` on the `--index` load path, where nothing was inserted; `self_search` appears on at most one step — the last — because it runs once against the finished index, and that step is the index state it ran against.
 Its metrics drop the `self_` prefix because the container already says it, and it carries no `intersection_at_k` or `ndcg_at_k`: identity truth is a single key per query, so neither a set overlap nor a ranked gain says anything beyond `recall_at_1`.
 

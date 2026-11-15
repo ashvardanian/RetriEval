@@ -16,7 +16,9 @@
 //! ```
 //!
 //! This statically links a bundled copy of FAISS — no system `libfaiss` needed.
-//! For dynamic linking against a pre-installed `libfaiss_c`, use `--features faiss-backend` instead.
+//! For dynamic linking against a pre-installed `libfaiss` and `libfaiss_c`, use `--features faiss-backend`
+//! instead, with the installation's `include` on `CPLUS_INCLUDE_PATH` and its `lib` on `LIBRARY_PATH` and
+//! `LD_LIBRARY_PATH`, since `src/faiss.cpp` compiles against FAISS's C++ headers.
 //!
 //! ## Examples
 //!
@@ -30,21 +32,27 @@
 //!     --output results/
 //! ```
 //!
-//! Binary hamming-distance search via BinaryHNSW (1024-bit vectors in `.b1bin`):
+//! Binary hamming-distance search via BinaryHNSW (1024-bit vectors in `.b1bin`), saved, then
+//! searched again with its codes and links memory-mapped:
 //! ```sh
 //! retri-eval-faiss \
 //!     --base-vectors datasets/binary_1M/base.1M.b1bin \
 //!     --query-vectors datasets/binary_1M/query.10K.b1bin \
 //!     --query-neighbors datasets/binary_1M/groundtruth.10K.ibin \
 //!     --data-type b1 \
+//!     --index binary_1M.faiss \
 //!     --output results/binary_1M
+//! retri-eval-faiss ... --data-type b1 --index binary_1M.faiss --mmap
 //! ```
 
 use std::{collections::HashMap, fmt};
 
 use clap::Parser;
 use faiss::{
-    index::io::{read_index, write_index},
+    index::{
+        io::{read_index_binary_with_flags, read_index_with_flags, write_index, write_index_binary},
+        io_flags::IoFlags,
+    },
     Index as _,
 };
 use itertools::iproduct;
@@ -65,7 +73,15 @@ extern "C" {
     ) -> i32;
     fn faiss_ParameterSpace_free(space: *mut std::ffi::c_void);
     fn faiss_get_last_error() -> *const std::ffi::c_char;
+    fn retrieval_faiss_binary_hnsw_set_expansions(
+        index: *mut std::ffi::c_void,
+        expansion_add: i32,
+        expansion_search: i32,
+    ) -> i32;
 }
+
+/// FAISS's `IO_FLAG_MMAP_IFC`, which maps flat codes and HNSW links in place of reading them.
+const IO_FLAG_MMAP_IFC: i32 = 1 << 9;
 
 /// Read the thread-local last-error message populated by `FAISS_TRY` in `faiss/c_api/macros_impl.h`.
 fn faiss_last_error() -> Option<String> {
@@ -167,6 +183,10 @@ struct Cli {
     /// Persisted index: loaded and searched if the path exists, else built and saved; needs a single config
     #[arg(long, env = "RETRIEVAL_INDEX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     index: Option<String>,
+
+    /// Load `--index` memory-mapping its codes and HNSW links, which the page cache then serves
+    #[arg(long, env = "RETRIEVAL_MMAP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
+    mmap: bool,
 }
 
 /// FAISS storage types, as `--data-type` spells them.
@@ -210,14 +230,14 @@ impl fmt::Display for Metric {
 }
 
 fn index_factory_string(data_type: DataType, connectivity: usize) -> String {
-    // `IDMap` persists base rows beside the vectors; faiss-sys 0.7 has no `IDMapBinary`, so binary indexes keep a row table.
+    // `IDMap` persists base rows beside the vectors, binary ones included.
     match data_type {
         DataType::F32 => format!("IDMap,HNSW{connectivity},Flat"),
         DataType::F16 => format!("IDMap,HNSW{connectivity},SQfp16"),
         DataType::Bf16 => format!("IDMap,HNSW{connectivity},SQbf16"),
         DataType::U8 => format!("IDMap,HNSW{connectivity},SQ8_direct"),
         DataType::I8 => format!("IDMap,HNSW{connectivity},SQ8_direct_signed"),
-        DataType::B1 => format!("BHNSW{connectivity}"),
+        DataType::B1 => format!("IDMap,BHNSW{connectivity}"),
     }
 }
 
@@ -228,34 +248,52 @@ fn metric_label_for(metric: faiss::MetricType) -> &'static str {
     }
 }
 
-/// Writes one batch of FAISS answers, `count` per query: labels are base rows on the `IDMap` paths,
-/// and indices into `rows` on the binary path, which has no `IDMap`. Negative labels are misses.
+/// Writes one batch of FAISS answers, `count` per query, whose labels are the base rows `IDMap`
+/// stored. Negative labels are misses.
 fn write_hits<D: Copy>(
     labels: &[faiss::Idx],
     distances: &[D],
-    rows: Option<&[u32]>,
     to_distance: impl Fn(D) -> Distance,
     mut hits: Hits<'_>,
 ) -> Result<(), String> {
     let count = hits.count();
     let answers = labels.chunks_exact(count).zip(distances.chunks_exact(count));
     for ((labels, distances), hit_row) in answers.zip(hits.rows()) {
-        hit_row.write_rows(labels.iter().zip(distances).filter_map(|(label, &distance)| {
-            let label = label.get()? as usize;
-            let row = rows.map_or(label, |rows| rows[label] as usize);
-            Some(Ok((row, to_distance(distance))))
-        }))?;
+        hit_row.write_rows(
+            labels
+                .iter()
+                .zip(distances)
+                .filter_map(|(label, &distance)| Some(Ok((label.get()? as usize, to_distance(distance))))),
+        )?;
     }
     Ok(())
 }
 
 enum FaissIndex {
     Float(faiss::index::IndexImpl),
-    /// Binary HNSW has no `IDMap` analogue in faiss-sys 0.7, so the base rows ride along in insertion order.
-    Binary {
-        index: faiss::index::BinaryIndexImpl,
-        rows: Vec<u32, std::alloc::System>,
-    },
+    Binary(faiss::index::BinaryIndexImpl),
+}
+
+/// Sets the construction and search expansions of the binary HNSW `index` wraps, each when nonzero,
+/// which neither FAISS's C API nor its ParameterSpace reaches.
+fn set_binary_expansions(
+    index: &faiss::index::BinaryIndexImpl,
+    expansion_add: usize,
+    expansion_search: usize,
+) -> Result<(), String> {
+    let expansion = |value: usize| i32::try_from(value).map_err(|_| format!("expansion {value} passes i32"));
+    // SAFETY: the pointer is the live `faiss::IndexBinary` behind `index`.
+    let return_code = unsafe {
+        retrieval_faiss_binary_hnsw_set_expansions(
+            index.inner_ptr() as *mut std::ffi::c_void,
+            expansion(expansion_add)?,
+            expansion(expansion_search)?,
+        )
+    };
+    match return_code {
+        0 => Ok(()),
+        _ => Err("FAISS binary index holds no HNSW to set expansions on".into()),
+    }
 }
 
 struct FaissBackend {
@@ -282,10 +320,8 @@ impl FaissBackend {
             DataType::B1 => {
                 let index = faiss::index::index_binary_factory(dimensions, &factory)
                     .map_err(|error| format!("failed to create FAISS binary index: {error}"))?;
-                let rows = Vec::new_in(std::alloc::System);
-                // Binary HNSW has no dispatcher in `faiss/AutoTune.cpp`, so `IndexBinaryHNSW` keeps
-                // its compile-time efConstruction and efSearch, which the report records.
-                ("hamming", FaissIndex::Binary { index, rows }, (40, 16))
+                set_binary_expansions(&index, expansion_add, expansion_search)?;
+                ("hamming", FaissIndex::Binary(index), (expansion_add, expansion_search))
             }
             _ => {
                 let index = faiss::index::index_factory(dimensions, &factory, metric.into())
@@ -311,26 +347,42 @@ impl FaissBackend {
         Ok(Self::wrap(index, threads, metadata))
     }
 
-    /// Opens a saved float (`IDMap,…`) index; faiss-sys 0.7 binds no HNSW introspection, so the
-    /// build-time settings are reported as null, and binary HNSW cannot be saved at all.
-    pub fn load(path: &str, expansion_search: usize, threads: Threads) -> Result<Self, String> {
-        let index = read_index(path).map_err(|error| {
-            format!(
-                "FAISS read_index({path}): {error}\n  \
-                 (binary `--data-type b1` indexes can't be loaded yet — \
-                 faiss-sys 0.7 doesn't bind IndexBinaryIDMap)"
-            )
-        })?;
-        tune(&index, &format!("efSearch={expansion_search}"))?;
+    /// Opens a saved `IDMap,…` index, binary when `data_type` is; faiss-sys 0.7 binds no HNSW
+    /// introspection, so the build-time settings are reported as null. `mmap` maps the flat codes
+    /// and the HNSW links instead of reading them, while the node levels, offsets and the `IDMap`
+    /// rows are still read onto the heap.
+    pub fn load(
+        path: &str,
+        data_type: DataType,
+        expansion_search: usize,
+        threads: Threads,
+        mmap: bool,
+    ) -> Result<Self, String> {
+        let flags = IoFlags::from(if mmap { IO_FLAG_MMAP_IFC } else { 0 });
+        let (metric_label, index) = match data_type {
+            DataType::B1 => {
+                let index = read_index_binary_with_flags(path, flags)
+                    .map_err(|error| format!("FAISS read_index_binary({path}): {error}"))?;
+                set_binary_expansions(&index, 0, expansion_search)?;
+                ("hamming", FaissIndex::Binary(index))
+            }
+            _ => {
+                let index =
+                    read_index_with_flags(path, flags).map_err(|error| format!("FAISS read_index({path}): {error}"))?;
+                tune(&index, &format!("efSearch={expansion_search}"))?;
+                (metric_label_for(index.metric_type()), FaissIndex::Float(index))
+            }
+        };
         let metadata = HashMap::from([
-            ("metric".into(), json!(metric_label_for(index.metric_type()))),
+            ("metric".into(), json!(metric_label)),
             ("expansion_search".into(), json!(expansion_search)),
             ("loaded_from".into(), json!(path)),
-            ("data_type".into(), Value::Null),
+            ("mmap".into(), json!(mmap)),
+            ("data_type".into(), json!(data_type.to_string())),
             ("connectivity".into(), Value::Null),
             ("expansion_add".into(), Value::Null),
         ]);
-        Ok(Self::wrap(FaissIndex::Float(index), threads, metadata))
+        Ok(Self::wrap(index, threads, metadata))
     }
 
     fn wrap(index: FaissIndex, threads: Threads, mut metadata: HashMap<String, Value>) -> Self {
@@ -370,16 +422,15 @@ impl Backend for FaissBackend {
                     .add_with_ids(data, &self.ids)
                     .map_err(|error| format!("FAISS add_with_ids failed: {error}"))
             }
-            FaissIndex::Binary { index, rows } => {
+            FaissIndex::Binary(index) => {
                 let VectorSlice::B1x8(bytes) = vectors.values() else {
                     return Err("FAISS binary index requires B1x8 data".into());
                 };
-                for row in keys.rows() {
-                    rows.push(u32::try_from(row).map_err(|_| "FAISS binary rows end at 2^32".to_string())?);
-                }
+                self.ids.clear();
+                self.ids.extend(keys.rows().map(|row| faiss::Idx::new(row as u64)));
                 index
-                    .add(bytes)
-                    .map_err(|error| format!("FAISS binary add failed: {error}"))
+                    .add_with_ids(bytes, &self.ids)
+                    .map_err(|error| format!("FAISS binary add_with_ids failed: {error}"))
             }
         }
     }
@@ -392,22 +443,16 @@ impl Backend for FaissBackend {
                 let result = index
                     .search(data, count)
                     .map_err(|error| format!("FAISS search failed: {error}"))?;
-                write_hits(&result.labels, &result.distances, None, |distance| distance, hits)
+                write_hits(&result.labels, &result.distances, |distance| distance, hits)
             }
-            FaissIndex::Binary { index, rows } => {
+            FaissIndex::Binary(index) => {
                 let VectorSlice::B1x8(bytes) = queries.values() else {
                     return Err("FAISS binary index requires B1x8 data".into());
                 };
                 let result = index
                     .search(bytes, count)
                     .map_err(|error| format!("FAISS binary search failed: {error}"))?;
-                write_hits(
-                    &result.labels,
-                    &result.distances,
-                    Some(rows),
-                    |distance| distance as Distance,
-                    hits,
-                )
+                write_hits(&result.labels, &result.distances, |distance| distance as Distance, hits)
             }
         }
     }
@@ -421,9 +466,9 @@ impl Backend for FaissBackend {
             FaissIndex::Float(index) => {
                 write_index(index, path).map_err(|error| format!("FAISS write_index({path}): {error}"))
             }
-            FaissIndex::Binary { .. } => Err("FAISS binary HNSW save is not supported — faiss-sys 0.7 doesn't bind \
-                 IndexBinaryIDMap, so its row table can't be persisted natively"
-                .into()),
+            FaissIndex::Binary(index) => {
+                write_index_binary(index, path).map_err(|error| format!("FAISS write_index_binary({path}): {error}"))
+            }
         }
     }
 }
@@ -458,6 +503,7 @@ fn main() {
     eprintln!("- Expansion add: {}", spell_list(&cli.expansion_add));
     eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
     eprintln!("- Threads: {}", cli.threads);
+    eprintln!("- Memory-mapped: {}", cli.mmap);
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
     let configs = iproduct!(
         &dimensions_sweep,
@@ -477,7 +523,7 @@ fn main() {
             cli.threads
         );
         let backend = match index_file {
-            IndexFile::Load(path) => FaissBackend::load(path, expansion_search, cli.threads),
+            IndexFile::Load(path) => FaissBackend::load(path, data_type, expansion_search, cli.threads, cli.mmap),
             IndexFile::None | IndexFile::Save(_) => FaissBackend::new(
                 IndexConfig {
                     dimensions,

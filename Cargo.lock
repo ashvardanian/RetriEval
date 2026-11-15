@@ -2370,6 +2370,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "forkunion"
 version = "4.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/ForkUnion#ce67be6511ce8cfc4b139b3e7266ec0e5edc372c"
 dependencies = [
  "cmake",
 ]
@@ -4610,6 +4611,7 @@ dependencies = [
 [[package]]
 name = "numkong"
 version = "8.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/NumKong#8870e51d68b11d5a713ce5d647df98d8960f542d"
 dependencies = [
  "cmake",
  "forkunion",
@@ -5623,6 +5625,7 @@ dependencies = [
  "arrow-schema",
  "bollard",
  "bytes",
+ "cc",
  "clap",
  "cuvs",
  "cuvs-sys",
@@ -6182,6 +6185,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 [[package]]
 name = "smashtable"
 version = "1.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/SmashTable#30e349dcd1e582896386d959d4a36badce061787"
 
 [[package]]
 name = "snafu"
@@ -6298,6 +6302,7 @@ dependencies = [
 [[package]]
 name = "stringzilla"
 version = "6.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/StringZilla#ff22abca2e1f271f37bd8cb10174bc9dd37ed4e7"
 dependencies = [
  "cmake",
 ]
@@ -7119,6 +7124,7 @@ dependencies = [
 [[package]]
 name = "usearch"
 version = "3.0.0-rc.1"
+source = "git+https://github.com/unum-cloud/USearch#840374af1a1dd5d411826bc62fdfe5ef6e41e1de"
 dependencies = [
  "cmake",
  "forkunion",

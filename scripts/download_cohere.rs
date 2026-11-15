@@ -369,11 +369,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     write_sampled_ground_truth(
-        &Dataset::load(&base_path)?,
+        Dataset::load(&base_path)?,
         cli.query_count,
         cli.top_k,
         cli.seed,
         cli.threads,
+        false,
         &cli.output,
     )?;
     eprintln!(

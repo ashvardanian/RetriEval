@@ -158,7 +158,23 @@ retri-eval-usearch \
 ## Microsoft SpaceV
 
 [SpaceV][msft-spacev] holds web-search embeddings already quantised to int8 at the source.
-A 100M subset is mirrored on Hugging Face; the original 1B lives on AWS S3.
+Subsets are prefixes of the official 1B file, sliced the same way as SIFT.
+BigANN publishes exact L2 top-100 ground truth for the 10M and 100M prefixes and the full 1B set, for the same 29,316 queries, with distances after the IDs.
+
+<details>
+<summary>10M — i8, 100d, L2, ~0.9 GB</summary>
+
+```sh
+scripts/download.sh spacev-10m
+retri-eval-usearch \
+    --base-vectors data/spacev-10m/base.10M.i8bin \
+    --query-vectors data/spacev-10m/query.30K.i8bin \
+    --query-neighbors data/spacev-10m/groundtruth.30K.ibin \
+    --data-type i8 --metric l2 \
+    --output results/spacev-10m
+```
+
+</details>
 
 <details>
 <summary>100M — i8, 100d, L2, ~9.3 GB</summary>
@@ -168,9 +184,18 @@ scripts/download.sh spacev-100m
 retri-eval-usearch \
     --base-vectors data/spacev-100m/base.100M.i8bin \
     --query-vectors data/spacev-100m/query.30K.i8bin \
-    --query-neighbors data/spacev-100m/groundtruth.30K.i32bin \
-    --data-type bf16,f16,i8 --metric l2 \
+    --query-neighbors data/spacev-100m/groundtruth.30K.ibin \
+    --data-type i8 --metric l2 \
     --steps 20 --output results/spacev-100m
+```
+
+</details>
+
+<details>
+<summary>1B — i8, 100d, L2, ~93 GB</summary>
+
+```sh
+scripts/download.sh spacev-1b
 ```
 
 </details>
@@ -178,8 +203,38 @@ retri-eval-usearch \
 ## Yandex Deep
 
 [Deep][yandex-deep] holds image embeddings extracted from the GoogLeNet penultimate layer.
-Only the full 1B is included here, as the smaller subsets repeat the same distribution at scales other datasets already cover.
-Its ground truth is published against the full 1B only, so a slice can be judged only by `--self-search`.
+Subsets are prefixes of the 1B file, sliced the same way as SIFT.
+BigANN publishes exact L2 top-100 ground truth for the 10M and 100M prefixes and the full 1B set, for the same 10K queries.
+
+<details>
+<summary>10M — f32, 96d, L2, ~3.6 GB</summary>
+
+```sh
+scripts/download.sh deep-10m
+retri-eval-usearch \
+    --base-vectors data/deep-10m/base.10M.fbin \
+    --query-vectors data/deep-10m/query.public.10K.fbin \
+    --query-neighbors data/deep-10m/groundtruth.public.10K.ibin \
+    --data-type bf16 --metric l2 \
+    --output results/deep-10m
+```
+
+</details>
+
+<details>
+<summary>100M — f32, 96d, L2, ~36 GB</summary>
+
+```sh
+scripts/download.sh deep-100m
+retri-eval-usearch \
+    --base-vectors data/deep-100m/base.100M.fbin \
+    --query-vectors data/deep-100m/query.public.10K.fbin \
+    --query-neighbors data/deep-100m/groundtruth.public.10K.ibin \
+    --data-type bf16 --metric l2 \
+    --steps 20 --output results/deep-100m
+```
+
+</details>
 
 <details>
 <summary>1B — f32, 96d, L2, ~358 GB</summary>
@@ -205,6 +260,40 @@ retri-eval-usearch \
     --query-neighbors data/t2i-1m/groundtruth.public.100K.ibin \
     --data-type bf16,f16,i8 --metric cos \
     --output results/t2i-1m
+```
+
+</details>
+
+The 10M and 100M subsets are prefixes of the 1B file, sliced the same way as SIFT.
+BigANN publishes exact inner-product top-100 ground truth for those prefixes, for the same 100K public queries, so the commands below use `--metric ip`.
+The queries come from the text encoder and the base from the image encoder, so they are out of distribution relative to each other.
+
+<details>
+<summary>10M — f32, 200d, IP, ~7.5 GB</summary>
+
+```sh
+scripts/download.sh t2i-10m
+retri-eval-usearch \
+    --base-vectors data/t2i-10m/base.10M.fbin \
+    --query-vectors data/t2i-10m/query.public.100K.fbin \
+    --query-neighbors data/t2i-10m/groundtruth.public.100K.ibin \
+    --data-type bf16 --metric ip \
+    --output results/t2i-10m
+```
+
+</details>
+
+<details>
+<summary>100M — f32, 200d, IP, ~75 GB</summary>
+
+```sh
+scripts/download.sh t2i-100m
+retri-eval-usearch \
+    --base-vectors data/t2i-100m/base.100M.fbin \
+    --query-vectors data/t2i-100m/query.public.100K.fbin \
+    --query-neighbors data/t2i-100m/groundtruth.public.100K.ibin \
+    --data-type bf16 --metric ip \
+    --steps 20 --output results/t2i-100m
 ```
 
 </details>

@@ -75,7 +75,7 @@ use serde_json::json;
 
 use retrieval::{
     run_config, spell_list, Backend, BatchKeys, BenchState, CastScratch, CommonArgs, Distance, Hits, IndexConfig,
-    IndexFile, SweepSummary, UnwrapOrBail, Vectors,
+    IndexFile, StepRefineEntry, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 // #region CudaAllocator
@@ -939,6 +939,12 @@ impl Backend for CuvsBackend {
             }))?;
         }
         Ok(())
+    }
+
+    /// Builds the graph after the last insert step, so `--index` saves it before the search.
+    fn finish(&mut self) -> Result<Option<StepRefineEntry>, String> {
+        self.build_index()?;
+        Ok(None)
     }
 
     /// The host-row sidecar has one entry per indexed vector, on both the

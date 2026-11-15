@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 
 bigann=https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks
 turing=https://comp21storage.z5.web.core.windows.net/comp21/MSFT-TURING-ANNS
+spacev=https://comp21storage.z5.web.core.windows.net/comp21/spacev1b
 yandex=https://storage.yandexcloud.net/yandex-research/ann-datasets
 hugging=https://huggingface.co/datasets/unum-cloud
 
@@ -50,15 +51,33 @@ turing-1m | turing-10m | turing-100m)
     fetch "$turing/msturing-gt-$scale" groundtruth.public.100K.ibin
     slice "$turing/base1b.fbin" "$rows" 400 "base.$scale.fbin"
     ;;
-spacev-100m)
-    fetch "$hugging/ann-spacev-100m/resolve/main/base.100M.i8bin" base.100M.i8bin
-    fetch "$hugging/ann-spacev-100m/resolve/main/query.30K.i8bin" query.30K.i8bin
-    fetch "$hugging/ann-spacev-100m/resolve/main/groundtruth.30K.i32bin" groundtruth.30K.i32bin
+spacev-10m | spacev-100m)
+    case "$name" in spacev-10m) rows=10000000 scale=10M ;; *) rows=100000000 scale=100M ;; esac
+    fetch "$spacev/query.i8bin" query.30K.i8bin
+    fetch "$bigann/GT_$scale/msspacev-$scale" groundtruth.30K.ibin
+    slice "$spacev/spacev1b_base.i8bin" "$rows" 100 "base.$scale.i8bin"
+    ;;
+spacev-1b)
+    fetch "$spacev/spacev1b_base.i8bin" base.1B.i8bin
+    fetch "$spacev/query.i8bin" query.30K.i8bin
+    fetch "$spacev/public_query_gt100.bin" groundtruth.30K.ibin
+    ;;
+deep-10m | deep-100m)
+    case "$name" in deep-10m) rows=10000000 scale=10M ;; *) rows=100000000 scale=100M ;; esac
+    fetch "$yandex/DEEP/query.public.10K.fbin" query.public.10K.fbin
+    fetch "$bigann/GT_$scale/deep-$scale" groundtruth.public.10K.ibin
+    slice "$yandex/DEEP/base.1B.fbin" "$rows" 384 "base.$scale.fbin"
     ;;
 deep-1b)
     fetch "$yandex/DEEP/base.1B.fbin" base.1B.fbin
     fetch "$yandex/DEEP/query.public.10K.fbin" query.public.10K.fbin
     fetch "$yandex/DEEP/groundtruth.public.10K.ibin" groundtruth.public.10K.ibin
+    ;;
+t2i-10m | t2i-100m)
+    case "$name" in t2i-10m) rows=10000000 scale=10M ;; *) rows=100000000 scale=100M ;; esac
+    fetch "$yandex/T2I/query.public.100K.fbin" query.public.100K.fbin
+    fetch "$bigann/GT_$scale/text2image-$scale" groundtruth.public.100K.ibin
+    slice "$yandex/T2I/base.1B.fbin" "$rows" 800 "base.$scale.fbin"
     ;;
 t2i-1m | t2i-1b)
     case "$name" in t2i-1m) base=base.1M.fbin ;; *) base=base.1B.fbin ;; esac

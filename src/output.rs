@@ -125,6 +125,9 @@ pub struct StepEntry {
     /// This harness process's anonymous resident bytes, which hold any in-process engine whole.
     pub process_anon_bytes: u64,
     pub add: Option<StepAddEntry>,
+    /// Refinement passes run after this step's inserts, before its searches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refine: Option<StepRefineEntry>,
     pub ground_truth_search: Option<StepSearchEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_search: Option<StepSearchEntry>,
@@ -140,6 +143,14 @@ pub struct StepAddEntry {
     pub counters: Option<CounterSample>,
 }
 
+/// The refinement half of a step: passes, their seconds, and the rows each pass re-wired.
+#[derive(Debug, Serialize)]
+pub struct StepRefineEntry {
+    pub passes: usize,
+    pub elapsed: f64,
+    pub changed: Vec<u64>,
+}
+
 /// One pass of a query set against the index, timed and scored. The same shape
 /// serves the supplied ground truth and the self-search, which differ only in
 /// where their truth comes from.
@@ -152,22 +163,19 @@ pub struct StepSearchEntry {
     pub top_k: usize,
     pub elapsed: f64,
     pub throughput: u64,
-    /// Rank-1 truth found anywhere in the top-k: FAISS's `OneRecallAtRCriterion`,
-    /// USearch's `mean_recall`. Saturates as k grows — `intersection_at_k` is the
-    /// discriminating measure at large k.
+    /// The first answer within the true nearest distance: 1-recall@1.
     pub recall_at_1: f64,
+    /// Any of the top-k within the true nearest distance, 1-recall@k: FAISS's
+    /// `OneRecallAtRCriterion`, USearch's `mean_recall`. Saturates as k grows —
+    /// `intersection_at_k` is the discriminating measure at large k.
     pub recall_at_k: f64,
-    /// Set overlap `|top-k ∩ truth-k| / k`, order-independent — what
+    /// The share of the top-k within the k-th true distance, k-recall@k, order-independent — what
     /// ann-benchmarks and cuVS publish as recall. Absent for a self-search,
     /// whose truth set is a single key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intersection_at_k: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ndcg_at_k: Option<f64>,
-    /// The share of the top-k within the k-th true distance, crediting ties the truth broke by key;
-    /// present when the ground truth stores distances and the backend's agree with them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub distance_recall_at_k: Option<f64>,
     /// Hardware counters summed across all online CPUs, present only with `--features
     /// perf-counters` on Linux and `CAP_PERFMON` or `kernel.perf_event_paranoid <= 1`.
     #[serde(flatten)]

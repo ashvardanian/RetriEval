@@ -51,6 +51,22 @@
 //!     --output results/turing_100M
 //! ```
 //!
+//! PubChem built in RAM, refined twice, saved and searched as an NVMe view:
+//! ```sh
+//! retri-eval-usearch \
+//!     --base-vectors datasets/pubchem/base.b1bin \
+//!     --query-vectors datasets/pubchem/query.10K.b1bin \
+//!     --query-neighbors datasets/pubchem/groundtruth.10K.ibin \
+//!     --data-type b1 \
+//!     --metric jaccard \
+//!     --steps 1 \
+//!     --refines 2 \
+//!     --residency nvme \
+//!     --nvme-paths /mnt/nvme0 \
+//!     --index /mnt/nvme0/pubchem.safegraphs.json \
+//!     --output results/pubchem
+//! ```
+//!
 //! Binary 1M Hamming-distance search (1024-bit vectors in `.b1bin` format):
 //! ```sh
 //! retri-eval-usearch \
@@ -62,19 +78,24 @@
 //!     --output results/binary_1M
 //! ```
 
-use std::{collections::HashMap, fmt::Write};
+use std::{
+    collections::HashMap,
+    fmt::Write,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use clap::Parser;
 use numkong as nk;
 use serde_json::{json, Value};
 use usearch::{
-    Arena, DenseIndex, DenseInsertConfig, DenseLoadRamConfig, DenseMetric, DenseOptions, DenseSearchConfig, DenseVerbs,
-    Element, Executor, Scalar,
+    Arena, DenseIndex, DenseInsertConfig, DenseLoadRamConfig, DenseLoadVramConfig, DenseMetric, DenseOptions,
+    DenseRefineConfig, DenseSearchConfig, DenseVerbs, DenseViewNvmeConfig, Element, Executor, Scalar,
 };
 
 use retrieval::{
     run_config, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key,
-    SweepSummary, Threads, UnwrapOrBail, Vectors,
+    StepRefineEntry, SweepSummary, Threads, UnwrapOrBail, Vectors,
 };
 
 #[derive(Parser, Debug)]
@@ -119,6 +140,23 @@ struct Cli {
     #[arg(long, env = "RETRIEVAL_MEMORY_DOMAINS", value_delimiter = ',')]
     memory_domains: Vec<i32>,
 
+    /// Where the index serves searches from: built in RAM or VRAM, or built in RAM, saved to
+    /// `--index` and searched as an NVMe view on the last step
+    #[arg(long, env = "RETRIEVAL_RESIDENCY", value_enum, default_value = "ram")]
+    residency: Residency,
+
+    /// Single-pass refinements run after the last insert step, before its search
+    #[arg(long, env = "RETRIEVAL_REFINES", default_value_t = 0)]
+    refines: usize,
+
+    /// Devices or directories an NVMe view serves its parts from; empty serves them where `--index` points
+    #[arg(long, env = "RETRIEVAL_NVME_PATHS", value_delimiter = ',')]
+    nvme_paths: Vec<PathBuf>,
+
+    /// GPU ordinals to place one shard on apiece; empty derives one free device
+    #[arg(long, env = "RETRIEVAL_DEVICES", value_delimiter = ',')]
+    devices: Vec<i32>,
+
     /// Number of threads, 0 for all cores (comma-separated for sweep)
     #[arg(long, env = "RETRIEVAL_THREADS", value_delimiter = ',', default_value = "0", value_parser = retrieval::parse_threads_flag)]
     threads: Vec<Threads>,
@@ -158,6 +196,14 @@ impl From<DataType> for Scalar {
     }
 }
 
+/// Where the index serves searches from, as `--residency` spells it.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Residency {
+    Ram,
+    Vram,
+    Nvme,
+}
+
 /// Metrics, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
@@ -187,6 +233,12 @@ impl std::fmt::Display for DataType {
     }
 }
 
+impl std::fmt::Display for Residency {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        retrieval::spell_value(self, formatter)
+    }
+}
+
 impl std::fmt::Display for Metric {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         retrieval::spell_value(self, formatter)
@@ -195,13 +247,26 @@ impl std::fmt::Display for Metric {
 
 // #region Backend
 
-pub struct USearchBackend {
+/// Where every config of a sweep places its index and how its build finishes, as the flags say.
+#[derive(Clone, Copy)]
+pub struct Placement<'cli> {
+    residency: Residency,
+    memory_domains: &'cli [i32],
+    devices: &'cli [i32],
+    nvme_paths: &'cli [PathBuf],
+    refines: usize,
+    /// The `--index` path an NVMe view is saved to and served from.
+    checkpoint: Option<&'cli str>,
+}
+
+pub struct USearchBackend<'cli> {
     index: DenseIndex,
     executor: Executor,
     arena: Arena,
     keys: Vec<usearch::Key>,
     expansion_add: usize,
     expansion_search: usize,
+    placement: Placement<'cli>,
     metadata: HashMap<String, Value>,
 }
 
@@ -209,11 +274,29 @@ fn failed(verb: &'static str) -> impl Fn(usearch::Error) -> String {
     move |error| format!("USearch {verb} failed with {}: {error}", error.status)
 }
 
-impl USearchBackend {
+/// Opens the checkpoint at `path` as a view served from `nvme_paths`, on an NVMe executor of its own.
+fn view_nvme(path: &str, nvme_paths: &[PathBuf]) -> Result<(DenseIndex, Executor), String> {
+    let served: Vec<&Path> = nvme_paths.iter().map(PathBuf::as_path).collect();
+    let rings = if served.is_empty() {
+        vec![Path::new(path)]
+    } else {
+        served.clone()
+    };
+    let executor = Executor::for_nvme(&rings, None, 0).map_err(failed("for_nvme"))?;
+    let index = DenseIndex::view_nvme(DenseViewNvmeConfig {
+        executor: Some(&executor),
+        paths: &served,
+        ..DenseViewNvmeConfig::from(path)
+    })
+    .map_err(failed("view_nvme"))?;
+    Ok((index, executor))
+}
+
+impl<'cli> USearchBackend<'cli> {
     pub fn new(
         config: IndexConfig<DataType, Metric>,
         threads: Threads,
-        memory_domains: &[i32],
+        placement: Placement<'cli>,
     ) -> Result<Self, String> {
         let options = DenseOptions {
             dimensions: config.dimensions,
@@ -222,29 +305,61 @@ impl USearchBackend {
             connectivity: config.connectivity,
             ..DenseOptions::default()
         };
-        let index = DenseIndex::init_ram(&options, memory_domains).map_err(failed("init_ram"))?;
-        let executor = Executor::for_ram(memory_domains, None, threads.0.get()).map_err(failed("for_ram"))?;
+        // An NVMe view is built in RAM, then saved and reopened once the inserts finish.
+        let (index, executor) = match placement.residency {
+            Residency::Vram => (
+                DenseIndex::init_vram(&options, placement.devices).map_err(failed("init_vram"))?,
+                Executor::for_vram(placement.devices, None, 0).map_err(failed("for_vram"))?,
+            ),
+            Residency::Ram | Residency::Nvme => (
+                DenseIndex::init_ram(&options, placement.memory_domains).map_err(failed("init_ram"))?,
+                Executor::for_ram(placement.memory_domains, None, threads.0.get()).map_err(failed("for_ram"))?,
+            ),
+        };
         Self::wrap(
             index,
             executor,
             config.expansion_add,
             config.expansion_search,
             threads,
-            memory_domains,
+            placement,
         )
     }
 
-    /// Opens a saved `.safegraphs` monolith or `.safegraphs.json` manifest, whose header carries the
-    /// geometry, metric, quantization and connectivity; only the search expansion is the caller's.
-    pub fn load(path: &str, expansion_search: usize, threads: Threads, memory_domains: &[i32]) -> Result<Self, String> {
-        let executor = Executor::for_ram(memory_domains, None, threads.0.get()).map_err(failed("for_ram"))?;
-        let index = DenseIndex::load_ram(DenseLoadRamConfig {
-            executor: Some(&executor),
-            memory_domains,
-            ..DenseLoadRamConfig::from(path)
-        })
-        .map_err(failed("load_ram"))?;
-        let mut backend = Self::wrap(index, executor, 0, expansion_search, threads, memory_domains)?;
+    /// Opens a saved `.safegraphs` monolith or `.safegraphs.json` manifest in the placement's
+    /// residency, its header carrying the geometry, metric, quantization and connectivity; only the
+    /// search expansion is the caller's.
+    pub fn load(
+        path: &str,
+        expansion_search: usize,
+        threads: Threads,
+        placement: Placement<'cli>,
+    ) -> Result<Self, String> {
+        let (index, executor) = match placement.residency {
+            Residency::Ram => {
+                let executor =
+                    Executor::for_ram(placement.memory_domains, None, threads.0.get()).map_err(failed("for_ram"))?;
+                let index = DenseIndex::load_ram(DenseLoadRamConfig {
+                    executor: Some(&executor),
+                    memory_domains: placement.memory_domains,
+                    ..DenseLoadRamConfig::from(path)
+                })
+                .map_err(failed("load_ram"))?;
+                (index, executor)
+            }
+            Residency::Vram => {
+                let executor = Executor::for_vram(placement.devices, None, 0).map_err(failed("for_vram"))?;
+                let index = DenseIndex::load_vram(DenseLoadVramConfig {
+                    executor: Some(&executor),
+                    devices: placement.devices,
+                    ..DenseLoadVramConfig::from(path)
+                })
+                .map_err(failed("load_vram"))?;
+                (index, executor)
+            }
+            Residency::Nvme => view_nvme(path, placement.nvme_paths)?,
+        };
+        let mut backend = Self::wrap(index, executor, 0, expansion_search, threads, placement)?;
         backend.metadata.insert("loaded_from".into(), json!(path));
         Ok(backend)
     }
@@ -255,7 +370,7 @@ impl USearchBackend {
         expansion_add: usize,
         expansion_search: usize,
         threads: Threads,
-        memory_domains: &[i32],
+        placement: Placement<'cli>,
     ) -> Result<Self, String> {
         let described = index.describe().map_err(failed("describe"))?;
         let metadata = described.metadata;
@@ -273,7 +388,9 @@ impl USearchBackend {
             ("expansion_add".into(), json!(expansion_add)),
             ("expansion_search".into(), json!(expansion_search)),
             ("threads".into(), json!(threads.0.get())),
-            ("memory_domains".into(), json!(memory_domains)),
+            ("memory_domains".into(), json!(placement.memory_domains)),
+            ("residency".into(), json!(placement.residency.to_string())),
+            ("refines".into(), json!(placement.refines)),
         ]);
         Ok(Self {
             arena: Arena::new_in(&executor).map_err(failed("arena"))?,
@@ -282,6 +399,7 @@ impl USearchBackend {
             keys: Vec::new(),
             expansion_add,
             expansion_search,
+            placement,
             metadata,
         })
     }
@@ -297,7 +415,7 @@ impl USearchBackend {
     }
 }
 
-impl Backend for USearchBackend {
+impl Backend for USearchBackend<'_> {
     fn metadata(&self) -> HashMap<String, Value> {
         self.metadata.clone()
     }
@@ -347,11 +465,51 @@ impl Backend for USearchBackend {
         self.index.describe().map_or(0, |described| described.memory_usage)
     }
 
+    fn finish(&mut self) -> Result<Option<StepRefineEntry>, String> {
+        let refine = match self.placement.refines {
+            0 => None,
+            passes => {
+                let started = Instant::now();
+                let mut changed = Vec::with_capacity(passes);
+                for _ in 0..passes {
+                    let report = self
+                        .index
+                        .on(&self.executor)
+                        .refine(DenseRefineConfig::default())
+                        .map_err(failed("refine"))?;
+                    changed.push(report.changed as u64);
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                eprintln!("  refine: {passes} passes in {elapsed:.2} s, changed {changed:?}");
+                Some(StepRefineEntry {
+                    passes,
+                    elapsed,
+                    changed,
+                })
+            }
+        };
+        if self.placement.residency == Residency::Nvme {
+            let path = self
+                .placement
+                .checkpoint
+                .ok_or("--residency nvme saves its view to --index")?;
+            self.index.on(&self.executor).save(path).map_err(failed("save"))?;
+            let (index, executor) = view_nvme(path, self.placement.nvme_paths)?;
+            self.arena = Arena::new_in(&executor).map_err(failed("arena"))?;
+            (self.index, self.executor) = (index, executor);
+        }
+        Ok(refine)
+    }
+
     fn indexed_count(&self) -> Option<usize> {
         self.index.describe().ok().map(|described| described.size)
     }
 
     fn save(&self, path: &str) -> Result<(), String> {
+        // A view already is the checkpoint `finish` saved.
+        if self.placement.residency == Residency::Nvme {
+            return Ok(());
+        }
         self.index.on(&self.executor).save(path).map_err(failed("save"))
     }
 }
@@ -373,6 +531,19 @@ fn main() {
     eprintln!("- Expansion search: {}", spell_list(&cli.expansion_search));
     eprintln!("- Memory domains: {}", spell_list(&cli.memory_domains));
     eprintln!("- Threads: {}", spell_list(&cli.threads));
+    eprintln!("- Residency: {}", cli.residency);
+    eprintln!("- Refines: {}", cli.refines);
+    if cli.residency == Residency::Nvme && cli.index.is_none() {
+        retrieval::bail("--residency nvme saves and serves its view at --index");
+    }
+    let placement = Placement {
+        residency: cli.residency,
+        memory_domains: &cli.memory_domains,
+        devices: &cli.devices,
+        nvme_paths: &cli.nvme_paths,
+        refines: cli.refines,
+        checkpoint: cli.index.as_deref(),
+    };
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
     let configs = itertools::iproduct!(
         &dimensions_sweep,
@@ -394,8 +565,9 @@ fn main() {
         if !cli.memory_domains.is_empty() {
             write!(description, " · domains {}", spell_list(&cli.memory_domains)).expect("a String takes any write");
         }
+        write!(description, " · {}", cli.residency).expect("a String takes any write");
         let backend = match index_file {
-            IndexFile::Load(path) => USearchBackend::load(path, expansion_search, threads, &cli.memory_domains),
+            IndexFile::Load(path) => USearchBackend::load(path, expansion_search, threads, placement),
             IndexFile::None | IndexFile::Save(_) => USearchBackend::new(
                 IndexConfig {
                     dimensions,
@@ -406,7 +578,7 @@ fn main() {
                     expansion_search,
                 },
                 threads,
-                &cli.memory_domains,
+                placement,
             ),
         };
         summary.record(run_config(&description, index_file, backend, &mut state, dimensions));

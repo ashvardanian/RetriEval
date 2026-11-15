@@ -144,3 +144,64 @@ impl PackedDistance for f32 {
         "l2"
     }
 }
+
+// #region Euclidean L2 (i8, u8 → f32)
+
+impl PackedDistance for i8 {
+    type Distance = f32;
+    /// `f32::to_bits()` rises with the value over the non-negative finite distances the kernel produces.
+    type OrderingKey = u32;
+    const WORST_KEY: u32 = u32::MAX;
+
+    #[inline(always)]
+    fn ordering_key(distance: f32) -> u32 {
+        distance.to_bits()
+    }
+
+    fn stored_distance(key: u32) -> f32 {
+        let distance = f32::from_bits(key);
+        distance * distance
+    }
+
+    fn distances_parallel_into(
+        queries: &MatrixView<'_, Self>,
+        packed_base: &DotsPackedMatrix<Self>,
+        out: &mut MatrixSpan<'_, f32>,
+        pool: &mut fu::ThreadPool,
+    ) -> Result<(), Error> {
+        queries.euclideans_packed_parallel_into(packed_base, out, pool)
+    }
+
+    fn metric_name() -> &'static str {
+        "l2"
+    }
+}
+
+impl PackedDistance for u8 {
+    type Distance = f32;
+    type OrderingKey = u32;
+    const WORST_KEY: u32 = u32::MAX;
+
+    #[inline(always)]
+    fn ordering_key(distance: f32) -> u32 {
+        distance.to_bits()
+    }
+
+    fn stored_distance(key: u32) -> f32 {
+        let distance = f32::from_bits(key);
+        distance * distance
+    }
+
+    fn distances_parallel_into(
+        queries: &MatrixView<'_, Self>,
+        packed_base: &DotsPackedMatrix<Self>,
+        out: &mut MatrixSpan<'_, f32>,
+        pool: &mut fu::ThreadPool,
+    ) -> Result<(), Error> {
+        queries.euclideans_packed_parallel_into(packed_base, out, pool)
+    }
+
+    fn metric_name() -> &'static str {
+        "l2"
+    }
+}
