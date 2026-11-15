@@ -40,16 +40,18 @@ const INDEX: &str = "bench_hnsw";
 /// SurrealDB HNSW distances, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
-    L2,
-    Cos,
+    #[value(alias = "l2")]
+    Euclidean,
+    #[value(alias = "cos")]
+    Angular,
 }
 
 impl Metric {
     /// The `DEFINE INDEX ... HNSW DIST` token.
     fn token(self) -> &'static str {
         match self {
-            Self::L2 => "EUCLIDEAN",
-            Self::Cos => "COSINE",
+            Self::Euclidean => "EUCLIDEAN",
+            Self::Angular => "COSINE",
         }
     }
 }
@@ -72,7 +74,7 @@ struct Cli {
         env = "RETRIEVAL_METRIC",
         value_delimiter = ',',
         value_enum,
-        default_value = "l2"
+        default_value = "euclidean"
     )]
     metric: Vec<Metric>,
 

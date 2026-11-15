@@ -90,18 +90,20 @@ fn read_keys(ids: &dyn Array, keys: &mut Vec<Key, std::alloc::System>) -> Result
 /// LanceDB distances, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
-    Ip,
-    Cos,
-    #[value(alias = "l2sq")]
-    L2,
+    #[value(alias = "ip")]
+    Inner,
+    #[value(alias = "cos")]
+    Angular,
+    #[value(aliases = ["l2", "l2sq"])]
+    Euclidean,
 }
 
 impl From<Metric> for lancedb::DistanceType {
     fn from(metric: Metric) -> Self {
         match metric {
-            Metric::Ip => Self::Dot,
-            Metric::Cos => Self::Cosine,
-            Metric::L2 => Self::L2,
+            Metric::Inner => Self::Dot,
+            Metric::Angular => Self::Cosine,
+            Metric::Euclidean => Self::L2,
         }
     }
 }
@@ -121,7 +123,7 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metric
-    #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "l2")]
+    #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "euclidean")]
     metric: Metric,
 
     /// Directory of LanceDB's storage

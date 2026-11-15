@@ -28,7 +28,7 @@
 //!     --query-vectors datasets/turing_10M/query.public.100K.fbin \
 //!     --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
 //!     --data-type f32,bf16,f16,i8 \
-//!     --metric l2 \
+//!     --metric euclidean \
 //!     --output results/
 //! ```
 //!
@@ -160,7 +160,7 @@ struct Cli {
         env = "RETRIEVAL_METRIC",
         value_delimiter = ',',
         value_enum,
-        default_value = "l2"
+        default_value = "euclidean"
     )]
     metric: Vec<Metric>,
 
@@ -209,16 +209,17 @@ impl fmt::Display for DataType {
 /// FAISS HNSW metrics, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
-    Ip,
-    #[value(alias = "l2sq")]
-    L2,
+    #[value(alias = "ip")]
+    Inner,
+    #[value(aliases = ["l2", "l2sq"])]
+    Euclidean,
 }
 
 impl From<Metric> for faiss::MetricType {
     fn from(metric: Metric) -> Self {
         match metric {
-            Metric::Ip => Self::InnerProduct,
-            Metric::L2 => Self::L2,
+            Metric::Inner => Self::InnerProduct,
+            Metric::Euclidean => Self::L2,
         }
     }
 }
@@ -552,7 +553,7 @@ mod tests {
         let config = IndexConfig {
             dimensions: 2,
             data_type: DataType::F32,
-            metric: Metric::L2,
+            metric: Metric::Euclidean,
             connectivity: 8,
             expansion_add: 32,
             expansion_search: 16,

@@ -28,7 +28,7 @@ retri-eval-usearch \
     --query-vectors data/wiki-1m/query.public.100K.fbin \
     --query-neighbors data/wiki-1m/groundtruth.public.100K.ibin \
     --data-type bf16,f16,i8 \
-    --metric ip \
+    --metric inner \
     --output results/
 ```
 
@@ -42,11 +42,11 @@ uv run scripts/plot.py results/ --output plots/
 
 ### Search Engines
 
-| Backend     | Parallelism | Quantization                                  | Metrics                       |
-| :---------- | :---------- | :-------------------------------------------- | :---------------------------- |
-| __USearch__ | ForkUnion   | bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | ip, l2, cos, hamming, jaccard |
-| __FAISS__   | OpenMP      | f32, f16, bf16, u8, i8, b1                    | ip, l2                        |
-| __cuVS__    | CUDA        | f32, f16, i8, u8                              | l2, ip, cos                   |
+| Backend     | Parallelism | Quantization                                  | Metrics                                     |
+| :---------- | :---------- | :-------------------------------------------- | :------------------------------------------ |
+| __USearch__ | ForkUnion   | bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1 | inner, euclidean, angular, hamming, jaccard |
+| __FAISS__   | OpenMP      | f32, f16, bf16, u8, i8, b1                    | inner, euclidean                            |
+| __cuVS__    | CUDA        | f32, f16, i8, u8                              | euclidean, inner, angular                   |
 
 - __USearch__: The input is stored in the `--data-type` quantization, converted on the fly.
   `e3m2` and `e2m3` occupy byte slots; `b1` is packed.
@@ -59,9 +59,9 @@ uv run scripts/plot.py results/ --output plots/
 ![A query walking a proximity graph from an entry point along a thick path, beside a table naming the connectivity, construction and search expansion flags in USearch, FAISS, Qdrant, Weaviate, Redis, SurrealDB and cuVS](assets/graph-search.svg)
 
 ```sh
-retri-eval-usearch --data-type bf16 --metric l2 ...
-retri-eval-faiss --data-type f16 --metric l2 ...
-retri-eval-cuvs --metric l2 ...
+retri-eval-usearch --data-type bf16 --metric euclidean ...
+retri-eval-faiss --data-type f16 --metric euclidean ...
+retri-eval-cuvs --metric euclidean ...
 ```
 
 ![Bit layouts of every --data-type from f32 down to b1, split into sign, exponent, mantissa and integer bits, with each type's largest value, overflow and NaN behavior, and the share of its codes inside the range from minus one to one](assets/scalar-types.svg)
@@ -95,6 +95,7 @@ Build only what you need:
 
 ```sh
 cargo build --release --features usearch-backend    # USearch
+cargo build --release --features usearch-cuda       # USearch with its CUDA kernels, for --residency vram
 cargo build --release --features faiss-backend      # FAISS
 cargo build --release --features qdrant-backend     # Qdrant
 cargo build --release --features redis-backend      # Redis
@@ -103,6 +104,7 @@ cargo build --release --features weaviate-backend   # Weaviate
 cargo build --release --features cuvs-backend       # cuVS
 cargo build --release --no-default-features --features turso-backend # Turso
 cargo build --release --no-default-features --features surrealdb-backend # SurrealDB
+cargo build --release --no-default-features --features ground-truth # retri-ground-truth
 ```
 
 Or combine multiple:
@@ -348,6 +350,8 @@ Microsoft's 100-dimensional `f32` web-search embeddings under L2, compared at th
 
 Each backend is a separate binary, and the manuals below list every flag of every binary with its default.
 A value spelled `<…,...>` takes comma-separated values and runs one configuration per combination.
+Counts take `K`, `M`, `G` or `T` in powers of 1000, like `10M`, and sizes take `KB` to `TB` in powers of 1024, like `16GB`.
+A zero connectivity or expansion lets USearch derive it, and the report records the connectivity the index header holds.
 A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
 A sweep also exits with status 1 when any configuration fails or none runs, while configurations a backend refuses to open are reported as skipped.
 Every `retri-eval-*` flag also reads `RETRIEVAL_<FLAG>` as its default, upper-cased with dashes as underscores, so `--top-k` reads `RETRIEVAL_TOP_K`.
@@ -412,22 +416,22 @@ retri-eval-usearch, retri-eval-faiss, retri-eval-cuvs
 retri-eval-usearch
   --data-type <TYPE,...>                bf16
       Stored type: bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8 or b1.
-  --metric <METRIC,...>                 l2
-      ip, l2, cos, hamming or jaccard.
-  --connectivity <N,...>                16
-      Graph connectivity.
-  --expansion-add <N,...>               128
-      Construction expansion.
-  --expansion-search <N,...>            64
-      Search expansion.
+  --metric <METRIC,...>                 euclidean
+      inner, euclidean, angular, hamming or jaccard; ip, l2, cos and tanimoto also parse.
+  --connectivity <N,...>                0
+      Graph connectivity, 0 to let USearch derive it.
+  --expansion-add <N,...>               0
+      Construction expansion, 0 to let USearch derive it.
+  --expansion-search <N,...>            0
+      Search expansion, 0 to let USearch derive it.
   --memory-domains <NODES>              every node the process may use
       Comma-separated NUMA nodes, one shard on each.
   --threads <N,...>                     0
       Threads, 0 for every core in the affinity mask.
   --residency <WHERE>                   ram
       ram, vram, or nvme: built in RAM, saved to --index and searched as a view on the last step.
-  --refines <N>                         0
-      Single-pass refinements after the last insert step, reported as the step's refine entry.
+  --max-refines <N>                     0
+      Refinement rounds after the last insert step, stopping at the first that does not improve the graph.
   --nvme-paths <PATHS>                  where --index points
       Devices or directories an NVMe view serves its parts from.
   --devices <ORDINALS>                  one free device
@@ -436,8 +440,8 @@ retri-eval-usearch
 retri-eval-faiss
   --data-type <TYPE,...>                bf16
       Scalar quantizer over f32 input: f32, f16, bf16, u8, i8 or b1.
-  --metric <METRIC,...>                 l2
-      ip or l2; b1 data always uses Hamming.
+  --metric <METRIC,...>                 euclidean
+      inner or euclidean, also spelled ip and l2; b1 data always uses Hamming.
   --connectivity <N,...>                32
       HNSW M.
   --expansion-add <N,...>               128
@@ -450,8 +454,8 @@ retri-eval-faiss
 retri-eval-cuvs
   --data-type <TYPE,...>                f32
       f32, f16, i8 or u8, converted on the host before CAGRA builds on it.
-  --metric <METRIC,...>                 l2
-      l2, ip or cos.
+  --metric <METRIC,...>                 euclidean
+      euclidean, inner or angular, also spelled l2, ip and cos.
   --connectivity <N,...>                32
       CAGRA's output graph degree.
   --expansion-add <N,...>               64
@@ -468,6 +472,8 @@ retri-eval-cuvs
       Random sampling rounds for the initial search points.
   --build-algo <ALGORITHM>              auto
       Graph build algorithm, auto or nn_descent.
+  --devices <ORDINALS>                  0
+      GPU ordinals; CAGRA builds and searches on the first.
 ```
 
 </details>
@@ -540,7 +546,7 @@ retri-eval-turso
 </details>
 
 <details>
-<summary>Dataset tools: <code>retri-generate</code>, <code>retri-download-molecules</code> & <code>retri-download-cohere</code></summary>
+<summary>Dataset tools: <code>retri-generate</code>, <code>retri-ground-truth</code>, <code>retri-download-molecules</code> & <code>retri-download-cohere</code></summary>
 
 ```text
 retri-generate, retri-download-molecules, retri-download-cohere
@@ -566,6 +572,20 @@ retri-generate
       Bit-flip probability from 0 to 1.
   --top-k <K>                           10
       Neighbors per query in the ground-truth file.
+
+retri-ground-truth
+  --base-vectors <PATH|GLOB>            required
+      Base vectors: .fbin, .u8bin, .i8bin or .b1bin.
+  --query-vectors <PATH>                required
+      Query vectors of the base's scalar type and width.
+  --metric <METRIC>                     required
+      euclidean over .fbin, .i8bin and .u8bin, or hamming over .b1bin.
+  --top-k <K>                           100
+      Neighbors per query in the ground-truth file.
+  --threads <N>                         0
+      Ground-truth threads, 0 for all cores.
+  --output <PATH>                       required
+      Ground-truth file to write: neighbor rows, then their distances.
 
 retri-download-molecules, retri-download-cohere
   --query-count <N>                     10000
@@ -689,7 +709,7 @@ Files are auto-named `<backend>-<hash>.json`.
 A step pairs the index state (`vectors_indexed`, `memory_bytes`, `process_anon_bytes`) with the phases that acted on it.
 `add.elapsed` includes the wait until a server finishes indexing what was added.
 A ground-truth search runs one untimed pass to warm the index, then repeats every query until at least 5 seconds pass, and `passes` counts the timed ones.
-`refine` appears on the last insert step when the backend ran refinement passes, `changed` counting the rows each pass re-wired.
+`refine` appears on the last insert step when `--max-refines` ran refinement rounds, which stop at the first that does not improve the graph; `passes` counts the rounds that ran and `changed` the rows each one re-wired.
 `add` is `null` on the `--index` load path, where nothing was inserted; `self_search` appears on at most one step — the last — because it runs once against the finished index, and that step is the index state it ran against.
 Its metrics drop the `self_` prefix because the container already says it, and it carries no `intersection_at_k` or `ndcg_at_k`: identity truth is a single key per query, so neither a set overlap nor a ranked gain says anything beyond `recall_at_1`.
 

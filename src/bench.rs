@@ -10,10 +10,10 @@ pub mod docker;
 pub mod download;
 pub mod error;
 pub mod eval;
-#[cfg(any(feature = "generate", feature = "download"))]
+#[cfg(feature = "ground-truth")]
 pub mod ground_truth;
 pub mod output;
-#[cfg(any(feature = "generate", feature = "download"))]
+#[cfg(feature = "ground-truth")]
 pub mod packed_distance;
 pub mod perf_counters;
 
@@ -1682,8 +1682,20 @@ pub fn parse_threads(text: &str, all_cores: NonZeroUsize) -> Option<Threads> {
     }
 }
 
-/// Parses a positive whole number in ASCII digits, like `128`; zero is `None`.
+/// Parses a count like `10000` or `10M`: `K`, `M`, `G`, `T` are powers of 1000 in any case, and zero is `None`.
 pub fn parse_count(text: &str) -> Option<usize> {
+    let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let exponent = ["", "k", "m", "g", "t"]
+        .iter()
+        .position(|unit| text[split..].eq_ignore_ascii_case(unit))?;
+    let count = text[..split]
+        .parse::<usize>()
+        .ok()?
+        .checked_mul(1000usize.pow(exponent as u32))?;
+    (count != 0).then_some(count)
+}
+
+fn parse_digits(text: &str) -> Option<u64> {
     let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     digits.then(|| text.parse().ok()).flatten().filter(|&count| count != 0)
 }
@@ -1691,8 +1703,8 @@ pub fn parse_count(text: &str) -> Option<usize> {
 /// Parses a duration like `200ms` or `10s`; a bare number, a fraction or zero is `None`.
 pub fn parse_duration(text: &str) -> Option<Duration> {
     match text.strip_suffix("ms") {
-        Some(count) => parse_count(count).map(|count| Duration::from_millis(count as u64)),
-        None => parse_count(text.strip_suffix('s')?).map(|count| Duration::from_secs(count as u64)),
+        Some(count) => parse_digits(count).map(Duration::from_millis),
+        None => parse_digits(text.strip_suffix('s')?).map(Duration::from_secs),
     }
 }
 
@@ -1829,7 +1841,15 @@ impl fmt::Display for Port {
 
 /// `parse_count` for clap.
 pub fn parse_count_flag(text: &str) -> Result<usize, String> {
-    parse_count(text).ok_or_else(|| "expected a positive count".into())
+    parse_count(text).ok_or_else(|| "expected a positive count like 1000 or 10M".into())
+}
+
+/// `parse_count` for clap, with `0` passed on for the library to derive.
+pub fn parse_count_or_zero_flag(text: &str) -> Result<usize, String> {
+    match text {
+        "0" => Ok(0),
+        _ => parse_count_flag(text),
+    }
 }
 
 /// `parse_threads` for clap, with `0` resolved to every available core.
@@ -1939,6 +1959,18 @@ mod tests {
         for text in ["0", "", "GB", "1PB", "-1", "1.5GB"] {
             assert_eq!(super::parse_size(text), None, "{text}");
         }
+    }
+
+    #[test]
+    fn counts_take_powers_of_1000_and_durations_take_digits() {
+        assert_eq!(super::parse_count("10M"), Some(10_000_000));
+        assert_eq!(super::parse_count("2k"), Some(2000));
+        for text in ["0", "", "M", "0K", "1.5M", "-1", "10MB"] {
+            assert_eq!(super::parse_count(text), None, "{text}");
+        }
+        assert_eq!(super::parse_duration("10s"), Some(super::Duration::from_secs(10)));
+        assert_eq!(super::parse_duration("10Ks"), None);
+        assert_eq!(super::parse_count_or_zero_flag("0"), Ok(0));
     }
 
     #[test]

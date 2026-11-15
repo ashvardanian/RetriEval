@@ -29,16 +29,18 @@ use retrieval::{
 /// Turso vector distances, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
-    L2,
-    Cos,
+    #[value(alias = "l2")]
+    Euclidean,
+    #[value(alias = "cos")]
+    Angular,
 }
 
 impl Metric {
     /// The SQL function that scores a stored vector against a query.
     fn sql_function(self) -> &'static str {
         match self {
-            Self::L2 => "vector_distance_l2",
-            Self::Cos => "vector_distance_cos",
+            Self::Euclidean => "vector_distance_l2",
+            Self::Angular => "vector_distance_cos",
         }
     }
 }
@@ -56,7 +58,7 @@ struct Cli {
     common: CommonArgs,
 
     /// Distance metric
-    #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "l2")]
+    #[arg(long, env = "RETRIEVAL_METRIC", value_enum, default_value = "euclidean")]
     metric: Metric,
 
     /// Directory of the database file, which keeps the database in memory when unset; only its
@@ -240,7 +242,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let mut backend = open(Metric::L2, &runtime);
+        let mut backend = open(Metric::Euclidean, &runtime);
         backend
             .add(both_rows(), Vectors::new(VectorSlice::F32(&[3.0, 4.0, 0.0, 0.0]), 2))
             .unwrap();
@@ -265,7 +267,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let mut backend = open(Metric::Cos, &runtime);
+        let mut backend = open(Metric::Angular, &runtime);
         backend
             .add(both_rows(), Vectors::new(VectorSlice::F32(&[0.0, 1.0, 1.0, 0.0]), 2))
             .unwrap();

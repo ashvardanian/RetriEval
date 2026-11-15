@@ -13,10 +13,7 @@
 //! corresponding NumKong `*_packed_parallel_into` method.
 
 use forkunion as fu;
-use numkong::{
-    self as nk, Dots, DotsPackedMatrix, Error, EuclideansPackedParallelOps, HammingsPackedParallelOps, MatrixSpan,
-    MatrixView, StorageElement,
-};
+use numkong::{self as nk, EuclideansPackedParallelOps, HammingsPackedParallelOps};
 
 /// A distance metric that NumKong can compute via its packed-matrix kernels.
 ///
@@ -32,9 +29,9 @@ use numkong::{
 ///   for `f64` we project via `f64::to_bits`, which is monotonic for
 ///   non-negative finite floats (the only values NumKong's Euclidean
 ///   kernel produces from finite non-negative input).
-pub trait PackedDistance: StorageElement + Dots + Sized + Default + Copy + Send + Sync
+pub trait PackedDistance: nk::StorageElement + nk::Dots + Sized + Default + Copy + Send + Sync
 where
-    Self::Distance: StorageElement + Copy + Default + Send + Sync,
+    Self::Distance: nk::StorageElement + Copy + Default + Send + Sync,
     Self::OrderingKey: Ord + Copy + Send + Sync,
 {
     /// Scalar type the kernel writes into the output distance matrix.
@@ -58,11 +55,11 @@ where
     /// NumKong's kernel overwrites every entry — callers need not
     /// pre-initialize beyond the allocation.
     fn distances_parallel_into(
-        queries: &MatrixView<'_, Self>,
-        packed_base: &DotsPackedMatrix<Self>,
-        out: &mut MatrixSpan<'_, Self::Distance>,
+        queries: &nk::MatrixView<'_, Self>,
+        packed_base: &nk::DotsPackedMatrix<Self>,
+        out: &mut nk::MatrixSpan<'_, Self::Distance>,
         pool: &mut fu::ThreadPool,
-    ) -> Result<(), Error>;
+    ) -> Result<(), nk::Error>;
 
     /// Human-readable label for progress-bar / log messages. Stable across
     /// runs so consumers can grep log output.
@@ -86,11 +83,11 @@ impl PackedDistance for nk::u1x8 {
     }
 
     fn distances_parallel_into(
-        queries: &MatrixView<'_, Self>,
-        packed_base: &DotsPackedMatrix<Self>,
-        out: &mut MatrixSpan<'_, u32>,
+        queries: &nk::MatrixView<'_, Self>,
+        packed_base: &nk::DotsPackedMatrix<Self>,
+        out: &mut nk::MatrixSpan<'_, u32>,
         pool: &mut fu::ThreadPool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), nk::Error> {
         queries.hammings_packed_parallel_into(packed_base, out, pool)
     }
 
@@ -132,11 +129,11 @@ impl PackedDistance for f32 {
     }
 
     fn distances_parallel_into(
-        queries: &MatrixView<'_, Self>,
-        packed_base: &DotsPackedMatrix<Self>,
-        out: &mut MatrixSpan<'_, f64>,
+        queries: &nk::MatrixView<'_, Self>,
+        packed_base: &nk::DotsPackedMatrix<Self>,
+        out: &mut nk::MatrixSpan<'_, f64>,
         pool: &mut fu::ThreadPool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), nk::Error> {
         queries.euclideans_packed_parallel_into(packed_base, out, pool)
     }
 
@@ -164,11 +161,11 @@ impl PackedDistance for i8 {
     }
 
     fn distances_parallel_into(
-        queries: &MatrixView<'_, Self>,
-        packed_base: &DotsPackedMatrix<Self>,
-        out: &mut MatrixSpan<'_, f32>,
+        queries: &nk::MatrixView<'_, Self>,
+        packed_base: &nk::DotsPackedMatrix<Self>,
+        out: &mut nk::MatrixSpan<'_, f32>,
         pool: &mut fu::ThreadPool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), nk::Error> {
         queries.euclideans_packed_parallel_into(packed_base, out, pool)
     }
 
@@ -193,11 +190,11 @@ impl PackedDistance for u8 {
     }
 
     fn distances_parallel_into(
-        queries: &MatrixView<'_, Self>,
-        packed_base: &DotsPackedMatrix<Self>,
-        out: &mut MatrixSpan<'_, f32>,
+        queries: &nk::MatrixView<'_, Self>,
+        packed_base: &nk::DotsPackedMatrix<Self>,
+        out: &mut nk::MatrixSpan<'_, f32>,
         pool: &mut fu::ThreadPool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), nk::Error> {
         queries.euclideans_packed_parallel_into(packed_base, out, pool)
     }
 

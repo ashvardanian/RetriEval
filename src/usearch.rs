@@ -17,7 +17,7 @@
 //!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
 //!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
 //!     --data-type bf16,e4m3,i8 \
-//!     --metric ip,cos,l2 \
+//!     --metric inner,angular,euclidean \
 //!     --output results/
 //! ```
 //!
@@ -28,7 +28,7 @@
 //!     --query-vectors datasets/turing_10M/query.public.100K.fbin \
 //!     --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
 //!     --data-type bf16,e4m3,i8 \
-//!     --metric l2 \
+//!     --metric euclidean \
 //!     --connectivity 48 \
 //!     --expansion-add 768 \
 //!     --expansion-search 384 \
@@ -43,7 +43,7 @@
 //!     --query-neighbors datasets/turing_100M/groundtruth.public.100K.ibin \
 //!     --data-type bf16 \
 //!     --memory-domains 0,1 \
-//!     --metric l2 \
+//!     --metric euclidean \
 //!     --connectivity 32 \
 //!     --expansion-add 256 \
 //!     --expansion-search 1024 \
@@ -51,7 +51,7 @@
 //!     --output results/turing_100M
 //! ```
 //!
-//! PubChem built in RAM, refined twice, saved and searched as an NVMe view:
+//! PubChem built in RAM, refined up to twice, saved and searched as an NVMe view:
 //! ```sh
 //! retri-eval-usearch \
 //!     --base-vectors datasets/pubchem/base.b1bin \
@@ -60,7 +60,7 @@
 //!     --data-type b1 \
 //!     --metric jaccard \
 //!     --steps 1 \
-//!     --refines 2 \
+//!     --max-refines 2 \
 //!     --residency nvme \
 //!     --nvme-paths /mnt/nvme0 \
 //!     --index /mnt/nvme0/pubchem.safegraphs.json \
@@ -90,7 +90,8 @@ use numkong as nk;
 use serde_json::{json, Value};
 use usearch::{
     Arena, DenseIndex, DenseInsertConfig, DenseLoadRamConfig, DenseLoadVramConfig, DenseMetric, DenseOptions,
-    DenseRefineConfig, DenseSearchConfig, DenseVerbs, DenseViewNvmeConfig, Element, Executor, Scalar,
+    DenseRefineConfig, DenseSearchConfig, DenseVerbs, DenseViewNvmeConfig, Element, Executor, RefineVerdict, Residency,
+    Scalar,
 };
 
 use retrieval::{
@@ -120,20 +121,20 @@ struct Cli {
         env = "RETRIEVAL_METRIC",
         value_delimiter = ',',
         value_enum,
-        default_value = "l2"
+        default_value = "euclidean"
     )]
     metric: Vec<Metric>,
 
-    /// Graph connectivity (comma-separated for sweep)
-    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "16", value_parser = retrieval::parse_count_flag)]
+    /// Graph connectivity (comma-separated for sweep); 0 lets the library derive it
+    #[arg(long, env = "RETRIEVAL_CONNECTIVITY", value_delimiter = ',', default_value = "0", value_parser = retrieval::parse_count_or_zero_flag)]
     connectivity: Vec<usize>,
 
-    /// Construction expansion factor (comma-separated for sweep)
-    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "128", value_parser = retrieval::parse_count_flag)]
+    /// Construction expansion factor (comma-separated for sweep); 0 lets the library derive it
+    #[arg(long, env = "RETRIEVAL_EXPANSION_ADD", value_delimiter = ',', default_value = "0", value_parser = retrieval::parse_count_or_zero_flag)]
     expansion_add: Vec<usize>,
 
-    /// Search expansion factor (comma-separated for sweep)
-    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "64", value_parser = retrieval::parse_count_flag)]
+    /// Search expansion factor (comma-separated for sweep); 0 lets the library derive it
+    #[arg(long, env = "RETRIEVAL_EXPANSION_SEARCH", value_delimiter = ',', default_value = "0", value_parser = retrieval::parse_count_or_zero_flag)]
     expansion_search: Vec<usize>,
 
     /// NUMA nodes to place one shard on apiece; empty takes every node the process may use
@@ -142,12 +143,12 @@ struct Cli {
 
     /// Where the index serves searches from: built in RAM or VRAM, or built in RAM, saved to
     /// `--index` and searched as an NVMe view on the last step
-    #[arg(long, env = "RETRIEVAL_RESIDENCY", value_enum, default_value = "ram")]
+    #[arg(long, env = "RETRIEVAL_RESIDENCY", default_value = "ram", value_parser = |text: &str| text.parse::<Residency>())]
     residency: Residency,
 
-    /// Single-pass refinements run after the last insert step, before its search
-    #[arg(long, env = "RETRIEVAL_REFINES", default_value_t = 0)]
-    refines: usize,
+    /// Refinement rounds after the last insert step, until one is not improved
+    #[arg(long, env = "RETRIEVAL_MAX_REFINES", default_value_t = 0)]
+    max_refines: usize,
 
     /// Devices or directories an NVMe view serves its parts from; empty serves them where `--index` points
     #[arg(long, env = "RETRIEVAL_NVME_PATHS", value_delimiter = ',')]
@@ -196,20 +197,15 @@ impl From<DataType> for Scalar {
     }
 }
 
-/// Where the index serves searches from, as `--residency` spells it.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Residency {
-    Ram,
-    Vram,
-    Nvme,
-}
-
 /// Metrics, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
-    Ip,
-    L2,
-    Cos,
+    #[value(alias = "ip")]
+    Inner,
+    #[value(alias = "l2")]
+    Euclidean,
+    #[value(alias = "cos")]
+    Angular,
     Hamming,
     #[value(alias = "tanimoto")]
     Jaccard,
@@ -218,9 +214,9 @@ pub enum Metric {
 impl From<Metric> for DenseMetric {
     fn from(metric: Metric) -> Self {
         match metric {
-            Metric::Ip => Self::Inner,
-            Metric::L2 => Self::Euclidean,
-            Metric::Cos => Self::Angular,
+            Metric::Inner => Self::Inner,
+            Metric::Euclidean => Self::Euclidean,
+            Metric::Angular => Self::Angular,
             Metric::Hamming => Self::Hamming,
             Metric::Jaccard => Self::Jaccard,
         }
@@ -228,12 +224,6 @@ impl From<Metric> for DenseMetric {
 }
 
 impl std::fmt::Display for DataType {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        retrieval::spell_value(self, formatter)
-    }
-}
-
-impl std::fmt::Display for Residency {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         retrieval::spell_value(self, formatter)
     }
@@ -254,7 +244,7 @@ pub struct Placement<'cli> {
     memory_domains: &'cli [i32],
     devices: &'cli [i32],
     nvme_paths: &'cli [PathBuf],
-    refines: usize,
+    max_refines: usize,
     /// The `--index` path an NVMe view is saved to and served from.
     checkpoint: Option<&'cli str>,
 }
@@ -315,6 +305,7 @@ impl<'cli> USearchBackend<'cli> {
                 DenseIndex::init_ram(&options, placement.memory_domains).map_err(failed("init_ram"))?,
                 Executor::for_ram(placement.memory_domains, None, threads.0.get()).map_err(failed("for_ram"))?,
             ),
+            other => return Err(format!("USearch builds no {other} index here")),
         };
         Self::wrap(
             index,
@@ -358,6 +349,7 @@ impl<'cli> USearchBackend<'cli> {
                 (index, executor)
             }
             Residency::Nvme => view_nvme(path, placement.nvme_paths)?,
+            other => return Err(format!("USearch opens no {other} index here")),
         };
         let mut backend = Self::wrap(index, executor, 0, expansion_search, threads, placement)?;
         backend.metadata.insert("loaded_from".into(), json!(path));
@@ -390,7 +382,7 @@ impl<'cli> USearchBackend<'cli> {
             ("threads".into(), json!(threads.0.get())),
             ("memory_domains".into(), json!(placement.memory_domains)),
             ("residency".into(), json!(placement.residency.to_string())),
-            ("refines".into(), json!(placement.refines)),
+            ("max_refines".into(), json!(placement.max_refines)),
         ]);
         Ok(Self {
             arena: Arena::new_in(&executor).map_err(failed("arena"))?,
@@ -466,21 +458,24 @@ impl Backend for USearchBackend<'_> {
     }
 
     fn finish(&mut self) -> Result<Option<StepRefineEntry>, String> {
-        let refine = match self.placement.refines {
+        let refine = match self.placement.max_refines {
             0 => None,
-            passes => {
+            max_refines => {
                 let started = Instant::now();
-                let mut changed = Vec::with_capacity(passes);
-                for _ in 0..passes {
+                let mut changed = Vec::with_capacity(max_refines);
+                for _ in 0..max_refines {
                     let report = self
                         .index
                         .on(&self.executor)
                         .refine(DenseRefineConfig::default())
                         .map_err(failed("refine"))?;
                     changed.push(report.changed as u64);
+                    if report.verdict != RefineVerdict::Improved {
+                        break;
+                    }
                 }
-                let elapsed = started.elapsed().as_secs_f64();
-                eprintln!("  refine: {passes} passes in {elapsed:.2} s, changed {changed:?}");
+                let (passes, elapsed) = (changed.len(), started.elapsed().as_secs_f64());
+                eprintln!("  refine: {passes} rounds in {elapsed:.2} s, changed {changed:?}");
                 Some(StepRefineEntry {
                     passes,
                     elapsed,
@@ -532,7 +527,7 @@ fn main() {
     eprintln!("- Memory domains: {}", spell_list(&cli.memory_domains));
     eprintln!("- Threads: {}", spell_list(&cli.threads));
     eprintln!("- Residency: {}", cli.residency);
-    eprintln!("- Refines: {}", cli.refines);
+    eprintln!("- Max refines: {}", cli.max_refines);
     if cli.residency == Residency::Nvme && cli.index.is_none() {
         retrieval::bail("--residency nvme saves and serves its view at --index");
     }
@@ -541,7 +536,7 @@ fn main() {
         memory_domains: &cli.memory_domains,
         devices: &cli.devices,
         nvme_paths: &cli.nvme_paths,
-        refines: cli.refines,
+        max_refines: cli.max_refines,
         checkpoint: cli.index.as_deref(),
     };
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
@@ -559,13 +554,6 @@ fn main() {
 
     let mut summary = SweepSummary::default();
     for (&dimensions, &data_type, &metric, &connectivity, &expansion_add, &expansion_search, &threads) in configs {
-        let mut description = format!(
-            "usearch · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"
-        );
-        if !cli.memory_domains.is_empty() {
-            write!(description, " · domains {}", spell_list(&cli.memory_domains)).expect("a String takes any write");
-        }
-        write!(description, " · {}", cli.residency).expect("a String takes any write");
         let backend = match index_file {
             IndexFile::Load(path) => USearchBackend::load(path, expansion_search, threads, placement),
             IndexFile::None | IndexFile::Save(_) => USearchBackend::new(
@@ -581,6 +569,19 @@ fn main() {
                 placement,
             ),
         };
+        // A zero `--connectivity` lets the library derive it, so the description reads the header's.
+        let connectivity = backend
+            .as_ref()
+            .ok()
+            .and_then(|backend| backend.index.describe().ok())
+            .map_or(connectivity, |described| described.metadata.connectivity);
+        let mut description = format!(
+            "usearch · {data_type} · {metric} · d={dimensions} · M={connectivity} · ef={expansion_add}/{expansion_search} · {threads} threads"
+        );
+        if !cli.memory_domains.is_empty() {
+            write!(description, " · domains {}", spell_list(&cli.memory_domains)).expect("a String takes any write");
+        }
+        write!(description, " · {}", cli.residency).expect("a String takes any write");
         summary.record(run_config(&description, index_file, backend, &mut state, dimensions));
     }
 

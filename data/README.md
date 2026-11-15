@@ -31,7 +31,7 @@ retri-eval-usearch \
     --base-vectors data/wiki-1m/base.1M.fbin \
     --query-vectors data/wiki-1m/query.public.100K.fbin \
     --query-neighbors data/wiki-1m/groundtruth.public.100K.ibin \
-    --data-type bf16,f16,i8 --metric ip \
+    --data-type bf16,f16,i8 --metric inner \
     --output results/wiki-1m
 ```
 
@@ -52,7 +52,7 @@ retri-eval-usearch \
     --base-vectors data/arxiv-2m/abstract.e5-base-v2.fbin \
     --query-vectors data/arxiv-2m/query.fbin \
     --query-neighbors data/arxiv-2m/groundtruth.ibin \
-    --data-type bf16,f16,i8 --metric ip \
+    --data-type bf16,f16,i8 --metric inner \
     --output results/arxiv-2m
 ```
 
@@ -74,7 +74,7 @@ retri-eval-usearch \
     --base-vectors data/sift-10m/base.10M.u8bin \
     --query-vectors data/sift-10m/query.public.10K.u8bin \
     --query-neighbors data/sift-10m/groundtruth.public.10K.ibin \
-    --data-type bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric euclidean \
     --output results/sift-10m
 ```
 
@@ -89,7 +89,7 @@ retri-eval-usearch \
     --base-vectors data/sift-100m/base.100M.u8bin \
     --query-vectors data/sift-100m/query.public.10K.u8bin \
     --query-neighbors data/sift-100m/groundtruth.public.10K.ibin \
-    --data-type bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric euclidean \
     --steps 20 --output results/sift-100m
 ```
 
@@ -119,7 +119,7 @@ retri-eval-usearch \
     --base-vectors data/turing-1m/base.1M.fbin \
     --query-vectors data/turing-1m/query.public.100K.fbin \
     --query-neighbors data/turing-1m/groundtruth.public.100K.ibin \
-    --data-type bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric euclidean \
     --output results/turing-1m
 ```
 
@@ -134,7 +134,7 @@ retri-eval-usearch \
     --base-vectors data/turing-10m/base.10M.fbin \
     --query-vectors data/turing-10m/query.public.100K.fbin \
     --query-neighbors data/turing-10m/groundtruth.public.100K.ibin \
-    --data-type bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric euclidean \
     --output results/turing-10m
 ```
 
@@ -149,7 +149,7 @@ retri-eval-usearch \
     --base-vectors data/turing-100m/base.100M.fbin \
     --query-vectors data/turing-100m/query.public.100K.fbin \
     --query-neighbors data/turing-100m/groundtruth.public.100K.ibin \
-    --data-type bf16,f16,i8 --metric l2 \
+    --data-type bf16,f16,i8 --metric euclidean \
     --steps 20 --output results/turing-100m
 ```
 
@@ -170,7 +170,7 @@ retri-eval-usearch \
     --base-vectors data/spacev-10m/base.10M.i8bin \
     --query-vectors data/spacev-10m/query.30K.i8bin \
     --query-neighbors data/spacev-10m/groundtruth.30K.ibin \
-    --data-type i8 --metric l2 \
+    --data-type i8 --metric euclidean \
     --output results/spacev-10m
 ```
 
@@ -185,7 +185,7 @@ retri-eval-usearch \
     --base-vectors data/spacev-100m/base.100M.i8bin \
     --query-vectors data/spacev-100m/query.30K.i8bin \
     --query-neighbors data/spacev-100m/groundtruth.30K.ibin \
-    --data-type i8 --metric l2 \
+    --data-type i8 --metric euclidean \
     --steps 20 --output results/spacev-100m
 ```
 
@@ -215,7 +215,7 @@ retri-eval-usearch \
     --base-vectors data/deep-10m/base.10M.fbin \
     --query-vectors data/deep-10m/query.public.10K.fbin \
     --query-neighbors data/deep-10m/groundtruth.public.10K.ibin \
-    --data-type bf16 --metric l2 \
+    --data-type bf16 --metric euclidean \
     --output results/deep-10m
 ```
 
@@ -230,7 +230,7 @@ retri-eval-usearch \
     --base-vectors data/deep-100m/base.100M.fbin \
     --query-vectors data/deep-100m/query.public.10K.fbin \
     --query-neighbors data/deep-100m/groundtruth.public.10K.ibin \
-    --data-type bf16 --metric l2 \
+    --data-type bf16 --metric euclidean \
     --steps 20 --output results/deep-100m
 ```
 
@@ -258,14 +258,14 @@ retri-eval-usearch \
     --base-vectors data/t2i-1m/base.1M.fbin \
     --query-vectors data/t2i-1m/query.public.100K.fbin \
     --query-neighbors data/t2i-1m/groundtruth.public.100K.ibin \
-    --data-type bf16,f16,i8 --metric cos \
+    --data-type bf16,f16,i8 --metric angular \
     --output results/t2i-1m
 ```
 
 </details>
 
 The 10M and 100M subsets are prefixes of the 1B file, sliced the same way as SIFT.
-BigANN publishes exact inner-product top-100 ground truth for those prefixes, for the same 100K public queries, so the commands below use `--metric ip`.
+BigANN publishes exact inner-product top-100 ground truth for those prefixes, for the same 100K public queries, so the commands below use `--metric inner`.
 The queries come from the text encoder and the base from the image encoder, so they are out of distribution relative to each other.
 
 <details>
@@ -277,7 +277,7 @@ retri-eval-usearch \
     --base-vectors data/t2i-10m/base.10M.fbin \
     --query-vectors data/t2i-10m/query.public.100K.fbin \
     --query-neighbors data/t2i-10m/groundtruth.public.100K.ibin \
-    --data-type bf16 --metric ip \
+    --data-type bf16 --metric inner \
     --output results/t2i-10m
 ```
 
@@ -292,7 +292,7 @@ retri-eval-usearch \
     --base-vectors data/t2i-100m/base.100M.fbin \
     --query-vectors data/t2i-100m/query.public.100K.fbin \
     --query-neighbors data/t2i-100m/groundtruth.public.100K.ibin \
-    --data-type bf16 --metric ip \
+    --data-type bf16 --metric inner \
     --steps 20 --output results/t2i-100m
 ```
 
@@ -442,7 +442,7 @@ cd ../..
 retri-eval-usearch \
     --base-vectors 'data/wikiverse/qwen3-embedding-0.6b/enwiki/*.body.f16bin' \
     --query-vectors data/wikiverse/qwen3-embedding-0.6b/enwiki/000_00000.body.f16bin \
-    --data-type f16 --metric cos \
+    --data-type f16 --metric angular \
     --output results/wikiverse-en-qwen3
 ```
 

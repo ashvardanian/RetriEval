@@ -2,12 +2,12 @@
 //!
 //! ## Examples
 //!
-//! SpaceV's queries over its first 100M base rows, under squared L2:
+//! SpaceV's queries over its first 100M base rows, under squared Euclidean distance:
 //! ```sh
 //! retri-ground-truth \
 //!     --base-vectors spacev-100m/base.100M.i8bin \
 //!     --query-vectors spacev-100m/query.30K.i8bin \
-//!     --metric l2 \
+//!     --metric euclidean \
 //!     --top-k 100 \
 //!     --output spacev-100m/groundtruth.30K.100M.ibin
 //! ```
@@ -32,7 +32,7 @@ struct Cli {
     #[arg(long)]
     query_vectors: PathBuf,
 
-    /// l2 over .fbin, .i8bin and .u8bin, or hamming over .b1bin
+    /// euclidean over .fbin, .i8bin and .u8bin, or hamming over .b1bin
     #[arg(long, value_parser = parse_metric)]
     metric: Metric,
 
@@ -50,7 +50,7 @@ struct Cli {
 }
 
 fn parse_metric(text: &str) -> Result<Metric, String> {
-    Metric::from_label(text).ok_or_else(|| "expected l2 or hamming".into())
+    Metric::from_label(text).ok_or_else(|| "expected euclidean or hamming".into())
 }
 
 fn main() {

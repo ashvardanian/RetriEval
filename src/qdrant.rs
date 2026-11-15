@@ -50,19 +50,21 @@ fn point_id(key: Key) -> PointId {
 /// Qdrant distance functions, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
-    Ip,
-    Cos,
-    #[value(alias = "l2sq")]
-    L2,
+    #[value(alias = "ip")]
+    Inner,
+    #[value(alias = "cos")]
+    Angular,
+    #[value(aliases = ["l2", "l2sq"])]
+    Euclidean,
     Manhattan,
 }
 
 impl From<Metric> for QdrantDistance {
     fn from(metric: Metric) -> Self {
         match metric {
-            Metric::Ip => Self::Dot,
-            Metric::Cos => Self::Cosine,
-            Metric::L2 => Self::Euclid,
+            Metric::Inner => Self::Dot,
+            Metric::Angular => Self::Cosine,
+            Metric::Euclidean => Self::Euclid,
             Metric::Manhattan => Self::Manhattan,
         }
     }
@@ -148,7 +150,7 @@ struct Cli {
         env = "RETRIEVAL_METRIC",
         value_delimiter = ',',
         value_enum,
-        default_value = "l2"
+        default_value = "euclidean"
     )]
     metric: Vec<Metric>,
 

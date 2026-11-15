@@ -9,13 +9,14 @@ use std::{
     path::Path,
 };
 
-use forkunion::{IntoParallelIterator, ParallelIteratorExt, ThreadPool};
+use forkunion::{self as fu, IntoParallelIterator, ParallelIteratorExt};
 use numkong::{self as nk, MatrixSpan, MatrixView};
+#[cfg(feature = "rand")]
 use rand::{rngs::StdRng, seq::index::sample as sample_without_replacement, SeedableRng};
 
 use crate::{
     error::GroundTruthError, eval, packed_distance::PackedDistance, pod_slice_as_bytes, row_ranges, spawn_pool,
-    Dataset, Seed, Threads, Vectors,
+    Dataset, Threads, Vectors,
 };
 
 /// Bytes of the per-call distance tile, enough cells for one kernel call to keep every core busy.
@@ -244,7 +245,7 @@ fn checked_top_k(
     Ok(top_k)
 }
 
-fn pool_of(threads: Threads) -> Result<ThreadPool, GroundTruthError> {
+fn pool_of(threads: Threads) -> Result<fu::ThreadPool, GroundTruthError> {
     spawn_pool(threads).map_err(|error| GroundTruthError::ThreadPool(format!("{error}")))
 }
 
@@ -267,7 +268,7 @@ fn fold_tile<Distance: Copy + Sync, Key: Ord + Copy + Send + Sync>(
     tile_start: usize,
     rankings: &mut [&mut [(Key, u32)]],
     key_of: impl Fn(Distance) -> Key + Sync,
-    pool: &mut ThreadPool,
+    pool: &mut fu::ThreadPool,
 ) -> Result<(), GroundTruthError> {
     rankings
         .into_par_iter()
@@ -339,11 +340,12 @@ pub fn write_bin_file(path: &Path, rows: usize, width: usize, bodies: &[&[u8]]) 
 /// Hamming top-`top_k` over every base shard, and writes `query.<count>.b1bin` and
 /// `groundtruth.<count>.ibin` into `output`. With `hold_out`, the sampled rows leave the base files
 /// first, so the truth names rows of the reduced base.
+#[cfg(feature = "rand")]
 pub fn write_sampled_ground_truth(
     base: Dataset,
     query_count: usize,
     top_k: usize,
-    seed: Seed,
+    seed: crate::Seed,
     threads: Threads,
     hold_out: bool,
     output: &Path,
@@ -448,7 +450,7 @@ pub fn write_ground_truth(
         )?,
         (metric, _) => {
             return Err(format!(
-                "no packed {metric:?} kernel for these vectors: l2 ranks .fbin, .i8bin and .u8bin, hamming .b1bin"
+                "no packed {metric:?} kernel for these vectors: euclidean ranks .fbin, .i8bin, .u8bin, hamming .b1bin"
             )
             .into())
         }
@@ -490,7 +492,7 @@ fn write_ground_truth_file(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rand"))]
 mod tests {
     use std::num::NonZeroUsize;
 

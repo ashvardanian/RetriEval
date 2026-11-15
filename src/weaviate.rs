@@ -40,19 +40,21 @@ const CLASS_NAME: &str = "Bench";
 /// Weaviate distances, as `--metric` spells them; Hamming needs bit-packed vectors Weaviate doesn't store.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
-    Ip,
-    Cos,
-    #[value(alias = "l2sq")]
-    L2,
+    #[value(alias = "ip")]
+    Inner,
+    #[value(alias = "cos")]
+    Angular,
+    #[value(aliases = ["l2", "l2sq"])]
+    Euclidean,
 }
 
 impl Metric {
     /// The distance name Weaviate's REST schema expects.
     fn schema_name(self) -> &'static str {
         match self {
-            Self::Ip => "dot",
-            Self::Cos => "cosine",
-            Self::L2 => "l2-squared",
+            Self::Inner => "dot",
+            Self::Angular => "cosine",
+            Self::Euclidean => "l2-squared",
         }
     }
 }
@@ -88,7 +90,7 @@ struct Cli {
         env = "RETRIEVAL_METRIC",
         value_delimiter = ',',
         value_enum,
-        default_value = "l2"
+        default_value = "euclidean"
     )]
     metric: Vec<Metric>,
 

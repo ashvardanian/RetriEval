@@ -46,7 +46,7 @@
 //!     --base-vectors datasets/wiki_1M/base.1M.fbin \
 //!     --query-vectors datasets/wiki_1M/query.public.100K.fbin \
 //!     --query-neighbors datasets/wiki_1M/groundtruth.public.100K.ibin \
-//!     --data-type f32,f16 --metric ip \
+//!     --data-type f32,f16 --metric inner \
 //!     --output results/
 //! ```
 //!
@@ -56,7 +56,7 @@
 //!     --base-vectors datasets/turing_10M/base.10M.fbin \
 //!     --query-vectors datasets/turing_10M/query.public.100K.fbin \
 //!     --query-neighbors datasets/turing_10M/groundtruth.public.100K.ibin \
-//!     --data-type f32,f16 --metric l2 \
+//!     --data-type f32,f16 --metric euclidean \
 //!     --connectivity 64 \
 //!     --expansion-add 128 \
 //!     --expansion-search 256 \
@@ -113,6 +113,11 @@ unsafe impl nk::Allocator for CudaAllocator {
 
 type GpuTensor<T> = nk::Tensor<T, CudaAllocator>;
 
+extern "C" {
+    /// The CUDA runtime's current-device switch, which `cuvs-sys` leaves unbound.
+    fn cudaSetDevice(device: i32) -> i32;
+}
+
 // #region DLPack
 
 /// Build a non-owning `DLManagedTensor` descriptor.
@@ -125,20 +130,16 @@ fn dl_tensor(
     shape: *mut i64,
     ndim: i32,
     data_type: cuvs_sys::DLDataType,
-    on_gpu: bool,
+    device: Option<i32>,
 ) -> cuvs_sys::DLManagedTensor {
-    let device_type = if on_gpu {
-        cuvs_sys::DLDeviceType::kDLCUDA
-    } else {
-        cuvs_sys::DLDeviceType::kDLCPU
+    let (device_type, device_id) = match device {
+        Some(device) => (cuvs_sys::DLDeviceType::kDLCUDA, device),
+        None => (cuvs_sys::DLDeviceType::kDLCPU, 0),
     };
     cuvs_sys::DLManagedTensor {
         dl_tensor: cuvs_sys::DLTensor {
             data,
-            device: cuvs_sys::DLDevice {
-                device_type,
-                device_id: 0,
-            },
+            device: cuvs_sys::DLDevice { device_type, device_id },
             ndim,
             dtype: data_type,
             shape,
@@ -487,7 +488,7 @@ struct Cli {
         env = "RETRIEVAL_METRIC",
         value_delimiter = ',',
         value_enum,
-        default_value = "l2"
+        default_value = "euclidean"
     )]
     metric: Vec<Metric>,
 
@@ -526,6 +527,10 @@ struct Cli {
     #[arg(long, env = "RETRIEVAL_BUILD_ALGO", value_enum, default_value = "auto")]
     build_algo: BuildAlgo,
 
+    /// GPU ordinals; CAGRA builds and searches on the first, device 0 when empty
+    #[arg(long, env = "RETRIEVAL_DEVICES", value_delimiter = ',')]
+    devices: Vec<i32>,
+
     /// Persisted index: loaded and searched if the path exists, else built and saved; needs a single config
     #[arg(long, env = "RETRIEVAL_INDEX", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     index: Option<String>,
@@ -562,18 +567,20 @@ impl From<CuvsDataType> for CastScratch {
 /// CAGRA metrics, as `--metric` spells them.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
-    #[value(alias = "l2sq")]
-    L2,
-    Ip,
-    Cos,
+    #[value(aliases = ["l2", "l2sq"])]
+    Euclidean,
+    #[value(alias = "ip")]
+    Inner,
+    #[value(alias = "cos")]
+    Angular,
 }
 
 impl From<Metric> for DistanceType {
     fn from(metric: Metric) -> Self {
         match metric {
-            Metric::L2 => Self::L2Expanded,
-            Metric::Ip => Self::InnerProduct,
-            Metric::Cos => Self::CosineExpanded,
+            Metric::Euclidean => Self::L2Expanded,
+            Metric::Inner => Self::InnerProduct,
+            Metric::Angular => Self::CosineExpanded,
         }
     }
 }
@@ -625,6 +632,7 @@ pub struct CuvsBackend {
 
     resources: cuvs::Resources,
     cuda_allocator: CudaAllocator,
+    device: i32,
     dimensions: usize,
     metric: DistanceType,
     data_type: CuvsDataType,
@@ -656,7 +664,7 @@ pub struct CagraTuning {
 }
 
 impl CuvsBackend {
-    pub fn new(config: IndexConfig<CuvsDataType, Metric>, tuning: CagraTuning) -> Result<Self, String> {
+    pub fn new(config: IndexConfig<CuvsDataType, Metric>, tuning: CagraTuning, device: i32) -> Result<Self, String> {
         let IndexConfig {
             dimensions,
             data_type,
@@ -672,10 +680,16 @@ impl CuvsBackend {
             max_iterations,
             num_random_samplings,
         } = tuning;
+        // SAFETY: a plain runtime call, which reports a bad ordinal as an error code.
+        let status = unsafe { cudaSetDevice(device) };
+        if status != 0 {
+            return Err(format!("cudaSetDevice({device}) failed with CUDA error {status}"));
+        }
         let resources = cuvs::Resources::new().map_err(|error| format!("failed to create cuVS resources: {error}"))?;
         let cuda_allocator = CudaAllocator(resources.0);
         let metadata = std::collections::HashMap::from([
             ("backend".into(), json!("cuvs-cagra")),
+            ("device".into(), json!(device)),
             ("data_type".into(), json!(data_type.to_string())),
             ("metric".into(), json!(metric.to_string())),
             ("connectivity".into(), json!(connectivity)),
@@ -694,6 +708,7 @@ impl CuvsBackend {
             index: None,
             resources,
             cuda_allocator,
+            device,
             dimensions,
             metric: metric.into(),
             data_type,
@@ -714,8 +729,13 @@ impl CuvsBackend {
     /// Open a saved CAGRA index. CAGRA's deserializer reports no build params, so the graph degree
     /// comes from the row sidecar written alongside the index, and the other build-time settings
     /// are reported as null.
-    pub fn load(path: &str, config: IndexConfig<CuvsDataType, Metric>, tuning: CagraTuning) -> Result<Self, String> {
-        let mut backend = Self::new(config, tuning)?;
+    pub fn load(
+        path: &str,
+        config: IndexConfig<CuvsDataType, Metric>,
+        tuning: CagraTuning,
+        device: i32,
+    ) -> Result<Self, String> {
+        let mut backend = Self::new(config, tuning, device)?;
         let index = CagraIndex::new()?;
         index.deserialize(&backend.resources, path)?;
         let (host_rows, connectivity) = read_host_rows(&rows_sidecar_path(path))?;
@@ -771,7 +791,7 @@ impl CuvsBackend {
             shape.as_mut_ptr(),
             2,
             self.data_type.dl_type(),
-            false,
+            None,
         );
 
         let build_params = cuvs::cagra::IndexParams::new()
@@ -888,21 +908,21 @@ impl Backend for CuvsBackend {
             buffers.queries_shape.as_mut_ptr(),
             2,
             self.data_type.dl_type(),
-            true,
+            Some(self.device),
         );
         let mut neighbors_tensor = dl_tensor(
             buffers.neighbors.as_mut_ptr() as _,
             buffers.results_shape.as_mut_ptr(),
             2,
             dl_key(),
-            true,
+            Some(self.device),
         );
         let mut distances_tensor = dl_tensor(
             buffers.distances.as_mut_ptr() as _,
             buffers.results_shape.as_mut_ptr(),
             2,
             dl_distance(),
-            true,
+            Some(self.device),
         );
         let index = self.index.as_ref().ok_or("index not built")?;
         index.search(
@@ -987,6 +1007,8 @@ fn main() {
     eprintln!("- Max iterations: {}", spell_count_or_auto(cli.max_iterations));
     eprintln!("- Random samplings: {}", spell_count_or_auto(cli.num_random_samplings));
     eprintln!("- Build algorithm: {}", cli.build_algo);
+    let device = cli.devices.first().copied().unwrap_or(0);
+    eprintln!("- Device: {device}");
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
     let configs = iproduct!(
         &dimensions_sweep,
@@ -1022,8 +1044,8 @@ fn main() {
             num_random_samplings: cli.num_random_samplings,
         };
         let backend = match index_file {
-            IndexFile::Load(path) => CuvsBackend::load(path, config, tuning),
-            IndexFile::None | IndexFile::Save(_) => CuvsBackend::new(config, tuning),
+            IndexFile::Load(path) => CuvsBackend::load(path, config, tuning, device),
+            IndexFile::None | IndexFile::Save(_) => CuvsBackend::new(config, tuning, device),
         };
         summary.record(run_config(&description, index_file, backend, &mut state, dimensions));
     }

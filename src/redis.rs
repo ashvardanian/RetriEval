@@ -38,19 +38,21 @@ const PREFIX: &str = "vec:";
 /// RediSearch distance metrics, as `--metric` spells them; Hamming and Jaccard aren't exposed on vector indexes.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
-    Ip,
-    Cos,
-    #[value(alias = "l2sq")]
-    L2,
+    #[value(alias = "ip")]
+    Inner,
+    #[value(alias = "cos")]
+    Angular,
+    #[value(aliases = ["l2", "l2sq"])]
+    Euclidean,
 }
 
 impl Metric {
     /// The `FT.CREATE ... DISTANCE_METRIC` token.
     fn token(self) -> &'static str {
         match self {
-            Self::Ip => "IP",
-            Self::Cos => "COSINE",
-            Self::L2 => "L2",
+            Self::Inner => "IP",
+            Self::Angular => "COSINE",
+            Self::Euclidean => "L2",
         }
     }
 }
@@ -129,7 +131,7 @@ struct Cli {
         env = "RETRIEVAL_METRIC",
         value_delimiter = ',',
         value_enum,
-        default_value = "l2"
+        default_value = "euclidean"
     )]
     metric: Vec<Metric>,
 
@@ -359,7 +361,11 @@ fn info_field(info: &redis::Value, name: &str) -> Option<f64> {
     let redis::Value::Array(items) = info else {
         return None;
     };
-    let pair = items.chunks_exact(2).find(|pair| redis_text(&pair[0]) == Some(name))?;
+    let pair = items
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .find(|pair| redis_text(&pair[0]) == Some(name))?;
     match &pair[1] {
         redis::Value::Int(value) => Some(*value as f64),
         value => redis_text(value)?.parse().ok(),
