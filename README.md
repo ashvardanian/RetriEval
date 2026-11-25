@@ -2,9 +2,10 @@
 
 ![RetriEval benchmarks thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/RetriEval.jpg?raw=true)
 
-__RetriEval__ is a benchmarking suite designed for Billion-scale Vector Search workloads.
-It's primarily used to benchmark in-process Search Engines on CPUs and GPUs, like [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss), and [cuVS](https://github.com/NVIDIA/cuvs), but it also reuses similar profiling logic for standalone databases like [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate), and [Redis](https://github.com/redis/redis).
-It works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/), aiming for reproducible measurements – with shuffled parallel construction, incremental recall curves, normalized metrics, and machine-readable reports, capturing everything from machine topology to indexing hyper-parameters.
+__RetriEval__ benchmarks vector search at billion scale, from in-process search engines to databases.
+It is a sibling of [CrudEval](https://github.com/ashvardanian/CrudEval), [TablEval](https://github.com/ashvardanian/TablEval) and [ServEval](https://github.com/ashvardanian/ServEval).
+It compares [USearch](https://github.com/unum-cloud/usearch), [FAISS](https://github.com/facebookresearch/faiss) and [cuVS](https://github.com/NVIDIA/cuvs) on CPUs and GPUs, and [Qdrant](https://github.com/qdrant/qdrant), [Weaviate](https://github.com/weaviate/weaviate) and [Redis](https://github.com/redis/redis) as servers.
+Runs shuffle construction, judge recall against exact ground truth, and write machine and budget details beside every number.
 
 ## Quickstart
 
@@ -88,6 +89,25 @@ Hamming is only available on `IvfFlat`, outside our graph path.
 Turso runs in-process with exact `f32` scans over an in-memory database, or a file in `--data-dir` whose benchmark table alone is recreated; it measures exact search, not a libSQL ANN index.
 The server backends run in Docker containers the binaries manage themselves; [`docker/README.md`](docker/README.md) covers their lifecycle and per-server caveats.
 
+### Text Engines
+
+Text runs index UTF-8 files of one entry per line, the line number being the row, as StringKilla's bases and tasks lay them out.
+Each query names one target row, and only that row is credited, so a tie or a duplicate ranked above it costs the query.
+The reports keep `recall_at_1` and `recall_at_k` as success@1 and success@k, and add `mrr_at_k`.
+
+- `retri-eval-tantivy` holds a Tantivy index in RAM, splits each query by the field's analyzer into `Should` terms, and merges into one segment after the last insert.
+  Tantivy scores fuzzy matches as a constant, so `--fuzziness` adds that constant to the exact terms' BM25 rather than blending BM25 over the edits as Lucene does.
+- `retri-eval-elasticsearch` runs Elasticsearch 8.17 in Docker, on Lucene 9.12, with one shard: `_bulk` inserts, `_refresh` on flush, `_forcemerge` to one segment after the last insert, and one `_msearch` of `match` queries per batch.
+
+```sh
+retri-eval-tantivy \
+    --base-texts data/en-wiked.txt \
+    --query-texts tasks/wiked-similar/queries.txt \
+    --query-targets tasks/wiked-similar/targets.txt \
+    --fuzziness 0,AUTO \
+    --output results/
+```
+
 ---
 
 Each backend is behind its own feature flag.
@@ -104,6 +124,8 @@ cargo build --release --features weaviate-backend   # Weaviate
 cargo build --release --features cuvs-backend       # cuVS
 cargo build --release --no-default-features --features turso-backend # Turso
 cargo build --release --no-default-features --features surrealdb-backend # SurrealDB
+cargo build --release --no-default-features --features tantivy-backend # Tantivy
+cargo build --release --no-default-features --features elasticsearch-backend # Elasticsearch
 cargo build --release --no-default-features --features ground-truth # retri-ground-truth
 ```
 
@@ -115,10 +137,11 @@ cargo build --release --features usearch-backend,faiss-backend,qdrant-backend
 
 ## Datasets
 
+RetriEval works with the same plain input format standardized by the [BigANN benchmark](https://big-ann-benchmarks.com/).
 The BigANN collections are a good starting point, as most ship pre-computed ground-truth neighbors for recall evaluation.
 The tables below group the datasets by scale, and each name links to its download and run recipe in [`data/README.md`](data/README.md), which also covers the file format and sharded inputs.
 
-### ~1M Scale — Development & Testing
+### ~1M Scale
 
 | Dataset                         | Scalar Type | Dimensions | Metric | Base Size | Ground Truth      |
 | :------------------------------ | ----------: | ---------: | -----: | --------: | :---------------- |
@@ -177,29 +200,49 @@ The tables below group the datasets by scale, and each name links to its downloa
 [cohere-wiki]: data/README.md#cohere-wikipedia-multilingual
 [wikiverse]: data/README.md#unum-wikiverse
 
+### Keys & Order
+
+Keys stay as wide as their input: a keys file is memory-mapped at its own width, and generated keys are computed from the row on demand, so neither costs memory per row.
+`uuid-v7` keys hold the row in their timestamp and counter, so they sort as rows do, while `uuid-v4` keys scatter over the whole key space.
+Each engine stores keys natively where it can:
+
+- __USearch__ takes every key as its 16-byte `Key`.
+- __Qdrant__ keeps keys that fit 64 bits as numeric point ids and the rest as UUID point ids.
+- __Weaviate and SurrealDB__ use each key as the object or record UUID, integers zero-padded.
+- __Redis__ spells keys as UUIDs in the hash names.
+- __LanceDB__ sizes its `id` column to `UInt32`, `UInt64` or `FixedSizeBinary(16)`.
+- __FAISS, cuVS and Turso__ store base rows as their ids and name hits by the rows' keys, so keys of any width cost them nothing; cuVS saves those rows to a `.rows` file beside its index.
+
+Duplicate keys suit USearch and the engines that store rows, FAISS, cuVS and Turso, since the others overwrite a repeated id.
+
+`--insertion-order shuffled` is a seeded Feistel permutation computed per position, so a shuffle of any size stores nothing per row.
+
 ## Results
 
-These numbers were measured for reference on DGX-B300 and DGX-H100 class nodes, the main drivers of AI neoclouds, and on single-socket AWS Graviton4 and Graviton5 hosts, and mostly guide the design of USearch.
+These numbers were measured for reference on DGX-B300 and DGX-H100 class nodes, the main drivers of AI neoclouds, on dual-socket Intel Xeon 6 hosts, and on single-socket AWS Graviton4 and Graviton5 hosts, and mostly guide the design of USearch.
 They shift with the data, the software versions and the hardware, so treat them as reference points for your own runs, not as fixed rankings.
+Every row comes from a dated run in [`CHANGELOG.md`](CHANGELOG.md), which also keeps each run's connectivity, K-recall@10 and build time.
+Rows that build faster than they search, and ECFP4 rows under 99%, stay only there.
 
-Each table holds one row per backend, device and data type, so a new run is a new row and nothing else moves:
+Each table holds one row per machine, core class, backend and type, so a new machine is a new row and nothing else moves:
 
-- `Device`: the cores a run used and what they are, like `148× NVIDIA SM103` for the streaming multiprocessors of one B300 or `128× Intel Xeon6` for the physical cores of a dual-socket host.
-  CPU rows count physical cores, not SMT threads: with two threads per core, the `96×` and `128×` hosts ran 192 and 256 threads.
+- `Machine`: the host or GPU a run used, with its cores or SMs, threads and NUMA domains, like `AWS Graviton5, 192 cores, 192 threads, 2 domains` or `NVIDIA B300 SXM6, 148 SMs`.
+  CPU rows count physical cores, not SMT threads, and name the threads where the run recorded them.
+- `Class`: the capability class the report prints, like `apple-m2` or `blackwell`, or `-` where the run recorded none.
+- `Backend`: the engine and its version.
 - `Type`: the stored type; every backend took its native input type, with no rescaling.
-- `Connectivity`: the graph degree, M.
-- `Layer 0`: the edges each vector keeps in the densest layer: 2×M in the HNSW graphs of USearch 2.25 and FAISS, M in the single-layer graphs of USearch 3.0 and cuVS.
-- `Expansions`: the construction and search expansion, split by `/`.
-- `1-r@10`: 1-recall@10, the share of queries whose true nearest neighbor lands in the top 10.
-- `10-r@10`: K-recall@10, the share of the true top 10 found.
-- `Add/s` and `Search/s`: vectors indexed and queries answered per second.
+- `Links`: the edges each vector keeps in the densest layer: 2×M in the HNSW graphs of USearch 2.25 and FAISS, M in the single-layer graphs of USearch 3.0 and cuVS.
+- `Expansion`: the construction and search expansion, split by `/`.
+- `Insertions` and `Queries`: vectors indexed and queries answered per second, in thousands or millions.
+- `Recall@10`: 1-recall@10 as a percent, the share of queries whose true nearest neighbor lands in the top 10.
 - `Memory`: the backend's own peak figure, which [`src/README.md`](src/README.md#memory-accounting) defines per backend.
-- `Build`: the wall time to index the whole base.
+- `Date`: the run day, which names its section in [`CHANGELOG.md`](CHANGELOG.md).
+- A `-` marks a figure the run did not record.
 
-Every row follows the same methodology:
+Every new row follows the same methodology, which the April rows predate:
 
 - Tune each backend's settings until it reaches 99% 1-recall@10 or more on the dataset.
-- Never let a row build faster than it searches: when `Add/s` exceeds `Search/s`, raise the construction expansion and lower the search expansion until search is at least as fast at that recall.
+- Never let a row build faster than it searches: when insertions outpace queries, raise the construction expansion and lower the search expansion until search is at least as fast at that recall.
 - Run every command on a 1M prefix first, then on a 10M prefix, before the full file.
 - Match the links each vector keeps: 64 means connectivity 64 in a single-layer graph and M=32 in HNSW.
 - Start every engine from the same expansions, and widen the construction only where a dataset misses 0.99.
@@ -208,7 +251,7 @@ Every row follows the same methodology:
 - Build in 20 steps, and validate the ground truth against the base before the first insert.
 
 Compare the fastest measured configuration meeting the same recall target, with the same recall definition, queries, K, and ground truth.
-Report build time and memory alongside query throughput, and keep query concurrency, batch size, and cache state comparable.
+Report insertion throughput and memory alongside query throughput, and keep query concurrency, batch size, and cache state comparable.
 
 ![Two schematic throughput-recall curves, where engine A looks faster at its default setting but engine B answers more queries once both are swept to the same 0.99 recall](assets/matched-recall.svg)
 
@@ -226,125 +269,109 @@ Each search reports both recall conventions, because they answer different quest
 
 ![One list of ten returned answers scored four ways against the true neighbors: 0 for 1-recall@1, 1 for 1-recall@10, 0.7 for 10-recall@10 and 0.74 for NDCG@10](assets/recall-metrics.svg)
 
-### PubChem MACCS
+### 10M
 
-168-bit binary fingerprints of PubChem molecules under Hamming, with settings calibrated at 10M and reused at 100M; recipes in [`data/README.md`](data/README.md#usearchmolecules).
+PubChem MACCS, 168-bit `b1` fingerprints under Hamming, 10,000,000 molecules, with settings calibrated here and reused at 100M; recipes in [`data/README.md`](data/README.md#usearchmolecules).
 
-#### PubChem MACCS 10M
+| Machine                                        | Class | Backend    | Type | Links | Expansion |   Insertions |       Queries | Recall@10 | Memory | Date       |
+| :--------------------------------------------- | :---- | :--------- | :--- | ----: | --------: | -----------: | ------------: | --------: | -----: | :--------- |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | FAISS 1.12 | `b1` |   128 |   40 / 16 | 95.230 k IPS | 293.795 k QPS |   96.610% | 7.6 GB | 2026-04-18 |
 
-| Backend      | Device          | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s | Memory | Build |
-| :----------- | :-------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | -----: | -------: | -----: | ----: |
-| USearch 2.25 | 96× Intel Xeon6 | `b1` |           32 |      64 |   128 / 64 | 0.9696 |       … | 36,347 |   35,767 | 4.7 GB |  5.0m |
-| FAISS 1.12   | 96× Intel Xeon6 | `b1` |           64 |     128 |    40 / 16 | 0.9661 |       … | 95,230 |  293,795 | 7.6 GB |  1.5m |
+USearch 2.25 built faster than it searched there, so its row stays in the changelog.
 
-#### PubChem MACCS 100M
+SIFT, Meta's 128-dimensional `u8` descriptors under L2, 10,000,000 rows; recipes in [`data/README.md`](data/README.md#meta-bigann-sift).
 
-| Backend      | Device            | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory |        Build |
-| :----------- | :---------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | ------: | --------: | ------: | -----------: |
-| USearch 2.25 | 96× Intel Xeon6   | `b1` |           32 |      64 |   128 / 64 | 0.8438 |       … |  35,080 |    38,432 | 40.8 GB |        54.6m |
-| FAISS 1.12   | 96× Intel Xeon6   | `b1` |           64 |     128 |    40 / 16 |      … |       … |       … |         … | ≥ 63 GB | killed at 9h |
-| USearch 3.0  | 148× NVIDIA SM103 | `b1` |           32 |      32 |   256 / 64 | 0.9907 |  0.9906 | 559,140 | 1,460,000 | 18.3 GB |         3.4m |
+| Machine                                             | Class | Backend      | Type  | Links | Expansion |    Insertions |       Queries | Recall@10 |  Memory | Date       |
+| :-------------------------------------------------- | :---- | :----------- | :---- | ----: | --------: | ------------: | ------------: | --------: | ------: | :--------- |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads      | -     | USearch 2.25 | `u8`  |    32 | 128 / 256 |  35.405 k IPS |  80.729 k QPS |   99.380% |  4.4 GB | 2026-04-18 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads      | -     | FAISS 1.12   | `u8`  |    32 | 128 / 256 |  26.374 k IPS |  38.278 k QPS |   99.520% |  5.9 GB | 2026-04-18 |
+| NVIDIA B300 SXM6, 148 SMs                           | -     | cuVS 26.10   | `u8`  |    64 | 128 / 128 | 204.838 k IPS |   1.204 M QPS |         - |       - | 2026-10-21 |
+| NVIDIA B300 SXM6, 148 SMs                           | -     | USearch 3.0  | `u8`  |    32 | 256 / 128 | 558.510 k IPS |   1.040 M QPS |   99.110% |  2.6 GB | 2026-10-21 |
+| Intel Xeon 6768P, 2 sockets, 128 cores, 256 threads | -     | FAISS 1.15.1 | `u8`  |    64 |  128 / 96 | 115.643 k IPS | 133.919 k QPS |   99.000% |  8.6 GB | 2026-10-22 |
+| Intel Xeon 6768P, 2 sockets, 128 cores, 256 threads | -     | FAISS 1.15.1 | `f32` |    64 |  128 / 96 |  59.688 k IPS |  61.027 k QPS |   99.000% | 14.4 GB | 2026-10-22 |
 
-### PubChem ECFP4
+cuVS 26.10 ran through NVIDIA's `cuvs-bench` harness rather than `retri-eval-cuvs`, and reported only K-recall@10, 0.9966 here.
+FAISS 1.15.1 ran from the `faiss-cpu` wheel, `u8` through `IndexHNSWSQ` with `QT_8bit_direct` and `f32` through `IndexHNSWFlat`, and its memory is the process's peak resident set, the memory-mapped base included.
 
-2048-bit ECFP4 fingerprints of PubChem molecules under Hamming, all 115,627,256 of them; recipes in [`data/README.md`](data/README.md#usearchmolecules).
+Turing-ANNS, Microsoft's 100-dimensional `f32` web-search embeddings under L2, across storage types, 10,000,000 rows; recipes in [`data/README.md`](data/README.md#microsoft-turing-anns).
 
-#### PubChem ECFP4 100M
+| Machine                                        | Class | Backend      | Type   | Links |   Expansion |   Insertions |       Queries | Recall@10 |  Memory | Date       |
+| :--------------------------------------------- | :---- | :----------- | :----- | ----: | ----------: | -----------: | ------------: | --------: | ------: | :--------- |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `f32`  |    96 |   768 / 384 |  8.532 k IPS |  12.331 k QPS |   99.290% | 13.0 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `bf16` |    96 |   768 / 384 | 10.496 k IPS |  16.940 k QPS |   99.290% | 10.9 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `f16`  |    96 |   768 / 384 | 10.969 k IPS |  20.246 k QPS |   99.290% | 10.9 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `e5m2` |    96 |   768 / 384 | 10.526 k IPS |  20.534 k QPS |   99.190% |  9.8 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `e4m3` |    96 |   768 / 384 |  7.353 k IPS |  12.106 k QPS |   99.300% |  9.8 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `e3m2` |    96 |   768 / 384 | 10.398 k IPS |  18.022 k QPS |   97.280% |  9.8 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `e2m3` |    96 |   768 / 384 | 10.935 k IPS |  21.313 k QPS |   79.410% |  9.8 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | FAISS 1.12   | `f32`  |    96 |   768 / 384 |  7.491 k IPS |  16.486 k QPS |   99.440% | 14.1 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | FAISS 1.12   | `bf16` |    96 |   768 / 384 |  3.800 k IPS |  10.391 k QPS |   99.440% | 12.1 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | FAISS 1.12   | `f16`  |    96 |   768 / 384 |  2.545 k IPS |  10.032 k QPS |   99.440% | 12.1 GB | 2026-04-20 |
+| NVIDIA B300 SXM6, 148 SMs                      | -     | USearch 3.0  | `bf16` |    32 | 1024 / 1024 | 95.870 k IPS | 155.810 k QPS |   99.080% |  3.4 GB | 2026-10-21 |
 
-| Backend      | Device             | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory |  Build |
-| :----------- | :----------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | ------: | -------: | ------: | -----: |
-| USearch 3.0  | 148× NVIDIA SM103  | `b1` |           32 |      32 |  512 / 512 | 0.9906 |       … | 146,810 |  285,230 |       … |  13.1m |
-| USearch 3.0  | 192× Arm Graviton5 | `b1` |           32 |      32 |  512 / 512 | 0.9821 |  0.9038 | 104,412 |   57,807 | 53.6 GB |  18.5m |
-| FAISS 1.15.1 | 192× Arm Graviton5 | `b1` |           32 |      64 |    40 / 16 | 0.5623 |  0.4704 | 341,635 |  839,862 | 93.3 GB |   5.6m |
-| USearch 3.0  | 84× Arm Graviton4  | `b1` |           64 |      64 |  512 / 512 | 0.9931 |  0.9953 |  41,008 |   49,048 | 68.6 GB |  47.0m |
-| FAISS 1.15.1 | 84× Arm Graviton4  | `b1` |           32 |      64 | 512 / 1024 | 0.9870 |  0.9925 |  27,175 |   11,750 | 62.9 GB | 1h 11m |
+The `e3m2` and `e2m3` rows keep the settings of the other types and fall short of 99%.
 
-Neither Graviton5 row reaches 99%, so both break the methodology above:
+### 100M
 
-- USearch on Graviton5 levels off at 0.9843 even at a search expansion of 1,024, short of the 0.9906 the B300 reaches at the same 512 / 512, and at that recall it builds faster than it searches.
-- FAISS's binary HNSW ran there at its compiled-in 40 / 16, since FAISS's parameter tuning has no dispatcher for `IndexBinaryHNSW`.
-- On Graviton4 the harness sets FAISS's expansions directly, and FAISS still levels off at 0.9870, where it builds faster than it searches.
-- 10-recall@10 near 0.90 is tie scoring: Hamming distances tie often, and those rows credited only the exact keys the ground truth kept among tied neighbors.
+PubChem MACCS, 168-bit `b1` fingerprints under Hamming, 100,000,000 molecules, at the settings calibrated at 10M; recipes in [`data/README.md`](data/README.md#usearchmolecules).
 
-### SIFT
+| Machine                                        | Class | Backend      | Type | Links | Expansion |    Insertions |      Queries | Recall@10 |  Memory | Date       |
+| :--------------------------------------------- | :---- | :----------- | :--- | ----: | --------: | ------------: | -----------: | --------: | ------: | :--------- |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `b1` |    64 |  128 / 64 |  35.080 k IPS | 38.432 k QPS |   84.380% | 40.8 GB | 2026-04-18 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | FAISS 1.12   | `b1` |   128 |   40 / 16 |             - |            - |         - | ≥ 63 GB | 2026-04-18 |
+| NVIDIA B300 SXM6, 148 SMs                      | -     | USearch 3.0  | `b1` |    32 |  256 / 64 | 559.140 k IPS |  1.460 M QPS |   99.070% | 18.3 GB | 2026-10-21 |
 
-Meta's 128-dimensional `u8` descriptors under L2, compared at the setting that first reaches 99% recall@10; recipes in [`data/README.md`](data/README.md#meta-bigann-sift).
+FAISS 1.12 was killed after 9 hours, past the memory shown.
 
-#### SIFT 10M
+PubChem ECFP4, 2048-bit `b1` fingerprints under Hamming, all 115,627,256 molecules; recipes in [`data/README.md`](data/README.md#usearchmolecules).
 
-| Backend      | Device            | Type  | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |   Add/s |  Search/s |  Memory | Build |
-| :----------- | :---------------- | :---- | -----------: | ------: | ---------: | -----: | ------: | ------: | --------: | ------: | ----: |
-| USearch 2.25 | 96× Intel Xeon6   | `u8`  |           16 |      32 |  128 / 256 | 0.9938 |       … |  35,405 |    80,729 |  4.4 GB |  4.8m |
-| FAISS 1.12   | 96× Intel Xeon6   | `u8`  |           16 |      32 |  128 / 256 | 0.9952 |       … |  26,374 |    38,278 |  5.9 GB |  5.6m |
-| cuVS 26.10   | 148× NVIDIA SM103 | `u8`  |           64 |      64 |  128 / 128 |      … |  0.9966 | 204,838 | 1,204,000 |       … |  0.8m |
-| USearch 3.0  | 148× NVIDIA SM103 | `u8`  |           32 |      32 |  256 / 128 | 0.9911 |  0.9780 | 558,510 | 1,040,000 |  2.6 GB |  0.3m |
-| FAISS 1.15.1 | 128× Intel Xeon6  | `u8`  |           32 |      64 |   128 / 96 | 0.9900 |  0.9765 | 115,643 |   133,919 |  8.6 GB |  1.4m |
-| FAISS 1.15.1 | 128× Intel Xeon6  | `f32` |           32 |      64 |   128 / 96 | 0.9900 |  0.9765 |  59,688 |    61,027 | 14.4 GB |  2.8m |
+| Machine                   | Class | Backend     | Type | Links | Expansion |    Insertions |       Queries | Recall@10 |  Memory | Date       |
+| :------------------------ | :---- | :---------- | :--- | ----: | --------: | ------------: | ------------: | --------: | ------: | :--------- |
+| NVIDIA B300 SXM6, 148 SMs | -     | USearch 3.0 | `b1` |    32 | 512 / 512 | 146.810 k IPS | 285.230 k QPS |   99.060% |       - | 2026-10-21 |
+| AWS Graviton4, 84 cores   | -     | USearch 3.0 | `b1` |    64 | 512 / 512 |  41.008 k IPS |  49.048 k QPS |   99.310% | 68.6 GB | 2026-11-13 |
 
-#### SIFT 100M
+Both Graviton5 rows and the Graviton4 FAISS row miss 99%, so they stay in the changelog with the reasons.
 
-| Backend      | Device             | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |   Add/s | Search/s |  Memory |        Build |
-| :----------- | :----------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | ------: | -------: | ------: | -----------: |
-| USearch 2.25 | 96× Intel Xeon6    | `u8` |           16 |      32 |  128 / 256 | 0.9833 |       … |  39,831 |   75,808 | 53.7 GB |        48.7m |
-| FAISS 1.12   | 96× Intel Xeon6    | `u8` |           16 |      32 |  128 / 256 |      … |       … |       … |        … | ≥ 46 GB | killed at 9h |
-| cuVS 26.10   | 148× NVIDIA SM103  | `u8` |           64 |      64 |  128 / 256 |      … |  0.9963 | 154,799 |  582,000 |       … |        10.8m |
-| USearch 3.0  | 148× NVIDIA SM103  | `u8` |           32 |      32 |  256 / 256 | 0.9913 |  0.9810 | 431,520 |  604,490 | 24.8 GB |         3.9m |
-| USearch 3.0  | 192× Arm Graviton5 | `u8` |           32 |      32 |  512 / 160 | 0.9925 |  0.9824 | 161,952 |  173,823 | 33.8 GB |        10.3m |
-| FAISS 1.15.1 | 192× Arm Graviton5 | `u8` |           32 |      64 |  256 / 128 | 0.9917 |  0.9792 |  84,536 |  178,600 | 56.9 GB |        19.7m |
-| USearch 3.0  | 84× Arm Graviton4  | `u8` |           64 |      64 |  128 / 128 | 0.9921 |  0.9775 | 185,046 |  208,835 | 46.7 GB |         9.0m |
-| FAISS 1.15.1 | 84× Arm Graviton4  | `u8` |           32 |      64 |  256 / 128 | 0.9912 |  0.9793 |  41,917 |   93,549 | 42.3 GB |        39.8m |
+SIFT, Meta's 128-dimensional `u8` descriptors under L2, 100,000,000 rows; recipes in [`data/README.md`](data/README.md#meta-bigann-sift).
 
-### SpaceV
+| Machine                                          | Class      | Backend      | Type | Links | Expansion |    Insertions |       Queries | Recall@10 |  Memory | Date       |
+| :----------------------------------------------- | :--------- | :----------- | :--- | ----: | --------: | ------------: | ------------: | --------: | ------: | :--------- |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads   | -          | USearch 2.25 | `u8` |    32 | 128 / 256 |  39.831 k IPS |  75.808 k QPS |   98.330% | 53.7 GB | 2026-04-18 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads   | -          | FAISS 1.12   | `u8` |    32 | 128 / 256 |             - |             - |         - | ≥ 46 GB | 2026-04-18 |
+| NVIDIA B300 SXM6, 148 SMs                        | -          | cuVS 26.10   | `u8` |    64 | 128 / 256 | 154.799 k IPS | 582.000 k QPS |         - |       - | 2026-10-21 |
+| NVIDIA B300 SXM6, 148 SMs                        | -          | USearch 3.0  | `u8` |    32 | 256 / 256 | 431.520 k IPS | 604.490 k QPS |   99.130% | 24.8 GB | 2026-10-21 |
+| AWS Graviton5, 192 cores, 192 threads, 2 domains | `apple-m2` | USearch 3.0  | `u8` |    32 | 512 / 160 | 161.952 k IPS | 173.823 k QPS |   99.250% | 33.8 GB | 2026-11-09 |
+| AWS Graviton5, 192 cores, 192 threads, 2 domains | -          | FAISS 1.15.1 | `u8` |    64 | 256 / 128 |  84.536 k IPS | 178.600 k QPS |   99.170% | 56.9 GB | 2026-11-09 |
+| AWS Graviton4, 84 cores                          | -          | USearch 3.0  | `u8` |    64 | 128 / 128 | 185.046 k IPS | 208.835 k QPS |   99.210% | 46.7 GB | 2026-11-13 |
+| AWS Graviton4, 84 cores                          | -          | FAISS 1.15.1 | `u8` |    64 | 256 / 128 |  41.917 k IPS |  93.549 k QPS |   99.120% | 42.3 GB | 2026-11-13 |
 
-Microsoft's 100-dimensional `i8` web-search embeddings under L2, compared at the setting that first reaches 99% 1-recall@10; recipes in [`data/README.md`](data/README.md#microsoft-spacev).
+FAISS 1.12 was killed after 9 hours, past the memory shown.
+cuVS 26.10 ran through NVIDIA's `cuvs-bench` harness rather than `retri-eval-cuvs`, and reported only K-recall@10, 0.9963 here.
+USearch on Graviton5 keeps 32 links, half the 64 the methodology matches, and FAISS there was built from source with its SVE kernels and OpenBLAS.
 
-#### SpaceV 100M
+SpaceV, Microsoft's 100-dimensional `i8` web-search embeddings under L2, 100,000,000 rows; recipes in [`data/README.md`](data/README.md#microsoft-spacev).
 
-| Backend      | Device            | Type | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory |  Build |
-| :----------- | :---------------- | :--- | -----------: | ------: | ---------: | -----: | ------: | -----: | -------: | ------: | -----: |
-| USearch 3.0  | 84× Arm Graviton4 | `i8` |           64 |      64 |  512 / 384 | 0.9934 |  0.9929 | 38,713 |   57,971 | 45.1 GB |  43.1m |
-| FAISS 1.15.1 | 84× Arm Graviton4 | `i8` |           32 |      64 |  512 / 640 | 0.9912 |  0.9908 | 14,975 |   15,773 | 39.5 GB | 1h 51m |
+| Machine                 | Class | Backend      | Type | Links | Expansion |   Insertions |      Queries | Recall@10 |  Memory | Date       |
+| :---------------------- | :---- | :----------- | :--- | ----: | --------: | -----------: | -----------: | --------: | ------: | :--------- |
+| AWS Graviton4, 84 cores | -     | USearch 3.0  | `i8` |    64 | 512 / 384 | 38.713 k IPS | 57.971 k QPS |   99.340% | 45.1 GB | 2026-11-13 |
+| AWS Graviton4, 84 cores | -     | FAISS 1.15.1 | `i8` |    64 | 512 / 640 | 14.975 k IPS | 15.773 k QPS |   99.120% | 39.5 GB | 2026-11-13 |
 
-### Deep
+Deep, Yandex's 96-dimensional `f32` image embeddings under L2, stored as `bf16` by both backends, 100,000,000 rows; recipes in [`data/README.md`](data/README.md#yandex-deep).
 
-Yandex's 96-dimensional `f32` image embeddings under L2, stored as `bf16` by both backends and compared at the setting that first reaches 99% 1-recall@10; recipes in [`data/README.md`](data/README.md#yandex-deep).
+| Machine                 | Class | Backend      | Type   | Links | Expansion |   Insertions |       Queries | Recall@10 |  Memory | Date       |
+| :---------------------- | :---- | :----------- | :----- | ----: | --------: | -----------: | ------------: | --------: | ------: | :--------- |
+| AWS Graviton4, 84 cores | -     | USearch 3.0  | `bf16` |    64 | 256 / 192 | 87.964 k IPS | 118.976 k QPS |   99.340% | 53.1 GB | 2026-11-13 |
+| AWS Graviton4, 84 cores | -     | FAISS 1.15.1 | `bf16` |    64 | 256 / 256 | 48.503 k IPS |  56.920 k QPS |   99.290% | 48.6 GB | 2026-11-13 |
 
-#### Deep 100M
+Turing-ANNS, Microsoft's 100-dimensional `f32` web-search embeddings under L2, across storage types, 100,000,000 rows; recipes in [`data/README.md`](data/README.md#microsoft-turing-anns).
 
-| Backend      | Device            | Type   | Connectivity | Layer 0 | Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory | Build |
-| :----------- | :---------------- | :----- | -----------: | ------: | ---------: | -----: | ------: | -----: | -------: | ------: | ----: |
-| USearch 3.0  | 84× Arm Graviton4 | `bf16` |           64 |      64 |  256 / 192 | 0.9934 |  0.9804 | 87,964 |  118,976 | 53.1 GB | 18.9m |
-| FAISS 1.15.1 | 84× Arm Graviton4 | `bf16` |           32 |      64 |  256 / 256 | 0.9929 |  0.9827 | 48,503 |   56,920 | 48.6 GB | 34.4m |
-
-### Turing-ANNS
-
-Microsoft's 100-dimensional `f32` web-search embeddings under L2, compared at the setting that first reaches 99% recall@10 across storage types; recipes in [`data/README.md`](data/README.md#microsoft-turing-anns).
-
-#### Turing-ANNS 10M
-
-| Backend      | Device            | Type   | Connectivity | Layer 0 |  Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |  Memory | Build |
-| :----------- | :---------------- | :----- | -----------: | ------: | ----------: | -----: | ------: | -----: | -------: | ------: | ----: |
-| USearch 2.25 | 96× Intel Xeon6   | `f32`  |           48 |      96 |   768 / 384 | 0.9929 |       … |  8,532 |   12,331 | 13.0 GB | 18.3m |
-| USearch 2.25 | 96× Intel Xeon6   | `bf16` |           48 |      96 |   768 / 384 | 0.9929 |       … | 10,496 |   16,940 | 10.9 GB | 14.1m |
-| USearch 2.25 | 96× Intel Xeon6   | `f16`  |           48 |      96 |   768 / 384 | 0.9929 |       … | 10,969 |   20,246 | 10.9 GB | 13.5m |
-| USearch 2.25 | 96× Intel Xeon6   | `e5m2` |           48 |      96 |   768 / 384 | 0.9919 |       … | 10,526 |   20,534 |  9.8 GB | 13.5m |
-| USearch 2.25 | 96× Intel Xeon6   | `e4m3` |           48 |      96 |   768 / 384 | 0.9930 |       … |  7,353 |   12,106 |  9.8 GB | 19.4m |
-| USearch 2.25 | 96× Intel Xeon6   | `e3m2` |           48 |      96 |   768 / 384 | 0.9728 |       … | 10,398 |   18,022 |  9.8 GB | 13.3m |
-| USearch 2.25 | 96× Intel Xeon6   | `e2m3` |           48 |      96 |   768 / 384 | 0.7941 |       … | 10,935 |   21,313 |  9.8 GB | 13.2m |
-| FAISS 1.12   | 96× Intel Xeon6   | `f32`  |           48 |      96 |   768 / 384 | 0.9944 |       … |  7,491 |   16,486 | 14.1 GB | 20.6m |
-| FAISS 1.12   | 96× Intel Xeon6   | `bf16` |           48 |      96 |   768 / 384 | 0.9944 |       … |  3,800 |   10,391 | 12.1 GB | 39.4m |
-| FAISS 1.12   | 96× Intel Xeon6   | `f16`  |           48 |      96 |   768 / 384 | 0.9944 |       … |  2,545 |   10,032 | 12.1 GB | 1h 1m |
-| USearch 3.0  | 148× NVIDIA SM103 | `bf16` |           32 |      32 | 1024 / 1024 | 0.9908 |  0.9831 | 95,870 |  155,810 |  3.4 GB |  1.7m |
-
-#### Turing-ANNS 100M
-
-| Backend      | Device            | Type   | Connectivity | Layer 0 |  Expansions | 1-r@10 | 10-r@10 |  Add/s | Search/s |   Memory |  Build |
-| :----------- | :---------------- | :----- | -----------: | ------: | ----------: | -----: | ------: | -----: | -------: | -------: | -----: |
-| USearch 2.25 | 96× Intel Xeon6   | `f32`  |           48 |      96 |   768 / 384 | 0.9929 |       … |  6,646 |   10,398 | 139.6 GB |  4h 1m |
-| USearch 2.25 | 96× Intel Xeon6   | `bf16` |           48 |      96 |   768 / 384 | 0.9931 |       … |  8,564 |   14,772 | 105.2 GB |  3h 1m |
-| USearch 2.25 | 96× Intel Xeon6   | `f16`  |           48 |      96 |   768 / 384 | 0.9930 |       … |  8,807 |   15,412 | 105.2 GB | 2h 54m |
-| USearch 2.25 | 96× Intel Xeon6   | `e5m2` |           48 |      96 |   768 / 384 | 0.9924 |       … |  7,368 |   13,227 |  88.0 GB | 3h 15m |
-| USearch 3.0  | 148× NVIDIA SM103 | `bf16` |           32 |      32 | 1024 / 1024 | 0.9933 |  0.9868 | 88,660 |  156,790 |  32.1 GB |  18.8m |
+| Machine                                        | Class | Backend      | Type   | Links |   Expansion |   Insertions |       Queries | Recall@10 |   Memory | Date       |
+| :--------------------------------------------- | :---- | :----------- | :----- | ----: | ----------: | -----------: | ------------: | --------: | -------: | :--------- |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `f32`  |    96 |   768 / 384 |  6.646 k IPS |  10.398 k QPS |   99.290% | 139.6 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `bf16` |    96 |   768 / 384 |  8.564 k IPS |  14.772 k QPS |   99.310% | 105.2 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `f16`  |    96 |   768 / 384 |  8.807 k IPS |  15.412 k QPS |   99.300% | 105.2 GB | 2026-04-20 |
+| Intel Xeon 6, 2 sockets, 96 cores, 192 threads | -     | USearch 2.25 | `e5m2` |    96 |   768 / 384 |  7.368 k IPS |  13.227 k QPS |   99.240% |  88.0 GB | 2026-04-20 |
+| NVIDIA B300 SXM6, 148 SMs                      | -     | USearch 3.0  | `bf16` |    32 | 1024 / 1024 | 88.660 k IPS | 156.790 k QPS |   99.330% |  32.1 GB | 2026-10-21 |
 
 ## CLI Reference
 
@@ -361,19 +388,37 @@ The flag on the command line overrides the variable, and switches like `--self-s
 <summary>Shared by every <code>retri-eval-*</code> binary</summary>
 
 ```text
-retri-eval-*
+retri-eval-* over vectors
   --base-vectors <PATH|GLOB>            required
       Base vectors to index: .fbin, .u8bin, .i8bin or .b1bin.
-  --base-keys <PATH|GLOB>               generated
-      Keys for the base vectors, one per vector: .i32bin, .u64bin or .uuidbin.
-  --key-type <TYPE>                     u32
-      Keys generated without --base-keys: u32, u64, uuid-v4 or uuid-v7.
   --query-vectors <PATH|GLOB>           required
       Query vectors to search with.
   --query-neighbors <PATH|GLOB>         required
-      Ground-truth neighbor rows for those queries: .ibin, or .u64bin past 2^32 base rows.
-  --top-k <K>                           ground-truth width
-      Neighbors per query, the K every metric is taken at; at most the ground-truth width.
+      Ground-truth neighbor rows for those queries: .ibin, or .u64bin past 2^32 base rows;
+      or .txt of one target row per query.
+  --max-base-vectors <N>                all
+      Cap on the base vectors used, for calibration on a slice.
+  --dims <N,...>                        native
+      Matryoshka truncations, each at most the native width, and a multiple of 8 for .b1bin.
+
+retri-eval-tantivy, retri-eval-elasticsearch
+  --base-texts <PATH>                   required
+      Base entries to index: UTF-8, one per line, the line number being the row.
+  --query-texts <PATH>                  required
+      Query entries to search with, one per line.
+  --query-targets <PATH>                required
+      Each query's target base row, one zero-based row per line.
+  --max-base-entries <N>                all
+      Cap on the base entries used, for calibration on a slice.
+
+retri-eval-*
+  --base-keys <PATH|GLOB>               generated
+      Keys for the base rows, one per row: .i32bin, .u64bin or .uuidbin.
+  --key-type <TYPE>                     u32
+      Keys generated without --base-keys: u32, u64, uuid-v4 or uuid-v7.
+  --top-k <K>                           ground-truth width, or 10 under targets
+      Neighbors per query, the K every metric is taken at; at most the ground-truth width
+      under neighbors, unbounded under targets.
   --insertion-order <ORDER>             shuffled
       shuffled by --seed, or the file's original order.
   --seed <SEED>                         42
@@ -381,9 +426,9 @@ retri-eval-*
   --steps <N>                           10
       Measurement steps; the base is inserted in this many equal parts.
   --inserts-per-core <N>                2048
-      Vectors per add call for each backend thread: --threads on usearch and faiss, one elsewhere.
+      Entries per add call for each backend thread: --threads on usearch, faiss and tantivy, one elsewhere.
   --queries-per-core <N>                2048
-      Queries per search call for each backend thread: --threads on usearch and faiss, one elsewhere.
+      Queries per search call for each backend thread: --threads on usearch, faiss and tantivy, one elsewhere.
   --output <DIR>                        none
       Directory for JSON result files; progress only when unset.
   --memory-limit <SIZE>                 cgroup memory.max, else all RAM
@@ -391,12 +436,8 @@ retri-eval-*
       container's memory and swap limit, beside the process's CPU affinity as their cpuset.
   --perf-counters                       off
       Record hardware counters per phase; needs the perf-counters feature on Linux.
-  --max-base-vectors <N>                all
-      Cap on the base vectors used, for calibration on a slice.
-  --dims <N,...>                        native
-      Matryoshka truncations, each at most the native width, and a multiple of 8 for .b1bin.
   --self-search                         off
-      After the last insertion, replay indexed vectors as their own queries.
+      After the last insertion, replay indexed entries as their own queries.
   --self-search-top-k <K>               10
       Neighbors per self-search query.
   --self-search-sample <N|FRACTION>     all
@@ -546,6 +587,30 @@ retri-eval-turso
 </details>
 
 <details>
+<summary>Text engines: <code>retri-eval-tantivy</code> & <code>retri-eval-elasticsearch</code></summary>
+
+```text
+retri-eval-tantivy, retri-eval-elasticsearch
+  --fuzziness <EDITS,...>               0
+      Edits a query term may differ by: 0, 1, 2, or AUTO for none up to 2 characters, one up to 5
+      and two beyond, as Elasticsearch spells it.
+
+retri-eval-tantivy
+  --threads <N,...>                     0
+      Search threads, 0 for every core in the affinity mask; Tantivy picks its own indexing threads.
+  --writer-memory <SIZE>                1GB
+      Memory the index writer buffers before it writes a segment, a budget `Index::writer` requires.
+
+retri-eval-elasticsearch
+  --startup-time-limit <DURATION>       120s
+      Time limit for container start and readiness.
+  --port <PORT>                         9200
+      Host HTTP port.
+```
+
+</details>
+
+<details>
 <summary>Dataset tools: <code>retri-generate</code>, <code>retri-ground-truth</code>, <code>retri-download-molecules</code> & <code>retri-download-cohere</code></summary>
 
 ```text
@@ -638,7 +703,7 @@ Use `--self-search-sample` to cap the sweep (e.g. `0.1` for a tenth, or `50000` 
 It is also the metric that survives `--max-base-vectors` most cleanly.
 Ground-truth files name neighbors drawn from the whole published base, so capping a run to a slice drags recall down by roughly the cap ratio no matter how good the index is — a quarter-size slice of the SIFT base reports about 0.25, not 0.99.
 The harness does not divide that back out: the correction would assume the indexed slice is a uniform sample of the base, and a leading-prefix cap is not one.
-It reports the raw figure and, in `dataset.vectors_count`, the divisor — coverage is `steps[].vectors_indexed / dataset.vectors_count`, plotted as `coverage.png`.
+It reports the raw figure and, in `dataset.entries_count`, the divisor — coverage is `steps[].entries_indexed / dataset.entries_count`, plotted as `coverage.png`.
 Self-recall needs no such correction at all: identity truth is computed against exactly the vectors that were inserted.
 
 Three caveats are worth knowing before quoting the numbers.
@@ -650,28 +715,6 @@ On a base whose row order carries structure, only the default full sweep is unbi
 Note also that a self-search's `recall_at_k` is very nearly redundant with its `recall_at_1`: a vector's own distance to itself is zero, which is minimal, so if the index retrieves it at all it lands at rank 1.
 Raising `--self-search-top-k` therefore changes how much search work each query does — which is the point when you are measuring throughput — but not the recall value.
 
-### Keys & Order
-
-Keys stay as wide as their input: a keys file is memory-mapped at its own width, and generated keys are computed from the row on demand, so neither costs memory per row.
-`uuid-v7` keys hold the row in their timestamp and counter, so they sort as rows do, while `uuid-v4` keys scatter over the whole key space.
-Each engine stores keys natively where it can:
-
-- __USearch__ takes every key as its 16-byte `Key`.
-- __Qdrant__ keeps keys that fit 64 bits as numeric point ids and the rest as UUID point ids.
-- __Weaviate and SurrealDB__ use each key as the object or record UUID, integers zero-padded.
-- __Redis__ spells keys as UUIDs in the hash names.
-- __LanceDB__ sizes its `id` column to `UInt32`, `UInt64` or `FixedSizeBinary(16)`.
-- __FAISS, cuVS and Turso__ store base rows as their ids and name hits by the rows' keys, so keys of any width cost them nothing; cuVS saves those rows to a `.rows` file beside its index.
-
-Duplicate keys suit USearch and the engines that store rows, FAISS, cuVS and Turso, since the others overwrite a repeated id.
-
-`--insertion-order shuffled` is a seeded Feistel permutation computed per position, so a shuffle of any size stores nothing per row.
-
-## Observability
-
-Building with `--features perf-counters` and passing `--perf-counters` adds per-phase hardware counters on Linux, and an external `perf stat` sidecar works on any build.
-[`src/README.md`](src/README.md) covers both, along with how each backend measures `memory_bytes`, which differs from one backend to the next.
-
 ## Output Format
 
 One JSON file per backend configuration, written to `--output <dir>`.
@@ -679,14 +722,16 @@ Files are auto-named `<backend>-<hash>.json`.
 
 ```json
 {
+  "schema_version": 2, "started_unix_seconds": 1795046400,
   "machine": { "cpu_model": "Intel Xeon 6776P", "physical_cores": 96,
                "budget": { "cores": 192, "cpus": "0-191", "memory_limit": 549755813888 }, ... },
-  "dataset": { "base_vectors_path": "...", "vectors_count": 10000000, "dimensions": 100, ... },
+  "dataset": { "base_path": "...", "entries_count": 10000000, "base_bytes": 4000000000,
+               "dimensions": 100, "truth": "neighbors", ... },
   "config": { "backend": "usearch", "data_type": "f32", "metric": "l2", "connectivity": 16,
-              "dimensions": 100, "vectors_count": 10000000, "top_k": 10, ... },
+              "dimensions": 100, "entries_count": 10000000, "top_k": 10, ... },
   "steps": [
     {
-      "vectors_indexed": 1000000,
+      "entries_indexed": 1000000,
       "memory_bytes": 412000000, "process_anon_bytes": 436000000,
       "add": { "elapsed": 12.3, "throughput": 81300 },
       "refine": { "passes": 2, "elapsed": 6.8, "changed": [412000, 61000] },
@@ -699,22 +744,83 @@ Files are auto-named `<backend>-<hash>.json`.
       "self_search": {
         "queries": 1000000, "passes": 1, "top_k": 10,
         "elapsed": 1.6, "throughput": 627541,
-        "recall_at_1": 0.9958, "recall_at_k": 0.9961
+        "recall_at_1": 0.9958, "recall_at_k": 0.9961, "mrr_at_k": 0.9959
       }
     }
   ]
 }
 ```
 
-A step pairs the index state (`vectors_indexed`, `memory_bytes`, `process_anon_bytes`) with the phases that acted on it.
+A step pairs the index state (`entries_indexed`, `memory_bytes`, `process_anon_bytes`) with the phases that acted on it.
 `add.elapsed` includes the wait until a server finishes indexing what was added.
 A ground-truth search runs one untimed pass to warm the index, then repeats every query until at least 5 seconds pass, and `passes` counts the timed ones.
 `refine` appears on the last insert step when `--max-refines` ran refinement rounds, which stop at the first that does not improve the graph; `passes` counts the rounds that ran and `changed` the rows each one re-wired.
 `add` is `null` on the `--index` load path, where nothing was inserted; `self_search` appears on at most one step — the last — because it runs once against the finished index, and that step is the index state it ran against.
 Its metrics drop the `self_` prefix because the container already says it, and it carries no `intersection_at_k` or `ndcg_at_k`: identity truth is a single key per query, so neither a set overlap nor a ranked gain says anything beyond `recall_at_1`.
+It carries `mrr_at_k` instead, the mean reciprocal rank of each query's own key within the top-k.
+`dataset.truth` names the judge: `neighbors` rescores answers by exact distance, while `targets` credits only each query's target row, reporting success@1 and success@k as `recall_at_1` and `recall_at_k` beside `mrr_at_k`.
 
-`dataset` describes the input files and `config` describes the run, so `dataset.vectors_count` is the base file's row count while `config.vectors_count` is what `--max-base-vectors` actually indexed; divide `steps[].vectors_indexed` by the former for the share of the ground truth a step could possibly have found.
-`dataset.dimensions` is likewise the file's width, and `config.dimensions` the width a `--dims` sweep truncated to.
+`dataset` describes the input files and `config` describes the run, so `dataset.entries_count` is the base file's row count while `config.entries_count` is what `--max-base-vectors` or `--max-base-entries` actually indexed; divide `steps[].entries_indexed` by the former for the share of the ground truth a step could possibly have found.
+`dataset.dimensions` is likewise the file's width, and `config.dimensions` the width a `--dims` sweep truncated to; both are absent from text runs, while `dataset.base_bytes` counts the base rows' bytes in every run.
+
+Building with `--features perf-counters` and passing `--perf-counters` adds per-phase hardware counters on Linux, and an external `perf stat` sidecar works on any build.
+[`src/README.md`](src/README.md) covers both, along with how each backend measures `memory_bytes`, which differs from one backend to the next.
+
+## Project Layout
+
+```text
+src/bench.rs                     Library root, shared benchmark infrastructure for every binary
+src/dataset.rs                   Memory-mapped vectors and text corpora, key mappings, ground truth
+src/eval.rs                      Recall, intersection and ranking metrics, by exact distance or target
+src/ground_truth.rs              Exact top-K ground truth over NumKong's packed distance kernels
+src/packed_distance.rs           One trait over NumKong's packed Hamming and Euclidean kernels
+src/output.rs                    Typed reports, machine information and JSON serialization
+src/error.rs                     Errors of dataset parsing and brute-force ground truth
+src/perf_counters.rs             Optional scoped Linux hardware counters
+src/docker.rs                    Container lifecycle for the server backends
+src/download.rs                  HTTP shard fetching shared by the dataset downloaders
+src/usearch.rs                   retri-eval-usearch
+src/faiss.rs                     retri-eval-faiss
+src/faiss.cpp                    Binary HNSW expansions that FAISS's C API leaves unreachable
+src/cuvs.rs                      retri-eval-cuvs, over CAGRA
+src/qdrant.rs                    retri-eval-qdrant
+src/redis.rs                     retri-eval-redis, over RediSearch
+src/weaviate.rs                  retri-eval-weaviate
+src/lancedb.rs                   retri-eval-lancedb, in-process
+src/turso.rs                     retri-eval-turso, exact search in-process
+src/surrealdb.rs                 retri-eval-surrealdb
+src/tantivy.rs                   retri-eval-tantivy, BM25 over text entries
+src/elasticsearch.rs             retri-eval-elasticsearch, BM25 over text entries
+src/generate.rs                  retri-generate, synthetic datasets with exact ground truth
+src/compute_ground_truth.rs      retri-ground-truth, for an existing base and query set
+src/README.md                    Hardware counters, perf stat sidecar and memory accounting
+scripts/download.sh              Fetches a public dataset under the names the commands above use
+scripts/download_molecules.rs    retri-download-molecules, USearchMolecules fingerprints and conformers
+scripts/download_cohere.rs       retri-download-cohere, Cohere Wikipedia binary embeddings
+scripts/plot.py                  SVG charts from the JSON reports
+```
+
+Directory guides describe [observability and memory accounting](src/README.md), [datasets](data/README.md), and [server backends](docker/README.md).
+
+## Benchmark Pitfalls
+
+- Throughput means nothing without its recall: an engine that looks faster at its default setting may answer fewer queries once both are swept to the same 0.99 recall, so [Results](#results) compares configurations at matched recall.
+- An index that builds faster than it searches is under-built: raise the construction expansion and lower the search expansion until search is at least as fast at that recall.
+- 1-recall@K and K-recall@K answer different questions, neither bounds the other, and 1-recall@K stops discriminating as K grows; pass `--top-k 10` for figures comparable across datasets.
+- Shipped query files are small, so a QPS figure over one burst says nothing about sustained throughput; [self-recall](#self-recall) replays the base under load, but its traversal converges faster than on real queries.
+- Capping a run with `--max-base-vectors` drags ground-truth recall down by roughly the cap ratio, which the harness reports rather than divides out.
+- Each backend measures `memory_bytes` its own way, from an index's own figure to a container's anonymous bytes without the page cache, as [`src/README.md`](src/README.md#memory-accounting) details.
+- On servers, `add.elapsed` includes the wait until the server finishes indexing what was added.
+- Keep query concurrency, batch size and cache state comparable between engines.
+
+## Remaining Scope
+
+The following planned capabilities remain incomplete:
+
+- A USearch sequence backend, scoring text entries by Levenshtein and Needleman-Wunsch inside this harness, waits for USearch's sequence index redesign.
+- `.f16bin` inputs, which WikiVerse ships, along with its ground-truth pipeline.
+- Multi-vector search, which WikiVerse's ColBERT embeddings need at 128 dimensions per token.
+- Graph search on LanceDB, until upstream offers HNSW without a trained IVF layer.
 
 ## Development
 
@@ -722,3 +828,10 @@ The repository pins Rust 1.100.
 CI runs `cargo fmt --check`, Ruff on the plotting script, then `cargo clippy` and `cargo test` per feature set; pass the same `--features` locally for optional native engines.
 `src/` holds the shared library in `bench.rs`, one binary per backend and `retri-generate`, `scripts/` the dataset downloaders and plotting, `.githooks/` the Git hooks, and `docker/` the compose files for the server backends.
 Arm the hooks once per clone with `git config core.hooksPath .githooks`.
+The pre-commit hook checks the staged lines against the house style, with rustfmt, Ruff and markdownlint where they are installed.
+
+## History
+
+RetriEval began in 2023 as USearch Benchmarks, Python scripts comparing USearch with FAISS on the billion-vector Deep1B dataset, with adapters for HNSWlib, SCANN, LanceDB, Qdrant and Weaviate.
+In 2026 it was rewritten in Rust as one executable per backend, with multi-configuration sweeps, one JSON report per configuration, and Redis and cuVS backends.
+Version 3 moves to the USearch v3 dense index and drops client-side shards, in step with the USearch 3 line it measures.
