@@ -68,6 +68,8 @@ This covers the whole process lifetime, dataset loading and ground-truth I/O inc
 - __FAISS, LanceDB and Turso__ report the process's anonymous resident bytes, `RssAnon`, which leave out the memory-mapped dataset.
 - __cuVS__ computes it: the host copy of the vectors and keys, plus the device vectors and a graph of `--connectivity` edges per vector.
 - __Qdrant, Redis, Weaviate and SurrealDB__ report the container's anonymous bytes from its cgroup's `memory.stat`, without the page cache; see [`docker/README.md`](../docker/README.md).
+- Tantivy reports the bytes its RAM index occupies, as the searcher's space usage counts them.
+- Elasticsearch reports the container's anonymous bytes as the other servers do, its JVM heap included.
 
 `steps[].process_anon_bytes` is the harness process's own `RssAnon` on every backend, so USearch's index figure sits beside the process's.
 

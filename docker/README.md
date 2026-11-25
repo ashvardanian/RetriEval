@@ -1,7 +1,7 @@
 # Docker
 
-Qdrant, Redis, Weaviate and SurrealDB run as Docker containers that each `retri-eval-*` binary spawns and tears down itself.
-The compose files here mirror the port bindings and environment variables hard-coded in the Qdrant, Redis and Weaviate binaries, for starting a server by hand; SurrealDB's settings live only in `src/surrealdb.rs`.
+Qdrant, Redis, Weaviate, SurrealDB and Elasticsearch run as Docker containers that each `retri-eval-*` binary spawns and tears down itself.
+The compose files here mirror the port bindings and environment variables hard-coded in the Qdrant, Redis and Weaviate binaries, for starting a server by hand; SurrealDB's and Elasticsearch's settings live only in `src/surrealdb.rs` and `src/elasticsearch.rs`.
 
 ## Lifecycle
 
@@ -9,8 +9,8 @@ The compose files here mirror the port bindings and environment variables hard-c
 
 1. __Pull__ the pinned image if it is not cached locally.
 2. __Run__ it with the binary's port bindings and environment variables, on the harness's own CPU affinity as its cpuset and `--memory-limit` as its memory and swap limit.
-3. __Wait__ until it answers: Qdrant's `/healthz`, Weaviate's `/v1/.well-known/ready`, SurrealDB's `/health`, or a TCP connect followed by a successful PING for Redis, bounded by `--startup-time-limit`.
-4. __Benchmark__ against the container, waiting after each add phase until the server finishes indexing: Qdrant's collection turns green, Weaviate's shards report `READY`, and Redis's `FT.INFO` shows the scan done.
+3. __Wait__ until it answers: Qdrant's `/healthz`, Weaviate's `/v1/.well-known/ready`, SurrealDB's `/health`, Elasticsearch's `/_cluster/health`, or a TCP connect followed by a successful PING for Redis, bounded by `--startup-time-limit`.
+4. __Benchmark__ against the container, waiting after each add phase until the server finishes indexing: Qdrant's collection turns green, Weaviate's shards report `READY`, Redis's `FT.INFO` shows the scan done, and Elasticsearch's `_refresh` returns.
 5. __Stop and remove__ it when the backend owning its handle is dropped.
    Startup failures before ownership transfers, forced termination or aborted processes can leave a container for manual removal.
 

@@ -4,7 +4,7 @@ version = "3.0.0-rc.1"
 license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.100"
-description = "RetriEval — benchmark suite for vector search engines"
+description = "RetriEval — benchmark suite for vector and text search engines"
 
 [lib]
 name = "retrieval"
@@ -54,6 +54,16 @@ required-features = ["turso-backend"]
 name = "retri-eval-surrealdb"
 path = "src/surrealdb.rs"
 required-features = ["surrealdb-backend"]
+
+[[bin]]
+name = "retri-eval-tantivy"
+path = "src/tantivy.rs"
+required-features = ["tantivy-backend"]
+
+[[bin]]
+name = "retri-eval-elasticsearch"
+path = "src/elasticsearch.rs"
+required-features = ["elasticsearch-backend"]
 
 [[bin]]
 name = "retri-generate"
@@ -113,6 +123,9 @@ arrow-schema = { version = "58", optional = true }
 
 turso = { version = "=0.8.1", default-features = false, optional = true }
 
+# Tantivy, held in RAM, so its memory-mapped directories stay out.
+tantivy = { version = "0.24", default-features = false, optional = true }
+
 # cuVS
 cuvs = { version = "26.4", optional = true }
 cuvs-sys = { version = "26.4", optional = true }
@@ -152,6 +165,8 @@ lancedb-backend = ["tier2", "lancedb", "arrow-array", "arrow-schema"]
 weaviate-backend = ["tier2", "itertools"]
 turso-backend = ["turso", "tokio"]
 surrealdb-backend = ["tier2", "itertools"]
+tantivy-backend = ["tantivy"]
+elasticsearch-backend = ["tier2"]
 cuvs-backend = ["cuvs", "cuvs-sys", "itertools"]
 ground-truth = []
 generate = ["ground-truth", "rand"]
