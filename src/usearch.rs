@@ -95,8 +95,8 @@ use usearch::{
 };
 
 use retrieval::{
-    run_config, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile, Key,
-    StepRefineEntry, SweepSummary, Threads, UnwrapOrBail, Vectors,
+    run_config, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Dataset, Distance, Hits, IndexConfig,
+    IndexFile, Key, StepRefineEntry, SweepSummary, Threads, UnwrapOrBail, Vectors,
 };
 
 #[derive(Parser, Debug)]
@@ -408,6 +408,8 @@ impl<'cli> USearchBackend<'cli> {
 }
 
 impl Backend for USearchBackend<'_> {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> HashMap<String, Value> {
         self.metadata.clone()
     }

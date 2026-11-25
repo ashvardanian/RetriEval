@@ -1,4 +1,5 @@
-//! Recall, intersection, and ranking metrics over borrowed search results, judged by exact distance.
+//! Recall, intersection, and ranking metrics over borrowed search results, judged by exact distance
+//! or by each query's one known target.
 
 use std::{alloc::System, iter::Sum, ops::Add};
 
@@ -123,9 +124,13 @@ pub struct Scores {
     /// The mean share of each query's top `k` within the `k`-th true distance, at most `k` of them:
     /// K-recall@K, FAISS's `IntersectionCriterion`, and what ann-benchmarks and cuVS publish as
     /// recall. It ignores rank and does not saturate as K grows, which keeps it informative at K=100.
-    pub intersection_at_k: f64,
+    /// Absent under a known-item judge, whose truth is a single key.
+    pub intersection_at_k: Option<f64>,
     /// Discounted gain of the answers within the `k`-th true distance, normalized by the best possible.
-    pub ndcg_at_k: f64,
+    pub ndcg_at_k: Option<f64>,
+    /// The mean reciprocal rank of each query's target within the top `k`, zero where it is missing;
+    /// present only under a known-item judge.
+    pub mrr_at_k: Option<f64>,
 }
 
 /// Every metric summed over the queries scored. Sums add associatively, so the partial sums of any
@@ -192,8 +197,9 @@ impl ScoreSums {
         Scores {
             recall_at_1: mean(self.recall_at_1),
             recall_at_k: mean(self.recall_at_k),
-            intersection_at_k: mean(self.intersection_at_k),
-            ndcg_at_k: mean(self.ndcg_at_k),
+            intersection_at_k: Some(mean(self.intersection_at_k)),
+            ndcg_at_k: Some(mean(self.ndcg_at_k)),
+            mrr_at_k: None,
         }
     }
 }
@@ -237,23 +243,62 @@ pub fn score<'a>(
     Ok(sums.mean())
 }
 
-/// Counts the queries whose own `expected` key came back at rank 1 and within the top `k`.
+/// Known-item counts summed over the queries scored.
+#[derive(Clone, Copy, Default)]
+pub struct KnownItemHits {
+    /// Queries whose target came back first.
+    pub at_1: usize,
+    /// Queries whose target came back within the top `k`.
+    pub at_k: usize,
+    /// The sum of `1 / rank` over the queries whose target came back within the top `k`.
+    pub reciprocal_ranks: f64,
+}
+
+impl Add for KnownItemHits {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            at_1: self.at_1 + other.at_1,
+            at_k: self.at_k + other.at_k,
+            reciprocal_ranks: self.reciprocal_ranks + other.reciprocal_ranks,
+        }
+    }
+}
+
+impl KnownItemHits {
+    /// The means over `queries`: success@1 and success@k as `recall_at_1` and `recall_at_k`, and MRR@k.
+    pub fn mean(self, queries: usize) -> Scores {
+        let queries = queries.max(1) as f64;
+        Scores {
+            recall_at_1: self.at_1 as f64 / queries,
+            recall_at_k: self.at_k as f64 / queries,
+            intersection_at_k: None,
+            ndcg_at_k: None,
+            mrr_at_k: Some(self.reciprocal_ranks / queries),
+        }
+    }
+}
+
+/// Ranks each query's one `target` key among its `found` keys, best first, within the top `k`.
 ///
-/// Self-recall needs no ground-truth file: a vector that is in the index is its own nearest
-/// neighbor. Exact-duplicate vectors in the base can cost a hit, since either twin may take rank
-/// 1, so self-recall below 1.0 bounds the index's error rate from above rather than measuring it.
-pub fn self_recall_hits<'a>(
+/// Only the target itself is credited, so a tied or duplicate entry that outranks it costs the
+/// query, and a self-search scores below 1.0 wherever the base repeats an entry.
+pub fn known_item_hits<'a>(
     found: impl Iterator<Item = &'a [Key]>,
-    expected: impl Iterator<Item = Key>,
+    targets: impl Iterator<Item = Key>,
     k: usize,
-) -> (usize, usize) {
-    found.zip(expected).fold((0, 0), |(at_1, at_k), (found, expected)| {
-        let results = &found[..found.len().min(k)];
-        (
-            at_1 + usize::from(results.first() == Some(&expected)),
-            at_k + usize::from(results.contains(&expected)),
-        )
-    })
+) -> KnownItemHits {
+    found
+        .zip(targets)
+        .fold(KnownItemHits::default(), |sums, (found, target)| {
+            let rank = found[..found.len().min(k)].iter().position(|&key| key == target);
+            sums + KnownItemHits {
+                at_1: usize::from(rank == Some(0)),
+                at_k: usize::from(rank.is_some()),
+                reciprocal_ranks: rank.map_or(0.0, |rank| 1.0 / (rank + 1) as f64),
+            }
+        })
 }
 
 /// Precomputed log2 table for NDCG discount factors: 1/log2(rank+1) for rank 1..=K.
@@ -268,7 +313,8 @@ fn discount_table(k: usize) -> Vec<f64, System> {
 
 #[cfg(test)]
 mod tests {
-    use super::{discount_table, ScoreSums};
+    use super::{discount_table, known_item_hits, ScoreSums};
+    use crate::Key;
 
     /// Without ties, counting by exact distance agrees with counting the truth's own keys.
     #[test]
@@ -277,7 +323,7 @@ mod tests {
         let truth = [1.0, 2.0, 3.0];
         // The answers hold the first and third true neighbors, then one past the truth.
         let found = ScoreSums::of_query(&[1.0, 3.0, 5.0], &truth, &discount).mean();
-        assert_eq!((found.recall_at_1, found.intersection_at_k), (1.0, 2.0 / 3.0));
+        assert_eq!((found.recall_at_1, found.intersection_at_k), (1.0, Some(2.0 / 3.0)));
         let missed = ScoreSums::of_query(&[2.0, 3.0, 5.0], &truth, &discount).mean();
         assert_eq!((missed.recall_at_1, missed.recall_at_k), (0.0, 0.0));
     }
@@ -291,9 +337,26 @@ mod tests {
         let tied = ScoreSums::of_query(&[0.0, 4.0, 9.0 + 1e-7], &truth, &discount).mean();
         assert_eq!(
             (tied.recall_at_1, tied.intersection_at_k, tied.ndcg_at_k),
-            (1.0, 1.0, 1.0)
+            (1.0, Some(1.0), Some(1.0))
         );
         let farther = ScoreSums::of_query(&[0.0, 4.0, 9.1], &truth, &discount).mean();
-        assert_eq!(farther.intersection_at_k, 2.0 / 3.0);
+        assert_eq!(farther.intersection_at_k, Some(2.0 / 3.0));
+    }
+
+    /// The target's rank sets every known-item metric, and a duplicate ranked above it earns nothing.
+    #[test]
+    fn known_items_rank_only_the_target() {
+        let [target, duplicate, other] = [7u32, 8, 9].map(Key::from);
+        let found = [
+            vec![target, other],
+            vec![duplicate, other, target],
+            vec![other, duplicate, other, target],
+        ];
+        let hits = known_item_hits(found.iter().map(Vec::as_slice), [target; 3].into_iter(), 3);
+        assert_eq!((hits.at_1, hits.at_k), (1, 2));
+        assert_eq!(hits.reciprocal_ranks, 1.0 + 1.0 / 3.0);
+        let scores = hits.mean(3);
+        assert_eq!(scores.mrr_at_k, Some((1.0 + 1.0 / 3.0) / 3.0));
+        assert_eq!(scores.intersection_at_k, None);
     }
 }

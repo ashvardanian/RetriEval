@@ -29,7 +29,7 @@ use serde_json::json;
 
 use retrieval::{
     docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CastScratch,
-    CommonArgs, Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    CommonArgs, Dataset, Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const INDEX_NAME: &str = "bench_idx";
@@ -267,6 +267,8 @@ impl<'a> RedisBackend<'a> {
 }
 
 impl Backend for RedisBackend<'_> {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
         let mut metadata = self.metadata.clone();
         let limits = self.runtime.block_on(self.container.limits());

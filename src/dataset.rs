@@ -1,4 +1,4 @@
-//! Memory-mapped vector datasets, key mappings, and ground truth.
+//! Memory-mapped vector datasets and text corpora, key mappings, and ground truth.
 
 use std::{
     alloc::System,
@@ -9,7 +9,51 @@ use std::{
 
 use memmap2::Mmap;
 
-use crate::{error::DatasetError, mix, stream_key, Key, KeyType, Seed, VectorSlice, Vectors};
+use crate::{error::DatasetError, mix, stream_key, Key, KeyType, Seed, Thousands, VectorSlice, Vectors};
+
+/// Rows a backend reads, loaded once and handed to it in batches, borrowed in place where they can be.
+pub trait Corpus: Sized {
+    /// One batch, borrowed from the corpus or from its scratch.
+    type Rows<'a>
+    where
+        Self: 'a;
+    /// How every row of one config is exposed, such as a truncated width.
+    type View: Copy;
+    /// Where batches that cannot borrow the corpus are copied.
+    type Scratch: Default;
+
+    fn load(path: &Path) -> io::Result<Self>;
+    fn rows(&self) -> usize;
+    /// Bytes the rows occupy in their files.
+    fn bytes(&self) -> u64;
+    /// Grows `scratch` to hold a batch of `rows` at `view`.
+    fn reserve(&self, scratch: &mut Self::Scratch, rows: usize, view: Self::View);
+    /// The rows `start..start + count`, borrowed when they are contiguous in place.
+    fn slice<'a>(
+        &'a self,
+        start: usize,
+        count: usize,
+        view: Self::View,
+        scratch: &'a mut Self::Scratch,
+    ) -> Self::Rows<'a>;
+    /// The listed rows, copied into `scratch`.
+    fn gather<'a>(
+        &'a self,
+        rows: impl IntoIterator<Item = usize>,
+        view: Self::View,
+        scratch: &'a mut Self::Scratch,
+    ) -> Self::Rows<'a>;
+
+    /// The vectors exact-neighbor truth is rescored over; `None` for rows without a distance.
+    fn vectors(&self) -> Option<&Dataset> {
+        None
+    }
+
+    /// The width `view` exposes, reported as `dimensions`; `None` for rows without one.
+    fn dimensions(_view: Self::View) -> Option<usize> {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarFormat {
@@ -396,6 +440,176 @@ impl Dataset {
     }
 }
 
+impl Corpus for Dataset {
+    type Rows<'a> = Vectors<'a>;
+    /// The truncated dimensions.
+    type View = usize;
+    type Scratch = Vec<u8>;
+
+    fn load(path: &Path) -> io::Result<Self> {
+        Dataset::load(path)
+    }
+
+    fn rows(&self) -> usize {
+        Dataset::rows(self)
+    }
+
+    fn bytes(&self) -> u64 {
+        (self.rows() * self.vector_bytes()) as u64
+    }
+
+    fn reserve(&self, scratch: &mut Self::Scratch, rows: usize, _view: usize) {
+        let bytes = rows * self.vector_bytes();
+        if scratch.len() < bytes {
+            scratch.resize(bytes, 0);
+        }
+    }
+
+    fn slice<'a>(&'a self, start: usize, count: usize, view: usize, scratch: &'a mut Self::Scratch) -> Vectors<'a> {
+        Dataset::slice(self, start, count, view, scratch)
+    }
+
+    fn gather<'a>(
+        &'a self,
+        rows: impl IntoIterator<Item = usize>,
+        view: usize,
+        scratch: &'a mut Self::Scratch,
+    ) -> Vectors<'a> {
+        Dataset::gather(self, rows, view, scratch)
+    }
+
+    fn vectors(&self) -> Option<&Dataset> {
+        Some(self)
+    }
+
+    fn dimensions(view: usize) -> Option<usize> {
+        Some(view)
+    }
+}
+
+/// A memory-mapped UTF-8 file of one entry per line, the line number being its row, as StringKilla's
+/// bases and queries are laid out.
+pub struct TextCorpus {
+    mmap: Mmap,
+    /// Where each line starts, then the file's end: one more offset than lines.
+    starts: Vec<u64, System>,
+}
+
+/// A batch of text entries: line bytes and one more offset into them than entries, as USearch's
+/// `Tape` lays entries out.
+#[derive(Clone, Copy)]
+pub struct Texts<'a> {
+    bytes: &'a [u8],
+    offsets: &'a [u64],
+}
+
+impl<'a> Texts<'a> {
+    pub fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Entry `row`, without its line ending.
+    pub fn get(&self, row: usize) -> &'a str {
+        let line = &self.bytes[self.offsets[row] as usize..self.offsets[row + 1] as usize];
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // SAFETY: the file was validated as UTF-8 once, and lines split at ASCII bytes.
+        unsafe { std::str::from_utf8_unchecked(line) }
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a str> + 'a {
+        let texts = *self;
+        (0..self.len()).map(move |row| texts.get(row))
+    }
+}
+
+/// The lines of a shuffled batch, copied end to end.
+pub struct TextScratch {
+    bytes: Vec<u8, System>,
+    offsets: Vec<u64, System>,
+}
+
+impl Default for TextScratch {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new_in(System),
+            offsets: Vec::new_in(System),
+        }
+    }
+}
+
+impl Corpus for TextCorpus {
+    type Rows<'a> = Texts<'a>;
+    type View = ();
+    type Scratch = TextScratch;
+
+    fn load(path: &Path) -> io::Result<Self> {
+        // SAFETY: the inputs are read-only files nothing else writes during a run.
+        let mmap = unsafe { Mmap::map(&File::open(path)?)? };
+        std::str::from_utf8(&mmap)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {error}", path.display())))?;
+        let lines = mmap.iter().filter(|&&byte| byte == b'\n').count();
+        let mut starts = Vec::with_capacity_in(lines + 2, System);
+        starts.push(0);
+        starts.extend(
+            mmap.iter()
+                .enumerate()
+                .filter(|&(_, &byte)| byte == b'\n')
+                .map(|(position, _)| position as u64 + 1),
+        );
+        // A last line without a final newline still counts.
+        if starts.last() != Some(&(mmap.len() as u64)) {
+            starts.push(mmap.len() as u64);
+        }
+        Ok(Self { mmap, starts })
+    }
+
+    fn rows(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    fn bytes(&self) -> u64 {
+        self.mmap.len() as u64
+    }
+
+    fn reserve(&self, scratch: &mut TextScratch, rows: usize, _view: ()) {
+        scratch.offsets.clear();
+        scratch.offsets.reserve(rows + 1);
+    }
+
+    fn slice<'a>(&'a self, start: usize, count: usize, _view: (), _scratch: &'a mut TextScratch) -> Texts<'a> {
+        let count = count.min(self.rows() - start);
+        Texts {
+            bytes: &self.mmap,
+            offsets: &self.starts[start..=start + count],
+        }
+    }
+
+    fn gather<'a>(
+        &'a self,
+        rows: impl IntoIterator<Item = usize>,
+        _view: (),
+        scratch: &'a mut TextScratch,
+    ) -> Texts<'a> {
+        scratch.bytes.clear();
+        scratch.offsets.clear();
+        scratch.offsets.push(0);
+        for row in rows {
+            let line = &self.mmap[self.starts[row] as usize..self.starts[row + 1] as usize];
+            scratch.bytes.extend_from_slice(line);
+            scratch.offsets.push(scratch.bytes.len() as u64);
+        }
+        Texts {
+            bytes: &scratch.bytes,
+            offsets: &scratch.offsets,
+        }
+    }
+}
+
 /// The order rows are inserted in: the file's own, which reads rows in place, or a seeded shuffle.
 pub enum Permutation {
     Identity,
@@ -596,5 +810,167 @@ impl GroundTruth {
             4 => u32::from_le_bytes(row.try_into().unwrap()) as usize,
             _ => u64::from_le_bytes(row.try_into().unwrap()) as usize,
         })
+    }
+}
+
+/// Each query's one target base row, from a text file of one zero-based row per line, as
+/// StringKilla's tasks and USearch's `--query-targets` hold them.
+pub struct Targets {
+    rows: Vec<usize, System>,
+}
+
+impl Targets {
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let mut rows = Vec::new_in(System);
+        for (line, row) in text.lines().enumerate() {
+            let row = row.parse::<usize>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}:{}: {row:?} is not a base row", path.display(), line + 1),
+                )
+            })?;
+            rows.push(row);
+        }
+        Ok(Self { rows })
+    }
+
+    /// The target base rows, in query order.
+    pub fn rows(&self) -> &[usize] {
+        &self.rows
+    }
+}
+
+/// What a run's searches are judged against, chosen by the truth file's extension.
+pub enum Truth {
+    /// Each query's nearest base rows from `.ibin`, `.i32bin` or `.u64bin`, rescored by exact distance.
+    Neighbors(GroundTruth),
+    /// Each query's one target row from `.txt`, credited only where that row comes back.
+    Targets(Targets),
+}
+
+impl Truth {
+    pub fn load(path: &Path) -> io::Result<Self> {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("txt") => Targets::load(path).map(Self::Targets),
+            _ => GroundTruth::load(path).map(Self::Neighbors),
+        }
+    }
+
+    /// The judge's name in reports: `neighbors` or `targets`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Neighbors(_) => "neighbors",
+            Self::Targets(_) => "targets",
+        }
+    }
+
+    /// The `--top-k` a run searches and scores at: under targets the request, else USearch's default of 10;
+    /// under neighbors the request, else the truth's width, which it may not exceed.
+    pub fn top_k(&self, requested: Option<usize>) -> Result<usize, String> {
+        const TARGETS_TOP_K: usize = 10;
+        match self {
+            Self::Targets(_) => Ok(requested.unwrap_or(TARGETS_TOP_K)),
+            Self::Neighbors(neighbors) => {
+                let width = neighbors.neighbors_per_query();
+                let top_k = requested.unwrap_or(width);
+                if top_k > width {
+                    return Err(format!(
+                        "--top-k {top_k} exceeds the ground truth's {width} neighbors per query"
+                    ));
+                }
+                Ok(top_k)
+            }
+        }
+    }
+
+    /// Refuses targets for another number of queries than `queries`, and any row past the base's `base_rows`.
+    pub fn check(&self, queries: usize, base_rows: usize) -> Result<(), String> {
+        let past_base = match self {
+            Self::Neighbors(neighbors) => (0..neighbors.queries()).find_map(|query| {
+                neighbors
+                    .neighbors(query)
+                    .find(|&row| row >= base_rows)
+                    .map(|row| (query, row))
+            }),
+            Self::Targets(targets) => {
+                if targets.rows.len() != queries {
+                    return Err(format!("{} targets for {queries} queries", targets.rows.len()));
+                }
+                targets
+                    .rows
+                    .iter()
+                    .position(|&row| row >= base_rows)
+                    .map(|query| (query, targets.rows[query]))
+            }
+        };
+        match past_base {
+            Some((query, row)) => Err(format!(
+                "query {query} names base row {row}, past the {} base rows",
+                Thousands(base_rows as u64)
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write, path::PathBuf};
+
+    use super::{Corpus, TextCorpus, TextScratch, Truth};
+
+    /// A file under the temporary directory holding `contents`, named for the test that wrote it.
+    fn written(name: &str, contents: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("retrieval-{}-{name}", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn text_lines_drop_crlf_keep_a_last_line_without_newline_and_an_empty_file_has_none() {
+        let corpus = TextCorpus::load(&written("lines.txt", b"alpha\r\n\nbeta\ngamma")).unwrap();
+        let mut scratch = Default::default();
+        let texts = corpus.slice(0, 4, (), &mut scratch);
+        assert_eq!(texts.iter().collect::<Vec<_>>(), ["alpha", "", "beta", "gamma"]);
+        assert_eq!(corpus.bytes(), 18);
+        let empty = TextCorpus::load(&written("empty.txt", b"")).unwrap();
+        assert_eq!(empty.rows(), 0);
+        assert!(empty.slice(0, 1, (), &mut scratch).is_empty());
+    }
+
+    #[test]
+    fn text_slices_borrow_the_mapping_and_gathers_copy_the_same_entries() {
+        let corpus = TextCorpus::load(&written("gather.txt", b"one\ntwo\r\nthree\n")).unwrap();
+        let (mut borrowed, mut copied) = (TextScratch::default(), TextScratch::default());
+        let slice: Vec<&str> = corpus.slice(1, 2, (), &mut borrowed).iter().collect();
+        let gather: Vec<&str> = corpus.gather([1, 2], (), &mut copied).iter().collect();
+        assert_eq!(slice, gather);
+        assert_eq!(slice, ["two", "three"]);
+        assert!(borrowed.bytes.is_empty());
+        assert_eq!(copied.bytes.as_slice(), b"two\r\nthree\n");
+    }
+
+    #[test]
+    fn targets_refuse_a_count_mismatch_and_a_row_past_the_base() {
+        let truth = Truth::load(&written("targets.txt", b"2\n0\r\n7\n")).unwrap();
+        assert_eq!(truth.name(), "targets");
+        assert!(truth.check(3, 8).is_ok());
+        assert!(truth.check(2, 8).unwrap_err().contains("3 targets for 2 queries"));
+        assert!(truth.check(3, 7).unwrap_err().contains("query 2 names base row 7"));
+    }
+
+    #[test]
+    fn top_k_is_free_under_targets_and_bounded_by_the_neighbors_width() {
+        let targets = Truth::load(&written("top-k.txt", b"0\n")).unwrap();
+        assert_eq!(targets.top_k(None), Ok(10));
+        assert_eq!(targets.top_k(Some(100)), Ok(100));
+        let header_and_rows: Vec<u8> = [1u32, 3, 0, 1, 2]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let neighbors = Truth::load(&written("top-k.ibin", &header_and_rows)).unwrap();
+        assert_eq!(neighbors.top_k(None), Ok(3));
+        assert!(neighbors.top_k(Some(4)).is_err());
     }
 }

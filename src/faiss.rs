@@ -59,8 +59,8 @@ use itertools::iproduct;
 use serde_json::{json, Value};
 
 use retrieval::{
-    run_config, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Distance, Hits, IndexConfig, IndexFile,
-    SweepSummary, Threads, UnwrapOrBail, VectorSlice, Vectors,
+    run_config, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Dataset, Distance, Hits, IndexConfig,
+    IndexFile, SweepSummary, Threads, UnwrapOrBail, VectorSlice, Vectors,
 };
 
 extern "C" {
@@ -409,6 +409,8 @@ fn tune(index: &faiss::index::IndexImpl, parameters: &str) -> Result<(), String>
 }
 
 impl Backend for FaissBackend {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> HashMap<String, Value> {
         self.metadata.clone()
     }

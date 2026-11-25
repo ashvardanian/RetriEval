@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 use retrieval::{
     docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CommonArgs,
-    Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    Dataset, Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const CLASS_NAME: &str = "Bench";
@@ -177,6 +177,8 @@ impl<'a> WeaviateBackend<'a> {
 }
 
 impl Backend for WeaviateBackend<'_> {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
         let mut metadata = self.metadata.clone();
         let limits = self.runtime.block_on(self.container.limits());

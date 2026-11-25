@@ -22,8 +22,8 @@ use clap::Parser;
 use serde_json::{json, Value};
 
 use retrieval::{
-    run_config, Backend, BatchKeys, BenchState, CommonArgs, Distance, Hits, IndexFile, SweepSummary, UnwrapOrBail,
-    VectorSlice, Vectors,
+    run_config, Backend, BatchKeys, BenchState, CommonArgs, Dataset, Distance, Hits, IndexFile, SweepSummary,
+    UnwrapOrBail, VectorSlice, Vectors,
 };
 
 /// Turso vector distances, as `--metric` spells them.
@@ -109,6 +109,8 @@ fn encode(row: &[f32], wire: &mut Vec<u8, System>) -> Result<(), String> {
 }
 
 impl Backend for TursoBackend {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> HashMap<String, Value> {
         HashMap::from([
             ("backend".into(), json!("turso")),

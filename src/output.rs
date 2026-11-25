@@ -1,8 +1,7 @@
 //! Typed benchmark reports, machine information, and JSON serialization.
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
-    hash::{Hash, Hasher},
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -20,6 +19,9 @@ pub struct MachineInfo {
     pub physical_cores: usize,
     pub logical_cores: usize,
     pub ram_bytes: u64,
+    pub kernel: Option<String>,
+    pub os: Option<String>,
+    pub architecture: &'static str,
     pub budget: Budget,
 }
 
@@ -96,18 +98,25 @@ fn cgroup_memory_limit() -> Option<u64> {
 /// Dataset descriptor — describes the input files, not the configuration.
 #[derive(Debug, Clone, Serialize)]
 pub struct DatasetInfo {
-    pub base_vectors_path: String,
-    pub query_vectors_path: String,
-    pub query_neighbors_path: String,
-    /// Rows in the base file, before any `--max-base-vectors` cap. Divide
-    /// `steps[].vectors_indexed` by this for the share of the ground truth a
-    /// step could possibly have found.
-    pub vectors_count: usize,
+    pub base_path: String,
+    pub query_path: String,
+    pub truth_path: String,
+    /// Rows in the base file, before any `--max-base-vectors` or `--max-base-entries` cap. Divide
+    /// `steps[].entries_indexed` by this for the share of the ground truth a step could possibly
+    /// have found.
+    pub entries_count: usize,
+    /// Bytes the base rows occupy in their files.
+    pub base_bytes: u64,
     pub queries_count: usize,
-    /// The input file's vector width. A `--dims` sweep truncates per
-    /// config and reports the effective width as `config.dimensions`.
-    pub dimensions: usize,
-    pub neighbors_per_query: usize,
+    /// The input file's vector width, absent for text. A `--dims` sweep truncates per config and
+    /// reports the effective width as `config.dimensions`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+    /// The width of exact-neighbor truth, absent for targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbors_per_query: Option<usize>,
+    /// The judge: `neighbors`, rescored by exact distance, or `targets`, credited only at the target row.
+    pub truth: &'static str,
 }
 
 /// One measurement step: how much of the base is in the index, what it cost to
@@ -118,7 +127,7 @@ pub struct DatasetInfo {
 /// once against the finished index.
 #[derive(Debug, Serialize)]
 pub struct StepEntry {
-    pub vectors_indexed: usize,
+    pub entries_indexed: usize,
     /// The backend's own figure: a server container's anonymous bytes, or an in-process engine's
     /// index size or anonymous bytes.
     pub memory_bytes: u64,
@@ -163,19 +172,22 @@ pub struct StepSearchEntry {
     pub top_k: usize,
     pub elapsed: f64,
     pub throughput: u64,
-    /// The first answer within the true nearest distance: 1-recall@1.
+    /// The first answer within the true nearest distance: 1-recall@1; success@1 under a known-item judge.
     pub recall_at_1: f64,
     /// Any of the top-k within the true nearest distance, 1-recall@k: FAISS's
-    /// `OneRecallAtRCriterion`, USearch's `mean_recall`. Saturates as k grows —
-    /// `intersection_at_k` is the discriminating measure at large k.
+    /// `OneRecallAtRCriterion`, USearch's `mean_recall`; success@k under a known-item judge.
+    /// Saturates as k grows — `intersection_at_k` is the discriminating measure at large k.
     pub recall_at_k: f64,
     /// The share of the top-k within the k-th true distance, k-recall@k, order-independent — what
-    /// ann-benchmarks and cuVS publish as recall. Absent for a self-search,
-    /// whose truth set is a single key.
+    /// ann-benchmarks and cuVS publish as recall. Absent for a self-search and for targets,
+    /// whose truth is a single key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intersection_at_k: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ndcg_at_k: Option<f64>,
+    /// The mean reciprocal rank of the one key a self-search or a target names, within the top-k.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mrr_at_k: Option<f64>,
     /// Hardware counters summed across all online CPUs, present only with `--features
     /// perf-counters` on Linux and `CAP_PERFMON` or `kernel.perf_event_paranoid <= 1`.
     #[serde(flatten)]
@@ -185,6 +197,8 @@ pub struct StepSearchEntry {
 /// Complete report for one backend configuration.
 #[derive(Debug, Serialize)]
 pub struct ConfigReport {
+    pub schema_version: u32,
+    pub started_unix_seconds: u64,
     pub machine: MachineInfo,
     pub dataset: DatasetInfo,
     pub config: HashMap<String, Value>,
@@ -207,27 +221,29 @@ pub fn collect_machine_info() -> MachineInfo {
         physical_cores,
         logical_cores,
         ram_bytes,
+        kernel: System::kernel_version(),
+        os: System::long_os_version(),
+        architecture: std::env::consts::ARCH,
         budget: budget().clone(),
     }
 }
 
-/// Write a ConfigReport as pretty JSON to a file.
+/// Writes a ConfigReport as pretty JSON through a synced temporary file, so a crash never leaves a partial report.
 pub fn write_report(path: &Path, report: &ConfigReport) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let file = std::fs::File::create(&temporary)?;
+    serde_json::to_writer_pretty(&file, report).map_err(std::io::Error::other)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)
 }
 
-/// Generate a short hash from config metadata for file naming.
+/// The 64-bit FNV-1a of the config's JSON with sorted keys, as 16 hex digits for file naming.
 pub fn config_hash(config: &HashMap<String, Value>) -> String {
-    let mut hasher = DefaultHasher::new();
-    let mut sorted = std::collections::BTreeMap::new();
-    sorted.extend(config.iter());
-    format!("{sorted:?}").hash(&mut hasher);
-    format!("{:06x}", hasher.finish() & CONFIG_HASH_MASK)
+    let sorted: BTreeMap<_, _> = config.iter().collect();
+    let bytes = serde_json::to_vec(&sorted).expect("string keys always serialize");
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
-
-/// Keep the low 24 bits of the hash — 6 hex digits, ~16M distinct file names.
-/// 6 chars is short enough to paste in commit messages without wrapping but
-/// wide enough to avoid collisions across the few hundred config permutations
-/// a typical benchmark sweep produces.
-const CONFIG_HASH_MASK: u64 = 0xFF_FFFF;

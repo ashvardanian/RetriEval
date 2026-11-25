@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 
 use retrieval::{
     docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CommonArgs,
-    Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    Dataset, Distance, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const IMAGE: &str = "surrealdb/surrealdb:v3.3.0";
@@ -306,6 +306,8 @@ impl<'a> SurrealBackend<'a> {
     }
 }
 impl Backend for SurrealBackend<'_> {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> HashMap<String, Value> {
         let mut metadata = self.metadata.clone();
         let limits = self.server.runtime.block_on(self.server.container.limits());
@@ -422,7 +424,7 @@ fn main() {
     eprintln!("- Startup time limit: {}", spell_duration(cli.startup_time_limit));
     eprintln!("- Port: {}", cli.port);
     let dimensions_sweep = cli.common.dimensions_sweep(state.dimensions());
-    let rows_per_request = cli.common.inserts_per_core.max(cli.common.queries_per_core);
+    let rows_per_request = cli.common.run.inserts_per_core.max(cli.common.run.queries_per_core);
     let widest = dimensions_sweep
         .iter()
         .copied()

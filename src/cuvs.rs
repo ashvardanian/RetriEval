@@ -74,8 +74,8 @@ use numkong as nk;
 use serde_json::json;
 
 use retrieval::{
-    run_config, spell_list, Backend, BatchKeys, BenchState, CastScratch, CommonArgs, Distance, Hits, IndexConfig,
-    IndexFile, StepRefineEntry, SweepSummary, UnwrapOrBail, Vectors,
+    run_config, spell_list, Backend, BatchKeys, BenchState, CastScratch, CommonArgs, Dataset, Distance, Hits,
+    IndexConfig, IndexFile, StepRefineEntry, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 // #region CudaAllocator
@@ -850,6 +850,8 @@ impl CuvsBackend {
 }
 
 impl Backend for CuvsBackend {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
         self.metadata.clone()
     }

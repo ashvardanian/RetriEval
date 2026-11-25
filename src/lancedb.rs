@@ -33,7 +33,8 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use serde_json::json;
 
 use retrieval::{
-    run_config, Backend, BatchKeys, BenchState, CommonArgs, Hits, IndexFile, Key, SweepSummary, UnwrapOrBail, Vectors,
+    run_config, Backend, BatchKeys, BenchState, CommonArgs, Dataset, Hits, IndexFile, Key, SweepSummary, UnwrapOrBail,
+    Vectors,
 };
 
 const TABLE_NAME: &str = "bench";
@@ -192,6 +193,8 @@ impl<'a> LanceDbBackend<'a> {
 }
 
 impl Backend for LanceDbBackend<'_> {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> std::collections::HashMap<String, serde_json::Value> {
         self.metadata.clone()
     }

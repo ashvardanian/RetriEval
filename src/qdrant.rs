@@ -36,8 +36,8 @@ use qdrant_client::{
 use serde_json::json;
 
 use retrieval::{
-    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CommonArgs, Hits,
-    IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
+    docker::ContainerHandle, run_config, spell_duration, spell_list, Backend, BatchKeys, BenchState, CommonArgs,
+    Dataset, Hits, IndexFile, Key, Port, SweepSummary, UnwrapOrBail, Vectors,
 };
 
 const COLLECTION: &str = "bench";
@@ -279,6 +279,8 @@ impl<'a> QdrantBackend<'a> {
 }
 
 impl Backend for QdrantBackend<'_> {
+    type Corpus = Dataset;
+
     fn metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.metadata.clone();
         let limits = self.runtime.block_on(self.container.limits());

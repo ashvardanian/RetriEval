@@ -89,11 +89,17 @@ def ground_truth_field(name: str) -> Callable[[dict[str, Any], dict[str, Any]], 
     return lambda step, _report: (step.get("ground_truth_search") or {}).get(name)
 
 
+def entries_indexed(step: dict[str, Any]) -> int:
+    """Entries a step had indexed, read as `vectors_indexed` from reports older than the rename."""
+    return int(step.get("entries_indexed", step.get("vectors_indexed")))
+
+
 def coverage(step: dict[str, Any], report: dict[str, Any]) -> float | None:
     """Share of the base file this step had indexed — the ceiling raw recall is
     bounded by, and the divisor a reader needs to interpret a capped run."""
-    total = (report.get("dataset") or {}).get("vectors_count") or 0
-    return int(step["vectors_indexed"]) / total if total else None
+    dataset = report.get("dataset") or {}
+    total = dataset.get("entries_count", dataset.get("vectors_count")) or 0
+    return entries_indexed(step) / total if total else None
 
 
 def make_plot(
@@ -107,7 +113,7 @@ def make_plot(
     machine_info: dict[str, Any],
     logarithmic: bool = False,
 ) -> None:
-    """Draw one chart of `y_fn` against the vectors indexed, one line per report."""
+    """Draw one chart of `y_fn` against the entries indexed, one line per report."""
     figure, axis = plt.subplots(figsize=(16, 9.2))
     for index, report in enumerate(reports):
         # Points are paired before filtering: dropping only the y-values would
@@ -116,7 +122,7 @@ def make_plot(
         for step in report.get("steps", []):
             value = y_fn(step, report)
             if value is not None:
-                points.append((int(step["vectors_indexed"]), value))
+                points.append((entries_indexed(step), value))
         # A load run has no add phase, so it contributes nothing to some charts.
         if not points:
             continue
@@ -205,8 +211,8 @@ def main() -> None:
         "Construction Speed",
         reports,
         add_field("throughput"),
-        "Vectors Indexed",
-        "Vectors / Second",
+        "Entries Indexed",
+        "Entries / Second",
         "construction-speed.svg",
         output_dir,
         machine_info,
@@ -217,7 +223,7 @@ def main() -> None:
         "Index Memory",
         reports,
         lambda s, _r: s["memory_bytes"] / 2**30,
-        "Vectors Indexed",
+        "Entries Indexed",
         "Memory (GB)",
         "construction-memory.svg",
         output_dir,
@@ -228,7 +234,7 @@ def main() -> None:
         "Search Speed",
         reports,
         ground_truth_field("throughput"),
-        "Vectors Indexed",
+        "Entries Indexed",
         "Queries / Second",
         "search-speed.svg",
         output_dir,
@@ -240,7 +246,7 @@ def main() -> None:
         "Recall@1",
         reports,
         ground_truth_field("recall_at_1"),
-        "Vectors Indexed",
+        "Entries Indexed",
         "Recall@1",
         "recall-at-1.svg",
         output_dir,
@@ -251,7 +257,7 @@ def main() -> None:
         f"Recall@{k_label}",
         reports,
         ground_truth_field("recall_at_k"),
-        "Vectors Indexed",
+        "Entries Indexed",
         f"Recall@{k_label}",
         "recall-at-k.svg",
         output_dir,
@@ -262,7 +268,7 @@ def main() -> None:
         f"Intersection@{k_label}",
         reports,
         ground_truth_field("intersection_at_k"),
-        "Vectors Indexed",
+        "Entries Indexed",
         f"Intersection@{k_label}",
         "intersection-at-k.svg",
         output_dir,
@@ -273,7 +279,7 @@ def main() -> None:
         f"NDCG@{k_label}",
         reports,
         ground_truth_field("ndcg_at_k"),
-        "Vectors Indexed",
+        "Entries Indexed",
         f"NDCG@{k_label}",
         "ndcg-at-k.svg",
         output_dir,
@@ -284,7 +290,7 @@ def main() -> None:
         "Ground-Truth Coverage",
         reports,
         coverage,
-        "Vectors Indexed",
+        "Entries Indexed",
         "Indexed / Base File",
         "coverage.svg",
         output_dir,
